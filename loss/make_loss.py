@@ -1,0 +1,149 @@
+# encoding: utf-8
+"""
+@author:  liaoxingyu
+@contact: sherlockliao01@gmail.com
+"""
+
+import torch.nn.functional as F
+from .softmax_loss import CrossEntropyLabelSmooth, LabelSmoothingCrossEntropy
+from .triplet_loss import TripletLoss
+from .center_loss import CenterLoss
+from .ratr_loss import RATRLoss
+
+
+def make_loss(cfg, num_classes):    # modified by gu
+    sampler = cfg.DATALOADER.SAMPLER
+    feat_dim = 2048
+    center_criterion = CenterLoss(num_classes=num_classes, feat_dim=feat_dim, use_gpu=True)  # center loss
+    if 'triplet' in cfg.MODEL.METRIC_LOSS_TYPE:
+        if cfg.MODEL.NO_MARGIN:
+            triplet = TripletLoss()
+            print("using soft triplet loss for training")
+        else:
+            triplet = TripletLoss(cfg.SOLVER.MARGIN)  # triplet loss
+            print("using triplet loss with margin:{}".format(cfg.SOLVER.MARGIN))
+    else:
+        print('expected METRIC_LOSS_TYPE should be triplet'
+              'but got {}'.format(cfg.MODEL.METRIC_LOSS_TYPE))
+
+    if cfg.MODEL.IF_LABELSMOOTH == 'on':
+        xent = CrossEntropyLabelSmooth(num_classes=num_classes)
+        print("label smooth on, numclasses:", num_classes)
+    
+    # RATR Loss 初始化
+    ratr_fn = None
+    if getattr(cfg.SOLVER, 'RATR_ENABLED', False):
+        pk = cfg.DATALOADER.NUM_INSTANCE  # K 值
+        p = cfg.SOLVER.IMS_PER_BATCH // pk  # P 值
+        tau = getattr(cfg.SOLVER, 'RATR_TAU', 0.1)
+        ratr_fn = RATRLoss(num_branches=2, num_classes=p, samples_per_class=pk, tau=tau)
+
+    if sampler == 'softmax':
+        def loss_func(score, feat, target):
+            return F.cross_entropy(score, target)
+
+    elif cfg.DATALOADER.SAMPLER == 'softmax_triplet':
+        def loss_func(score, feat, target, target_cam):
+            if cfg.MODEL.METRIC_LOSS_TYPE == 'triplet':
+                # 支持多分支模式 (PMS 或 SFM)
+                if isinstance(score, list):
+                    # 检查是 SFM 模式还是 PMS 模式
+                    use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
+                    
+                    if use_sfm and len(score) >= 2:
+                        # SFM 模式：HAT风格多级聚合损失 (归一化版本)
+                        sfm_lambda = getattr(cfg.SOLVER, 'SFM_LAMBDA', 1.0)
+                        sfm_lambda_aux = getattr(cfg.SOLVER, 'SFM_LAMBDA_AUX', 0.5)
+                        
+                        # 1. Backbone 分支 (权重 = 1.0)
+                        if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                            id_b = xent(score[0].float(), target)
+                        else:
+                            id_b = F.cross_entropy(score[0].float(), target)
+                        tri_b = triplet(feat[0].float(), target)[0]
+                        
+                        # 2. Fused 分支 (循环处理所有聚合层级)
+                        id_f_list = []
+                        tri_f_list = []
+                        num_fused = len(score) - 1
+                        
+                        total_id_loss = id_b
+                        total_tri_loss = tri_b
+                        total_weight = 1.0
+                        
+                        loss_detail = {
+                            'id_backbone': id_b.item(),
+                            'tri_backbone': tri_b.item(),
+                            'sfm_lambda': sfm_lambda,
+                        }
+                        
+                        for i in range(1, len(score)):
+                            # 最后一级使用 SFM_LAMBDA，中间级使用 SFM_LAMBDA_AUX
+                            is_last = (i == len(score) - 1)
+                            w = sfm_lambda if is_last else sfm_lambda_aux
+                            
+                            if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                                id_fi = xent(score[i].float(), target)
+                            else:
+                                id_fi = F.cross_entropy(score[i].float(), target)
+                            tri_fi = triplet(feat[i].float(), target)[0]
+                            
+                            total_id_loss = total_id_loss + w * id_fi
+                            total_tri_loss = total_tri_loss + w * tri_fi
+                            total_weight += w
+                            
+                            # 记录详情
+                            loss_detail[f'id_fused_{i}'] = id_fi.item()
+                            loss_detail[f'tri_fused_{i}'] = tri_fi.item()
+                            
+                        # 兼容性补充：将最后一级存为 id_fused 和 tri_fused
+                        num_fused = len(score) - 1
+                        if num_fused > 0:
+                            loss_detail['id_fused'] = loss_detail[f'id_fused_{num_fused}']
+                            loss_detail['tri_fused'] = loss_detail[f'tri_fused_{num_fused}']
+                        
+                        # 取消归一化，直接使用加权和
+                        ID_LOSS = total_id_loss
+                        TRI_LOSS = total_tri_loss
+                        
+                        total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
+                                     cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
+                        
+                        # ===== RATR 损失 =====
+                        nonlocal ratr_fn
+                        if ratr_fn is not None:
+                            ratr_lambda = getattr(cfg.SOLVER, 'RATR_LAMBDA', 1.0)
+                            
+                            # L2 归一化特征 (backbone + 最终融合)
+                            backbone_feat_norm = F.normalize(feat[0].float(), dim=1)
+                            fused_feat_norm = F.normalize(feat[-1].float(), dim=1)
+                            
+                            # 确保 RATR 模块在正确的 device 上
+                            ratr_fn = ratr_fn.to(target.device)
+                            
+                            ratr_loss = ratr_fn([backbone_feat_norm, fused_feat_norm], target)
+                            total_loss = total_loss + ratr_lambda * ratr_loss
+                            
+                            loss_detail['ratr'] = ratr_loss.item()
+                        
+                        return total_loss, loss_detail
+                else:
+                    # 单分支逻辑
+                    if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                        ID_LOSS = xent(score.float(), target)
+                    else:
+                        ID_LOSS = F.cross_entropy(score.float(), target)
+                    TRI_LOSS = triplet(feat.float(), target)[0]
+                    
+                    return cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
+                           cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
+            else:
+                print('expected METRIC_LOSS_TYPE should be triplet'
+                      'but got {}'.format(cfg.MODEL.METRIC_LOSS_TYPE))
+
+
+    else:
+        print('expected sampler should be softmax, triplet, softmax_triplet or softmax_triplet_center'
+              'but got {}'.format(cfg.DATALOADER.SAMPLER))
+    return loss_func, center_criterion
+

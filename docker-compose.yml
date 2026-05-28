@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  mambavision-reid:
+    image: mambavision-reid:latest
+    container_name: mambavision-reid-container
+    build:
+      context: ..
+      dockerfile: Dockerfile.mambavision.optimized
+    
+    runtime: nvidia
+    
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0,1,2,3
+      - PYTHONUNBUFFERED=1
+    
+    shm_size: 8gb
+    
+    volumes:
+      # 代码挂载
+      - ./:/workspace/TransReID
+      # 数据挂载
+      - ../data:/workspace/data
+      - ../logs:/workspace/logs
+      - ../pretrained:/workspace/pretrained
+    
+    ports:
+      - "6006:6006"  # TensorBoard
+    
+    working_dir: /workspace/TransReID
+    
+    command: /bin/bash
+    
+    stdin_open: true
+    tty: true
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    container_name: tensorboard
+    command: tensorboard --logdir=/logs --host=0.0.0.0 --port=6006
+    ports:
+      - "6007:6006"
+    volumes:
+      - ../logs:/logs
+    depends_on:
+      - mambavision-reid
+

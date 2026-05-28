@@ -1,0 +1,7 @@
+torch
+torchvision
+timm
+yacs
+opencv-python
+mamba-ssm==2.2.4
+einops==0.8.1

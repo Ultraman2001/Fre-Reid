@@ -1,0 +1,7 @@
+component,layer_idx,layer_name,height,width,pha_topk,pha_sim
+RGB,0,base.levels.2.blocks.0.mixer,16,8,13,0.41672396659851074
+RGB,1,base.levels.2.blocks.1.mixer,16,8,13,0.2687889635562897
+RGB,2,base.levels.2.blocks.2.mixer,16,8,13,0.21983063220977783
+RGB,3,base.levels.2.blocks.3.mixer,16,8,13,0.31388434767723083
+RGB,4,base.levels.3.blocks.0.mixer,16,8,13,0.3350094258785248
+RGB,5,base.levels.3.blocks.1.mixer,16,8,13,0.5555856227874756
