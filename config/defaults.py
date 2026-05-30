@@ -73,7 +73,7 @@ _C.MODEL.MAMBAVISION.SFM_DEPTHS = [1, 1, 1]  # [S1+2, F12+3, F23+4] 各级融合
 _C.MODEL.MAMBAVISION.SFM_DROP_PATH = 0.1  # SFM 模块内部的 DropPath 概率
 _C.MODEL.MAMBAVISION.SFM_POOLING_TYPE = 'gem'  # SFM 分支池化类型 ('gem', 'avg', 'max', 'avg_max')
 
-# FD-Mamba: Stage-2 feature-level Haar DWT dual branch
+# FD-Mamba: Stage-1 feature-level Haar DWT dual branch
 _C.MODEL.MAMBAVISION.USE_FD = False
 _C.MODEL.MAMBAVISION.FD_POOLING_TYPE = 'gem'
 

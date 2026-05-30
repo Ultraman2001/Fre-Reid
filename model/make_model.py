@@ -426,7 +426,18 @@ class build_transformer(nn.Module):
             freq_score = classifier_forward(self.fd_freq_classifier, self.ID_LOSS_TYPE, freq_bn, label)
             return [final_score, spa_score, freq_score], [final_feat, spa_feat, freq_feat]
 
-        return final_bn if self.neck_feat == 'after' else final_feat
+        if self.neck_feat == 'after':
+            return {
+                'backbone': spa_bn,
+                'fused': freq_bn,
+                'concat': final_bn,
+            }
+
+        return {
+            'backbone': spa_feat,
+            'fused': freq_feat,
+            'concat': final_feat,
+        }
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.is_mambavision or self.is_puzzle:

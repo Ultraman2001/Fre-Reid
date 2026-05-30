@@ -82,4 +82,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/Duke/FD-Mamba-Stage2-DWT'
+OUTPUT_DIR: './logs/Duke/FD-Mamba-Stage1-WTConv'

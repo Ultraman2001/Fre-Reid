@@ -809,10 +809,23 @@ class MambaVisionLayer(nn.Module):
 
 
 class FeatureDWTBranch(nn.Module):
-    """Feature-level Haar DWT branch for Stage-2 MambaVision maps."""
+    """Stage-1 feature-level Haar DWT branch with WTConv-style subband mixing."""
 
-    def __init__(self, in_dim, out_dim):
+    def __init__(self, in_dim, out_dim, kernel_size=3):
         super().__init__()
+        padding = kernel_size // 2
+        self.subband_dwconv = nn.Conv2d(
+            in_dim * 4,
+            in_dim * 4,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=in_dim * 4,
+            bias=False,
+        )
+        self.subband_norm = nn.BatchNorm2d(in_dim * 4)
+        self.subband_act = nn.GELU(approximate='tanh')
+        self.subband_scale = nn.Parameter(torch.ones(1, in_dim * 4, 1, 1) * 0.1)
+
         self.ll_adapter = nn.Sequential(
             nn.Conv2d(in_dim, out_dim, 1, bias=False),
             nn.BatchNorm2d(out_dim),
@@ -835,21 +848,26 @@ class FeatureDWTBranch(nn.Module):
         pad_h = h % 2
         pad_w = w % 2
         if pad_h or pad_w:
-            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+            pad_mode = 'reflect' if h > 1 and w > 1 else 'replicate'
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode=pad_mode)
 
         x00 = x[:, :, 0::2, 0::2]
         x01 = x[:, :, 0::2, 1::2]
         x10 = x[:, :, 1::2, 0::2]
         x11 = x[:, :, 1::2, 1::2]
 
-        ll = (x00 + x01 + x10 + x11) * 0.5
-        lh = (x00 - x01 + x10 - x11) * 0.5
-        hl = (x00 + x01 - x10 - x11) * 0.5
-        hh = (x00 - x01 - x10 + x11) * 0.5
+        ll = (x00 + x01 + x10 + x11) * 0.25
+        lh = (x00 - x01 + x10 - x11) * 0.25
+        hl = (x00 + x01 - x10 - x11) * 0.25
+        hh = (x00 - x01 - x10 + x11) * 0.25
         return ll, lh, hl, hh
 
     def forward(self, x):
-        ll, lh, hl, hh = self._haar_dwt2d(x)
+        subbands = torch.cat(self._haar_dwt2d(x), dim=1)
+        subbands = subbands + self.subband_scale * self.subband_act(
+            self.subband_norm(self.subband_dwconv(subbands))
+        )
+        ll, lh, hl, hh = torch.chunk(subbands, 4, dim=1)
         ll_feat = self.ll_adapter(ll)
         hf_feat = self.hf_adapter(torch.cat([lh, hl, hh], dim=1))
         return self.fuse(torch.cat([ll_feat, hf_feat], dim=1))
@@ -876,7 +894,7 @@ class MambaVisionBackbone(nn.Module):
             sfm_num_layers: number of SFM layers (1 or 2).
             sfm_depths: list of depths for each SFM module [sfm_1_depth, sfm_2_depth].
             sfm_drop_path: drop path rate for SFM modules.
-            use_fd: whether to enable Stage-2 feature-level DWT dual branch.
+            use_fd: whether to enable Stage-1 feature-level DWT dual branch.
         """
         super().__init__()
         
@@ -971,8 +989,9 @@ class MambaVisionBackbone(nn.Module):
         if self.use_fd and self.use_sfm:
             raise ValueError('Feature DWT branch and SFM should not be enabled at the same time.')
         if self.use_fd:
-            self.fd_branch = FeatureDWTBranch(final_dim, self.proj_dim)
-            print(f'[MambaVision] Feature-level DWT branch enabled: Stage2 {final_dim} -> {self.proj_dim}')
+            stage1_dim = dim * 2
+            self.fd_branch = FeatureDWTBranch(stage1_dim, self.proj_dim)
+            print(f'[MambaVision] Feature-level DWT branch enabled: Stage1 {stage1_dim} -> {self.proj_dim}')
 
         self.sfm_depths = list(sfm_depths)
         while len(self.sfm_depths) < 3:
@@ -1070,9 +1089,9 @@ class MambaVisionBackbone(nn.Module):
         # Stage 1, 2
         x = self.levels[0](x)  # Stage 1 -> (B, 192, 32, 16)
         feat_s1 = x
+        freq_map = self.fd_branch(feat_s1) if self.use_fd else None
         x = self.levels[1](x)  # Stage 2 -> (B, 384, 16, 8)
         feat_s2 = x
-        freq_map = self.fd_branch(feat_s2) if self.use_fd else None
         
         # Stage 3
         x = self.levels[2](x)  # Stage 3 -> (B, 384, 16, 8)

@@ -39,9 +39,9 @@ def make_optimizer(cfg, model, center_criterion):
         elif "fd_" in key:
             fd_lr_factor = getattr(cfg.SOLVER, 'FD_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fd_lr_factor
-            if "fd_branch" not in printed_high_lr_keys:
-                print(f"Using {fd_lr_factor}x learning rate for FD-Mamba modules: {key}")
-                printed_high_lr_keys.add("fd_branch")
+            if "fd_modules" not in printed_high_lr_keys:
+                print(f"Using {fd_lr_factor}x learning rate for FD-Mamba branch/head layers: {key}")
+                printed_high_lr_keys.add("fd_modules")
 
         if "bias" in key:
             # Scale the *current* LR (whether base or high) by the bias factor
