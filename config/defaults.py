@@ -73,6 +73,10 @@ _C.MODEL.MAMBAVISION.SFM_DEPTHS = [1, 1, 1]  # [S1+2, F12+3, F23+4] 各级融合
 _C.MODEL.MAMBAVISION.SFM_DROP_PATH = 0.1  # SFM 模块内部的 DropPath 概率
 _C.MODEL.MAMBAVISION.SFM_POOLING_TYPE = 'gem'  # SFM 分支池化类型 ('gem', 'avg', 'max', 'avg_max')
 
+# FD-Mamba: Stage-2 feature-level Haar DWT dual branch
+_C.MODEL.MAMBAVISION.USE_FD = False
+_C.MODEL.MAMBAVISION.FD_POOLING_TYPE = 'gem'
+
 # EMA Setting
 _C.MODEL.EMA = CN()
 _C.MODEL.EMA.ENABLED = False
@@ -197,6 +201,11 @@ _C.SOLVER.SFM_LAMBDA_AUX = 0.2    # 中间聚合级 (F12, F23) 的损失权重
 
 # Multiplier for SFM module learning rate (SFM is new, use 1.0 by default)
 _C.SOLVER.SFM_LR_FACTOR = 1.0
+
+# FD-Mamba branch supervision and learning rate
+_C.SOLVER.FD_LAMBDA_SPA = 0.5
+_C.SOLVER.FD_LAMBDA_FREQ = 0.5
+_C.SOLVER.FD_LR_FACTOR = 2.0
 
 # RATR (Ranking-aware Triplet Regularization) 损失配置
 _C.SOLVER.RATR_ENABLED = False    # 是否启用 RATR

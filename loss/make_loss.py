@@ -47,8 +47,43 @@ def make_loss(cfg, num_classes):    # modified by gu
             if cfg.MODEL.METRIC_LOSS_TYPE == 'triplet':
                 # 支持多分支模式 (PMS 或 SFM)
                 if isinstance(score, list):
-                    # 检查是 SFM 模式还是 PMS 模式
+                    # 检查是 FD-Mamba、SFM 模式还是 PMS 模式
+                    use_fd = getattr(cfg.MODEL.MAMBAVISION, 'USE_FD', False)
                     use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
+
+                    if use_fd and len(score) >= 3:
+                        fd_lambda_spa = getattr(cfg.SOLVER, 'FD_LAMBDA_SPA', 0.5)
+                        fd_lambda_freq = getattr(cfg.SOLVER, 'FD_LAMBDA_FREQ', 0.5)
+
+                        if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                            id_final = xent(score[0].float(), target)
+                            id_spa = xent(score[1].float(), target)
+                            id_freq = xent(score[2].float(), target)
+                        else:
+                            id_final = F.cross_entropy(score[0].float(), target)
+                            id_spa = F.cross_entropy(score[1].float(), target)
+                            id_freq = F.cross_entropy(score[2].float(), target)
+
+                        tri_final = triplet(feat[0].float(), target)[0]
+                        tri_spa = triplet(feat[1].float(), target)[0]
+                        tri_freq = triplet(feat[2].float(), target)[0]
+
+                        ID_LOSS = id_final + fd_lambda_spa * id_spa + fd_lambda_freq * id_freq
+                        TRI_LOSS = tri_final + fd_lambda_spa * tri_spa + fd_lambda_freq * tri_freq
+                        total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
+                                     cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
+
+                        loss_detail = {
+                            'fd_lambda_spa': fd_lambda_spa,
+                            'fd_lambda_freq': fd_lambda_freq,
+                            'fd_id_final': id_final.item(),
+                            'fd_tri_final': tri_final.item(),
+                            'fd_id_spa': id_spa.item(),
+                            'fd_tri_spa': tri_spa.item(),
+                            'fd_id_freq': id_freq.item(),
+                            'fd_tri_freq': tri_freq.item(),
+                        }
+                        return total_loss, loss_detail
                     
                     if use_sfm and len(score) >= 2:
                         # SFM 模式：HAT风格多级聚合损失 (归一化版本)

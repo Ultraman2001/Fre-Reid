@@ -99,6 +99,38 @@ def weights_init_classifier(m):
             nn.init.constant_(m.bias, 0.0)
 
 
+METRIC_CLASSIFIERS = ('arcface', 'cosface', 'amsoftmax', 'circle')
+
+
+def create_classifier_head(id_loss_type, in_planes, num_classes, cfg, prefix=''):
+    if id_loss_type == 'arcface':
+        if prefix:
+            print('[{}] using arcface with s:{}, m: {}'.format(prefix, cfg.SOLVER.COSINE_SCALE, cfg.SOLVER.COSINE_MARGIN))
+        return Arcface(in_planes, num_classes, s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+    if id_loss_type == 'cosface':
+        if prefix:
+            print('[{}] using cosface with s:{}, m: {}'.format(prefix, cfg.SOLVER.COSINE_SCALE, cfg.SOLVER.COSINE_MARGIN))
+        return Cosface(in_planes, num_classes, s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+    if id_loss_type == 'amsoftmax':
+        if prefix:
+            print('[{}] using amsoftmax with s:{}, m: {}'.format(prefix, cfg.SOLVER.COSINE_SCALE, cfg.SOLVER.COSINE_MARGIN))
+        return AMSoftmax(in_planes, num_classes, s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+    if id_loss_type == 'circle':
+        if prefix:
+            print('[{}] using circle with s:{}, m: {}'.format(prefix, cfg.SOLVER.COSINE_SCALE, cfg.SOLVER.COSINE_MARGIN))
+        return CircleLoss(in_planes, num_classes, s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+
+    classifier = nn.Linear(in_planes, num_classes, bias=False)
+    classifier.apply(weights_init_classifier)
+    return classifier
+
+
+def classifier_forward(classifier, id_loss_type, feat, label=None):
+    if id_loss_type in METRIC_CLASSIFIERS:
+        return classifier(feat, label)
+    return classifier(feat)
+
+
 class Backbone(nn.Module):
     def __init__(self, num_classes, cfg):
         super(Backbone, self).__init__()
@@ -187,6 +219,8 @@ class build_transformer(nn.Module):
         self.in_planes = 768
         self.is_puzzle = 'puzzle' in cfg.MODEL.TRANSFORMER_TYPE.lower()
         self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
+        self.use_sfm = False
+        self.use_fd = False
         
         self.pooling = None
 
@@ -197,6 +231,9 @@ class build_transformer(nn.Module):
             
             # SFM 配置
             self.use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
+            self.use_fd = getattr(cfg.MODEL.MAMBAVISION, 'USE_FD', False)
+            if self.use_sfm and self.use_fd:
+                raise ValueError('USE_SFM and USE_FD should not be enabled at the same time.')
             sfm_num_layers = getattr(cfg.MODEL.MAMBAVISION, 'SFM_NUM_LAYERS', 1)
             sfm_depths = list(getattr(cfg.MODEL.MAMBAVISION, 'SFM_DEPTHS', [1, 1]))
             sfm_drop_path = getattr(cfg.MODEL.MAMBAVISION, 'SFM_DROP_PATH', 0.0)
@@ -220,12 +257,17 @@ class build_transformer(nn.Module):
                 sfm_num_layers=sfm_num_layers,
                 sfm_depths=sfm_depths,
                 sfm_drop_path=sfm_drop_path,
+                use_fd=self.use_fd,
             )
             # Get feature dimension from MambaVision
             self.in_planes = self.base.num_features
             pooling_type = getattr(cfg.MODEL, 'POOLING_TYPE', 'gem')
             self.pooling = create_pooling(pooling_type)
             print(f'[Model] Using pooling type: {pooling_type}')
+            if self.use_fd:
+                fd_pooling_type = getattr(cfg.MODEL.MAMBAVISION, 'FD_POOLING_TYPE', pooling_type)
+                self.fd_pooling = create_pooling(fd_pooling_type)
+                print(f'[FD] Using frequency pooling type: {fd_pooling_type}')
             
             # SFM 多级聚合 heads
             if self.use_sfm:
@@ -283,6 +325,32 @@ class build_transformer(nn.Module):
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
+
+        if self.is_mambavision and self.use_fd:
+            self.fd_in_planes = self.in_planes * 2
+
+            self.fd_bottleneck = nn.BatchNorm1d(self.fd_in_planes)
+            self.fd_bottleneck.bias.requires_grad_(False)
+            self.fd_bottleneck.apply(weights_init_kaiming)
+
+            self.fd_spa_bottleneck = nn.BatchNorm1d(self.in_planes)
+            self.fd_spa_bottleneck.bias.requires_grad_(False)
+            self.fd_spa_bottleneck.apply(weights_init_kaiming)
+
+            self.fd_freq_bottleneck = nn.BatchNorm1d(self.in_planes)
+            self.fd_freq_bottleneck.bias.requires_grad_(False)
+            self.fd_freq_bottleneck.apply(weights_init_kaiming)
+
+            self.fd_classifier = create_classifier_head(
+                self.ID_LOSS_TYPE, self.fd_in_planes, self.num_classes, cfg, prefix='FD final'
+            )
+            self.fd_spa_classifier = create_classifier_head(
+                self.ID_LOSS_TYPE, self.in_planes, self.num_classes, cfg, prefix='FD spatial'
+            )
+            self.fd_freq_classifier = create_classifier_head(
+                self.ID_LOSS_TYPE, self.in_planes, self.num_classes, cfg, prefix='FD frequency'
+            )
+            print(f'[FD] Initialized Stage2 DWT dual-branch heads: final_dim={self.fd_in_planes}')
         
         # SFM fused分支的head (ModuleList 支持多级级联与深层监督)
         if self.is_mambavision and self.use_sfm:
@@ -334,6 +402,32 @@ class build_transformer(nn.Module):
                     head_idx += 1
             print(f'[SFM] Initialized {head_idx} hierarchical fused heads')
 
+    def _pool_feature_map(self, feature_map, pooling_layer=None):
+        if pooling_layer is None:
+            pooling_layer = self.pooling
+        if pooling_layer is None:
+            pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
+        else:
+            pooled = pooling_layer(feature_map)
+        return pooled.flatten(1)
+
+    def _forward_fd(self, spa_map, freq_map, label=None):
+        spa_feat = self._pool_feature_map(spa_map, self.pooling)
+        freq_feat = self._pool_feature_map(freq_map, self.fd_pooling)
+        final_feat = torch.cat([spa_feat, freq_feat], dim=1)
+
+        final_bn = self.fd_bottleneck(final_feat)
+        spa_bn = self.fd_spa_bottleneck(spa_feat)
+        freq_bn = self.fd_freq_bottleneck(freq_feat)
+
+        if self.training:
+            final_score = classifier_forward(self.fd_classifier, self.ID_LOSS_TYPE, final_bn, label)
+            spa_score = classifier_forward(self.fd_spa_classifier, self.ID_LOSS_TYPE, spa_bn, label)
+            freq_score = classifier_forward(self.fd_freq_classifier, self.ID_LOSS_TYPE, freq_bn, label)
+            return [final_score, spa_score, freq_score], [final_feat, spa_feat, freq_feat]
+
+        return final_bn if self.neck_feat == 'after' else final_feat
+
     def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.is_mambavision or self.is_puzzle:
             # Get backbone output
@@ -341,6 +435,13 @@ class build_transformer(nn.Module):
             
             # Check if SFM mode (output is dict) or normal mode (output is tensor)
             if isinstance(output, dict):
+                if 'freq_map' in output:
+                    return self._forward_fd(
+                        output['backbone_map'],
+                        output['freq_map'],
+                        label=label,
+                    )
+
                 # SFM mode: hierarchical multi-branch processing
                 backbone_map = output['backbone_map']  # (B, 512, 16, 8)
                 fused_maps = output['fused_maps']     # List of intermediate fused maps
@@ -397,11 +498,7 @@ class build_transformer(nn.Module):
                 feature_map = output
                 
                 # Apply pooling
-                if self.pooling is None:
-                    pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
-                else:
-                    pooled = self.pooling(feature_map)
-                global_feat = pooled.flatten(1)
+                global_feat = self._pool_feature_map(feature_map)
                 
                 feat = self.bottleneck(global_feat)
 

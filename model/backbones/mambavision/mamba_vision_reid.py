@@ -808,6 +808,53 @@ class MambaVisionLayer(nn.Module):
         return self.downsample(x)
 
 
+class FeatureDWTBranch(nn.Module):
+    """Feature-level Haar DWT branch for Stage-2 MambaVision maps."""
+
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.ll_adapter = nn.Sequential(
+            nn.Conv2d(in_dim, out_dim, 1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.GELU(approximate='tanh'),
+        )
+        self.hf_adapter = nn.Sequential(
+            nn.Conv2d(in_dim * 3, out_dim, 1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.GELU(approximate='tanh'),
+        )
+        self.fuse = nn.Sequential(
+            nn.Conv2d(out_dim * 2, out_dim, 1, bias=False),
+            nn.BatchNorm2d(out_dim),
+            nn.GELU(approximate='tanh'),
+        )
+
+    @staticmethod
+    def _haar_dwt2d(x):
+        h, w = x.shape[-2:]
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+
+        x00 = x[:, :, 0::2, 0::2]
+        x01 = x[:, :, 0::2, 1::2]
+        x10 = x[:, :, 1::2, 0::2]
+        x11 = x[:, :, 1::2, 1::2]
+
+        ll = (x00 + x01 + x10 + x11) * 0.5
+        lh = (x00 - x01 + x10 - x11) * 0.5
+        hl = (x00 + x01 - x10 - x11) * 0.5
+        hh = (x00 - x01 - x10 + x11) * 0.5
+        return ll, lh, hl, hh
+
+    def forward(self, x):
+        ll, lh, hl, hh = self._haar_dwt2d(x)
+        ll_feat = self.ll_adapter(ll)
+        hf_feat = self.hf_adapter(torch.cat([lh, hl, hh], dim=1))
+        return self.fuse(torch.cat([ll_feat, hf_feat], dim=1))
+
+
 class MambaVisionBackbone(nn.Module):
     """MambaVision backbone for ReID with optional Fine-Grained Branch"""
     def __init__(self, img_size=(256, 128), dim=80, in_dim=32, depths=[1, 3, 8, 4],
@@ -816,7 +863,8 @@ class MambaVisionBackbone(nn.Module):
                  drop_rate=0., attn_drop_rate=0., layer_scale=None, layer_scale_conv=None,
                  global_stages=[], sasf_stages=[],
                  camera=0, view=0, sie_xishu=1.5,
-                 use_sfm=False, sfm_num_layers=1, sfm_depths=[1, 1], sfm_drop_path=0.0):
+                 use_sfm=False, sfm_num_layers=1, sfm_depths=[1, 1], sfm_drop_path=0.0,
+                 use_fd=False):
         """
         Args:
             global_stages: list of stage indices to use global attention instead of window attention.
@@ -828,6 +876,7 @@ class MambaVisionBackbone(nn.Module):
             sfm_num_layers: number of SFM layers (1 or 2).
             sfm_depths: list of depths for each SFM module [sfm_1_depth, sfm_2_depth].
             sfm_drop_path: drop path rate for SFM modules.
+            use_fd: whether to enable Stage-2 feature-level DWT dual branch.
         """
         super().__init__()
         
@@ -918,6 +967,13 @@ class MambaVisionBackbone(nn.Module):
         
         # Hierarchical SimpleFusionMamba (SFM) modules
         self.use_sfm = use_sfm
+        self.use_fd = use_fd
+        if self.use_fd and self.use_sfm:
+            raise ValueError('Feature DWT branch and SFM should not be enabled at the same time.')
+        if self.use_fd:
+            self.fd_branch = FeatureDWTBranch(final_dim, self.proj_dim)
+            print(f'[MambaVision] Feature-level DWT branch enabled: Stage2 {final_dim} -> {self.proj_dim}')
+
         self.sfm_depths = list(sfm_depths)
         while len(self.sfm_depths) < 3:
             self.sfm_depths.append(0)
@@ -1016,6 +1072,7 @@ class MambaVisionBackbone(nn.Module):
         feat_s1 = x
         x = self.levels[1](x)  # Stage 2 -> (B, 384, 16, 8)
         feat_s2 = x
+        freq_map = self.fd_branch(feat_s2) if self.use_fd else None
         
         # Stage 3
         x = self.levels[2](x)  # Stage 3 -> (B, 384, 16, 8)
@@ -1025,6 +1082,11 @@ class MambaVisionBackbone(nn.Module):
         x = self.main_proj(x) 
         x = self.levels[3](x)  # Stage 4 -> (B, 512, 16, 8)
         feat_s4 = x
+        if self.use_fd:
+            return {
+                'backbone_map': feat_s4,
+                'freq_map': freq_map,
+            }
         
         # SFM hierarchical processing
         if self.use_sfm:
@@ -1086,6 +1148,7 @@ def mambavision_tiny_reid(img_size=(256, 128), pretrained_path='', **kwargs):
     sfm_num_layers = kwargs.pop('sfm_num_layers', 1)
     sfm_depths = kwargs.pop('sfm_depths', [1, 1])
     sfm_drop_path = kwargs.pop('sfm_drop_path', 0.0)
+    use_fd = kwargs.pop('use_fd', False)
     
     model = MambaVisionBackbone(
         img_size=img_size,
@@ -1102,6 +1165,7 @@ def mambavision_tiny_reid(img_size=(256, 128), pretrained_path='', **kwargs):
         sfm_num_layers=sfm_num_layers,
         sfm_depths=sfm_depths,
         sfm_drop_path=sfm_drop_path,
+        use_fd=use_fd,
         **kwargs
     )
     if pretrained_path:
@@ -1119,6 +1183,7 @@ def mambavision_small_reid(img_size=(256, 128), pretrained_path='', **kwargs):
     sfm_num_layers = kwargs.pop('sfm_num_layers', 1)
     sfm_depths = kwargs.pop('sfm_depths', [1, 1])
     sfm_drop_path = kwargs.pop('sfm_drop_path', 0.0)
+    use_fd = kwargs.pop('use_fd', False)
     
     model = MambaVisionBackbone(
         img_size=img_size,
@@ -1135,6 +1200,7 @@ def mambavision_small_reid(img_size=(256, 128), pretrained_path='', **kwargs):
         sfm_num_layers=sfm_num_layers,
         sfm_depths=sfm_depths,
         sfm_drop_path=sfm_drop_path,
+        use_fd=use_fd,
         **kwargs
     )
 
@@ -1153,6 +1219,7 @@ def mambavision_base_reid(img_size=(256, 128), pretrained_path='', **kwargs):
     sfm_num_layers = kwargs.pop('sfm_num_layers', 1)
     sfm_depths = kwargs.pop('sfm_depths', [1, 1])
     sfm_drop_path = kwargs.pop('sfm_drop_path', 0.0)
+    use_fd = kwargs.pop('use_fd', False)
     
     model = MambaVisionBackbone(
         img_size=img_size,
@@ -1170,6 +1237,7 @@ def mambavision_base_reid(img_size=(256, 128), pretrained_path='', **kwargs):
         sfm_num_layers=sfm_num_layers,
         sfm_depths=sfm_depths,
         sfm_drop_path=sfm_drop_path,
+        use_fd=use_fd,
         **kwargs
     )
     if pretrained_path:

@@ -86,7 +86,7 @@ def do_train(cfg,
                 scaler.step(optimizer_center)
                 scaler.update()
             
-            # SFM 模式 (score 是 list 时，使用 backbone 分支计算准确率)
+            # 多分支模式 (score 是 list 时，使用主分支计算准确率)
             if isinstance(score, list):
                 acc = (score[0].max(1)[1] == target).float().mean()
             else:
@@ -102,24 +102,36 @@ def do_train(cfg,
                     epoch, (n_iter + 1), len(train_loader),
                     loss_meter.avg, acc_meter.avg, scheduler._get_lr(epoch)[0])
                 
-                # SFM模式：追加各分支loss详情 (精简版)
+                # 多分支模式：追加各分支loss详情 (精简版)
                 if loss_detail is not None:
-                    s_lambda = loss_detail.get('sfm_lambda', 0.0)
-                    id_b = loss_detail.get('id_backbone', 0.0)
-                    tri_b = loss_detail.get('tri_backbone', 0.0)
-                    
-                    log_msg += " | SFM[λ={:.1f}]: ID_b={:.2f}, Tri_b={:.4f}".format(s_lambda, id_b, tri_b)
-                    
-                    # 打印各融合分支的 Loss (不含 CS 相似度)
-                    if isinstance(feat, list) and len(feat) > 1:
-                        for i in range(1, len(feat)):
-                            id_val = loss_detail.get(f'id_fused_{i}', loss_detail.get('id_fused', 0.0))
-                            tri_val = loss_detail.get(f'tri_fused_{i}', loss_detail.get('tri_fused', 0.0))
-                            log_msg += " | F{}[ID={:.2f}, Tri={:.4f}]".format(i, id_val, tri_val)
-                    
-                    # RATR 损失
-                    if 'ratr' in loss_detail:
-                        log_msg += " | RATR={:.4f}".format(loss_detail['ratr'])
+                    if 'fd_id_final' in loss_detail:
+                        log_msg += " | FD[λs={:.1f},λf={:.1f}]: Final[ID={:.2f},Tri={:.4f}] Spa[ID={:.2f},Tri={:.4f}] Freq[ID={:.2f},Tri={:.4f}]".format(
+                            loss_detail.get('fd_lambda_spa', 0.0),
+                            loss_detail.get('fd_lambda_freq', 0.0),
+                            loss_detail.get('fd_id_final', 0.0),
+                            loss_detail.get('fd_tri_final', 0.0),
+                            loss_detail.get('fd_id_spa', 0.0),
+                            loss_detail.get('fd_tri_spa', 0.0),
+                            loss_detail.get('fd_id_freq', 0.0),
+                            loss_detail.get('fd_tri_freq', 0.0),
+                        )
+                    else:
+                        s_lambda = loss_detail.get('sfm_lambda', 0.0)
+                        id_b = loss_detail.get('id_backbone', 0.0)
+                        tri_b = loss_detail.get('tri_backbone', 0.0)
+
+                        log_msg += " | SFM[λ={:.1f}]: ID_b={:.2f}, Tri_b={:.4f}".format(s_lambda, id_b, tri_b)
+
+                        # 打印各融合分支的 Loss (不含 CS 相似度)
+                        if isinstance(feat, list) and len(feat) > 1:
+                            for i in range(1, len(feat)):
+                                id_val = loss_detail.get(f'id_fused_{i}', loss_detail.get('id_fused', 0.0))
+                                tri_val = loss_detail.get(f'tri_fused_{i}', loss_detail.get('tri_fused', 0.0))
+                                log_msg += " | F{}[ID={:.2f}, Tri={:.4f}]".format(i, id_val, tri_val)
+
+                        # RATR 损失
+                        if 'ratr' in loss_detail:
+                            log_msg += " | RATR={:.4f}".format(loss_detail['ratr'])
                 
                 logger.info(log_msg)
 
