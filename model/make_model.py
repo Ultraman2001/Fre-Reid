@@ -187,8 +187,6 @@ class build_transformer(nn.Module):
         self.in_planes = 768
         self.is_puzzle = 'puzzle' in cfg.MODEL.TRANSFORMER_TYPE.lower()
         self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
-        self.use_sdm = False
-        self.sdm_mode = 'stability'
         
         self.pooling = None
 
@@ -199,12 +197,6 @@ class build_transformer(nn.Module):
             
             # SFM 配置
             self.use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
-            self.use_sdm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SDM', False)
-            self.sdm_mode = getattr(cfg.MODEL.MAMBAVISION, 'SDM_MODE', 'stability').lower()
-            if self.use_sdm and self.use_sfm:
-                raise ValueError('SDM mode and SFM mode should not be enabled at the same time.')
-            if self.sdm_mode not in ('freq', 'concat', 'stability'):
-                raise ValueError("SDM_MODE should be one of: 'freq', 'concat', 'stability'.")
             sfm_num_layers = getattr(cfg.MODEL.MAMBAVISION, 'SFM_NUM_LAYERS', 1)
             sfm_depths = list(getattr(cfg.MODEL.MAMBAVISION, 'SFM_DEPTHS', [1, 1]))
             sfm_drop_path = getattr(cfg.MODEL.MAMBAVISION, 'SFM_DROP_PATH', 0.0)
@@ -234,12 +226,6 @@ class build_transformer(nn.Module):
             pooling_type = getattr(cfg.MODEL, 'POOLING_TYPE', 'gem')
             self.pooling = create_pooling(pooling_type)
             print(f'[Model] Using pooling type: {pooling_type}')
-            if self.use_sdm:
-                mean = torch.tensor(cfg.INPUT.PIXEL_MEAN).view(1, 3, 1, 1)
-                std = torch.tensor(cfg.INPUT.PIXEL_STD).view(1, 3, 1, 1)
-                self.register_buffer('sdm_pixel_mean', mean, persistent=False)
-                self.register_buffer('sdm_pixel_std', std, persistent=False)
-                print(f'[SDM] Enabled shared spatial/frequency mode: {self.sdm_mode}')
             
             # SFM 多级聚合 heads
             if self.use_sfm:
@@ -297,14 +283,6 @@ class build_transformer(nn.Module):
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
-
-        if self.is_mambavision and self.use_sdm and self.sdm_mode == 'concat':
-            self.sdm_bottleneck = nn.BatchNorm1d(self.in_planes * 2)
-            self.sdm_bottleneck.bias.requires_grad_(False)
-            self.sdm_bottleneck.apply(weights_init_kaiming)
-            self.sdm_classifier = nn.Linear(self.in_planes * 2, self.num_classes, bias=False)
-            self.sdm_classifier.apply(weights_init_classifier)
-            print('[SDM] Initialized concat BNNeck and classifier')
         
         # SFM fused分支的head (ModuleList 支持多级级联与深层监督)
         if self.is_mambavision and self.use_sfm:
@@ -356,140 +334,8 @@ class build_transformer(nn.Module):
                     head_idx += 1
             print(f'[SFM] Initialized {head_idx} hierarchical fused heads')
 
-    def _unwrap_feature_map(self, output):
-        if isinstance(output, dict):
-            return output['backbone_map']
-        return output
-
-    def _forward_base_map(self, x, cam_label=None, view_label=None, freeze_bn_stats=False):
-        if not (freeze_bn_stats and self.training):
-            return self._unwrap_feature_map(self.base(x, cam_label=cam_label, view_label=view_label))
-
-        frozen_bn = []
-        for module in self.base.modules():
-            if isinstance(module, nn.modules.batchnorm._BatchNorm) and module.training:
-                frozen_bn.append(module)
-                module.eval()
-        try:
-            output = self.base(x, cam_label=cam_label, view_label=view_label)
-        finally:
-            for module in frozen_bn:
-                module.train()
-        return self._unwrap_feature_map(output)
-
-    def _pool_feature_map(self, feature_map):
-        if self.pooling is None:
-            pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
-        else:
-            pooled = self.pooling(feature_map)
-        return pooled.flatten(1)
-
-    def _make_frequency_view(self, x):
-        dtype = x.dtype
-        device_type = x.device.type
-        with torch.amp.autocast(device_type, enabled=False):
-            x_rgb = x.float() * self.sdm_pixel_std.float() + self.sdm_pixel_mean.float()
-            x_rgb = x_rgb.clamp(0.0, 1.0)
-            gray = (
-                0.2989 * x_rgb[:, 0:1] +
-                0.5870 * x_rgb[:, 1:2] +
-                0.1140 * x_rgb[:, 2:3]
-            )
-
-            h, w = gray.shape[-2:]
-            pad_h = h % 2
-            pad_w = w % 2
-            if pad_h or pad_w:
-                gray = nn.functional.pad(gray, (0, pad_w, 0, pad_h), mode='reflect')
-
-            x00 = gray[:, :, 0::2, 0::2]
-            x01 = gray[:, :, 0::2, 1::2]
-            x10 = gray[:, :, 1::2, 0::2]
-            x11 = gray[:, :, 1::2, 1::2]
-
-            ll = (x00 + x01 + x10 + x11) * 0.25
-            lh = (x00 - x01 + x10 - x11) * 0.25
-            hl = (x00 + x01 - x10 - x11) * 0.25
-            hh = (x00 - x01 - x10 + x11) * 0.25
-
-            ll = nn.functional.interpolate(ll, size=gray.shape[-2:], mode='bilinear', align_corners=False)
-            edge = nn.functional.interpolate(lh.abs() + hl.abs(), size=gray.shape[-2:], mode='bilinear', align_corners=False)
-            diag = nn.functional.interpolate(hh.abs(), size=gray.shape[-2:], mode='bilinear', align_corners=False)
-
-            if pad_h or pad_w:
-                ll = ll[:, :, :h, :w]
-                edge = edge[:, :, :h, :w]
-                diag = diag[:, :, :h, :w]
-
-            edge = (edge * 2.0).clamp(0.0, 1.0)
-            diag = (diag * 4.0).clamp(0.0, 1.0)
-            freq = torch.cat([ll.clamp(0.0, 1.0), edge, diag], dim=1)
-            freq = (freq - self.sdm_pixel_mean.float()) / self.sdm_pixel_std.float()
-        return freq.to(dtype)
-
-    def _compute_sdm_stability(self, spa_map, freq_map):
-        diff = (spa_map.float() - freq_map.float()).abs().mean(dim=1, keepdim=True)
-        denom = (spa_map.float().abs() + freq_map.float().abs()).mean(dim=1, keepdim=True) + 1e-6
-        stab = (1.0 - diff / denom).clamp(0.0, 1.0)
-        return stab.to(spa_map.dtype)
-
-    def _forward_sdm(self, x, label=None, cam_label=None, view_label=None):
-        freq_x = self._make_frequency_view(x)
-        spa_map = self._forward_base_map(x, cam_label=cam_label, view_label=view_label)
-        freq_map = self._forward_base_map(
-            freq_x,
-            cam_label=cam_label,
-            view_label=view_label,
-            freeze_bn_stats=True,
-        )
-
-        if self.sdm_mode == 'freq':
-            global_feat = self._pool_feature_map(freq_map)
-            feat = self.bottleneck(global_feat)
-            if self.training:
-                if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                    cls_score = self.classifier(feat, label)
-                else:
-                    cls_score = self.classifier(feat)
-                return cls_score, global_feat
-            return feat if self.neck_feat == 'after' else global_feat
-
-        if self.sdm_mode == 'concat':
-            spa_feat = self._pool_feature_map(spa_map)
-            freq_feat = self._pool_feature_map(freq_map)
-            global_feat = torch.cat([spa_feat, freq_feat], dim=1)
-            feat = self.sdm_bottleneck(global_feat)
-            if self.training:
-                cls_score = self.sdm_classifier(feat)
-                return cls_score, global_feat
-            return feat if self.neck_feat == 'after' else global_feat
-
-        stab = self._compute_sdm_stability(spa_map, freq_map)
-        with torch.no_grad():
-            s = stab.detach()
-            self.sdm_last_stats = {
-                'mean': s.mean(),
-                'var': s.var(unbiased=False),
-                'min': s.min(),
-                'max': s.max(),
-                'freq_w': (1.0 - s).mean(),
-            }
-        fused_map = spa_map * stab + freq_map * (1.0 - stab)
-        global_feat = self._pool_feature_map(fused_map)
-        feat = self.bottleneck(global_feat)
-        if self.training:
-            if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                cls_score = self.classifier(feat, label)
-            else:
-                cls_score = self.classifier(feat)
-            return cls_score, global_feat
-        return feat if self.neck_feat == 'after' else global_feat
-
-    def forward(self, x, label=None, cam_label=None, view_label=None, x2=None, x3=None, **kwargs):
+    def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.is_mambavision or self.is_puzzle:
-            if self.is_mambavision and self.use_sdm:
-                return self._forward_sdm(x, label=label, cam_label=cam_label, view_label=view_label)
-
             # Get backbone output
             output = self.base(x, cam_label=cam_label, view_label=view_label)
             
@@ -550,7 +396,12 @@ class build_transformer(nn.Module):
                 # Normal mode: single tensor output
                 feature_map = output
                 
-                global_feat = self._pool_feature_map(feature_map)
+                # Apply pooling
+                if self.pooling is None:
+                    pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
+                else:
+                    pooled = self.pooling(feature_map)
+                global_feat = pooled.flatten(1)
                 
                 feat = self.bottleneck(global_feat)
 

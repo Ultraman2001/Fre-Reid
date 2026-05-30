@@ -120,20 +120,6 @@ def do_train(cfg,
                     # RATR 损失
                     if 'ratr' in loss_detail:
                         log_msg += " | RATR={:.4f}".format(loss_detail['ratr'])
-
-                raw_model = model.module if hasattr(model, "module") else model
-                if hasattr(raw_model, "sdm_last_stats"):
-                    st = raw_model.sdm_last_stats
-                    log_msg += (
-                        " | SDM: stab_mean={:.3f}, var={:.5f}, min={:.3f}, max={:.3f}, freq_w={:.3f}"
-                        .format(
-                            st["mean"].item(),
-                            st["var"].item(),
-                            st["min"].item(),
-                            st["max"].item(),
-                            st["freq_w"].item(),
-                        )
-                    )
                 
                 logger.info(log_msg)
 
