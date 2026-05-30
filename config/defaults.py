@@ -72,6 +72,8 @@ _C.MODEL.MAMBAVISION.SFM_NUM_LAYERS = 3   # 已升级为 3 层层级聚合 (Stag
 _C.MODEL.MAMBAVISION.SFM_DEPTHS = [1, 1, 1]  # [S1+2, F12+3, F23+4] 各级融合 Block 数
 _C.MODEL.MAMBAVISION.SFM_DROP_PATH = 0.1  # SFM 模块内部的 DropPath 概率
 _C.MODEL.MAMBAVISION.SFM_POOLING_TYPE = 'gem'  # SFM 分支池化类型 ('gem', 'avg', 'max', 'avg_max')
+_C.MODEL.MAMBAVISION.USE_SDM = False      # Shared-backbone spatial/frequency dual-view mode
+_C.MODEL.MAMBAVISION.SDM_MODE = 'stability'  # 'freq', 'concat', or 'stability'
 
 # EMA Setting
 _C.MODEL.EMA = CN()
