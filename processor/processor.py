@@ -247,8 +247,8 @@ def do_inference(cfg,
     model.eval()
     img_path_list = []
     
-    # Collect features for all branches
-    all_feats = {'backbone': [], 'fused': [], 'concat': []}
+    # Collect features for all returned branches.
+    all_feats = {}
     all_pids = []
     all_camids = []
 
@@ -259,13 +259,13 @@ def do_inference(cfg,
             target_view = target_view.to(device)
             feat = model(img, cam_label=camids, view_label=target_view)
             
-            # Handle dict output (SFM mode) or tensor output (normal mode)
+            # Handle dict output (SFM/FD modes) or tensor output (normal mode)
             if isinstance(feat, dict):
-                for key in all_feats.keys():
-                    all_feats[key].append(feat[key].cpu())
+                for key, value in feat.items():
+                    all_feats.setdefault(key, []).append(value.cpu())
             else:
                 # Normal mode: only concat available
-                all_feats['concat'].append(feat.cpu())
+                all_feats.setdefault('concat', []).append(feat.cpu())
             
             all_pids.extend(pid.tolist() if hasattr(pid, 'tolist') else pid)
             all_camids.extend(camid.tolist() if hasattr(camid, 'tolist') else camid)

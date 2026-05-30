@@ -428,14 +428,14 @@ class build_transformer(nn.Module):
 
         if self.neck_feat == 'after':
             return {
-                'backbone': spa_bn,
-                'fused': freq_bn,
+                'spa': spa_bn,
+                'freq': freq_bn,
                 'concat': final_bn,
             }
 
         return {
-            'backbone': spa_feat,
-            'fused': freq_feat,
+            'spa': spa_feat,
+            'freq': freq_feat,
             'concat': final_feat,
         }
 
