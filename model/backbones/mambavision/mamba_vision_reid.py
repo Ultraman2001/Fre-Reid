@@ -1089,7 +1089,7 @@ class MambaVisionBackbone(nn.Module):
         # Stage 1, 2
         x = self.levels[0](x)  # Stage 1 -> (B, 192, 32, 16)
         feat_s1 = x
-        freq_map = self.fd_branch(feat_s1) if self.use_fd else None
+        freq_map = self.fd_branch(feat_s1.detach()) if self.use_fd else None
         x = self.levels[1](x)  # Stage 2 -> (B, 384, 16, 8)
         feat_s2 = x
         
