@@ -9,12 +9,23 @@ from .softmax_loss import CrossEntropyLabelSmooth, LabelSmoothingCrossEntropy
 from .triplet_loss import TripletLoss
 from .center_loss import CenterLoss
 from .ratr_loss import RATRLoss
+from .bpbreid_loss import BPBreIDLoss
 
 
 def make_loss(cfg, num_classes):    # modified by gu
     sampler = cfg.DATALOADER.SAMPLER
     feat_dim = 2048
     center_criterion = CenterLoss(num_classes=num_classes, feat_dim=feat_dim, use_gpu=True)  # center loss
+    bpbreid_enabled = getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ENABLED', False)
+    if bpbreid_enabled:
+        bpbreid_loss = BPBreIDLoss(cfg, num_classes)
+        print("using BPBreID GiLt + body-part attention loss")
+
+        def loss_func(score, feat, target, target_cam, target_masks=None):
+            return bpbreid_loss(score, target, target_masks)
+
+        return loss_func, center_criterion
+
     if 'triplet' in cfg.MODEL.METRIC_LOSS_TYPE:
         if cfg.MODEL.NO_MARGIN:
             triplet = TripletLoss()

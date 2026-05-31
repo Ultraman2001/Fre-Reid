@@ -36,6 +36,13 @@ def make_optimizer(cfg, model, center_criterion):
                 print(f"Using {cfg.SOLVER.STAGE4_LR_FACTOR}x learning rate for Stage 4 (levels.3): {key}")
                 printed_high_lr_keys.add("levels.3")
 
+        elif "bpbreid_head" in key:
+            bp_lr_factor = getattr(cfg.SOLVER, 'BPBREID_LR_FACTOR', 2.0)
+            lr = cfg.SOLVER.BASE_LR * bp_lr_factor
+            if "bpbreid_head" not in printed_high_lr_keys:
+                print(f"Using {bp_lr_factor}x learning rate for BPBreID head: {key}")
+                printed_high_lr_keys.add("bpbreid_head")
+
         if "bias" in key:
             # Scale the *current* LR (whether base or high) by the bias factor
             lr = lr * cfg.SOLVER.BIAS_LR_FACTOR

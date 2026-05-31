@@ -39,8 +39,17 @@ def do_train(cfg,
     loss_meter = AverageMeter()
     acc_meter = AverageMeter()
 
-    evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
+    evaluator = R1_mAP_eval(
+        num_query,
+        max_rank=50,
+        feat_norm=cfg.TEST.FEAT_NORM,
+        reranking=cfg.TEST.RE_RANKING,
+        bp_anchor_distance_weight=float(
+            getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ANCHOR_DISTANCE_WEIGHT', 0.0)
+        ),
+    )
     scaler = amp.GradScaler('cuda')
+    bpbreid_enabled = getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ENABLED', False)
     # train
     for epoch in range(1, epochs + 1):
         start_time = time.time()
@@ -49,18 +58,34 @@ def do_train(cfg,
         evaluator.reset()
         scheduler.step(epoch)
         model.train()
-        for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader):
+        for n_iter, batch in enumerate(train_loader):
+            if bpbreid_enabled:
+                img, vid, target_cam, target_view, target_masks = batch
+            else:
+                img, vid, target_cam, target_view = batch
+                target_masks = None
             optimizer.zero_grad()
             optimizer_center.zero_grad()
             img = img.to(device)
             target = vid.to(device)
             target_cam = target_cam.to(device)
             target_view = target_view.to(device)
+            if target_masks is not None:
+                target_masks = target_masks.to(device)
             with amp.autocast('cuda'):
-                score, feat = model(img, target, cam_label=target_cam, view_label=target_view)
+                score, feat = model(
+                    img,
+                    target,
+                    cam_label=target_cam,
+                    view_label=target_view,
+                    external_parts_masks=target_masks,
+                )
             
             # Loss 计算在 FP32 下进行，避免 FP16 溢出导致 NaN
-            loss_result = loss_fn(score, feat, target, target_cam)
+            if bpbreid_enabled:
+                loss_result = loss_fn(score, feat, target, target_cam, target_masks=target_masks)
+            else:
+                loss_result = loss_fn(score, feat, target, target_cam)
             if isinstance(loss_result, tuple):
                 loss, loss_detail = loss_result
             else:
@@ -87,7 +112,10 @@ def do_train(cfg,
                 scaler.update()
             
             # SFM 模式 (score 是 list 时，使用 backbone 分支计算准确率)
-            if isinstance(score, list):
+            if isinstance(score, dict) and score.get('type') == 'bpbreid':
+                cls_score = score['id_cls_scores'].get('foreg', score['id_cls_scores'].get('globl'))
+                acc = (cls_score.max(1)[1] == target).float().mean()
+            elif isinstance(score, list):
                 acc = (score[0].max(1)[1] == target).float().mean()
             else:
                 acc = (score.max(1)[1] == target).float().mean()
@@ -103,7 +131,21 @@ def do_train(cfg,
                     loss_meter.avg, acc_meter.avg, scheduler._get_lr(epoch)[0])
                 
                 # SFM模式：追加各分支loss详情 (精简版)
-                if loss_detail is not None:
+                if loss_detail is not None and 'bp_loss' in loss_detail:
+                    log_msg += " | BP[ID_g={:.2f}, ID_f={:.2f}, Tri_p={:.4f}, Pix={:.4f}]".format(
+                        loss_detail.get('globl_id', 0.0),
+                        loss_detail.get('foreg_id', 0.0),
+                        loss_detail.get('parts_tri', 0.0),
+                        loss_detail.get('pixels_ce', 0.0),
+                    )
+                    if 'pixels_acc' in loss_detail:
+                        log_msg += " | PixAcc={:.3f}".format(loss_detail['pixels_acc'])
+                    if 'anchor_id' in loss_detail or 'anchor_tri' in loss_detail:
+                        log_msg += " | Anchor[ID={:.2f}, Tri={:.4f}]".format(
+                            loss_detail.get('anchor_id', 0.0),
+                            loss_detail.get('anchor_tri', 0.0),
+                        )
+                elif loss_detail is not None:
                     s_lambda = loss_detail.get('sfm_lambda', 0.0)
                     id_b = loss_detail.get('id_backbone', 0.0)
                     tri_b = loss_detail.get('tri_backbone', 0.0)
@@ -188,14 +230,26 @@ def do_train(cfg,
             def run_eval(eval_model, desc="Validation"):
                 eval_model.eval()
                 evaluator.reset()
-                for n_iter, (img, vid, camid, camids, target_view, _) in enumerate(val_loader):
+                for n_iter, batch in enumerate(val_loader):
+                    if bpbreid_enabled:
+                        img, vid, camid, camids, target_view, _, target_masks = batch
+                    else:
+                        img, vid, camid, camids, target_view, _ = batch
+                        target_masks = None
                     with torch.no_grad():
                         img = img.to(device)
                         camids = camids.to(device)
                         target_view = target_view.to(device)
-                        feat = eval_model(img, cam_label=camids, view_label=target_view)
+                        if target_masks is not None:
+                            target_masks = target_masks.to(device)
+                        feat = eval_model(
+                            img,
+                            cam_label=camids,
+                            view_label=target_view,
+                            external_parts_masks=target_masks,
+                        )
                         # Handle dict output (SFM mode) - use concat for training validation
-                        if isinstance(feat, dict):
+                        if isinstance(feat, dict) and 'bp_features' not in feat:
                             feat = feat['concat']
                         evaluator.update((feat, vid, camid))
                 cmc, mAP, _, _, _, _, _ = evaluator.compute()
@@ -234,7 +288,42 @@ def do_inference(cfg,
 
     model.eval()
     img_path_list = []
-    
+    bpbreid_enabled = getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ENABLED', False)
+
+    if bpbreid_enabled:
+        evaluator = R1_mAP_eval(
+            num_query,
+            max_rank=50,
+            feat_norm=cfg.TEST.FEAT_NORM,
+            reranking=cfg.TEST.RE_RANKING,
+            bp_anchor_distance_weight=float(
+                getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ANCHOR_DISTANCE_WEIGHT', 0.0)
+            ),
+        )
+        evaluator.reset()
+        for n_iter, batch in enumerate(val_loader):
+            img, pid, camid, camids, target_view, imgpath, target_masks = batch
+            with torch.no_grad():
+                img = img.to(device)
+                camids = camids.to(device)
+                target_view = target_view.to(device)
+                target_masks = target_masks.to(device)
+                feat = model(
+                    img,
+                    cam_label=camids,
+                    view_label=target_view,
+                    external_parts_masks=target_masks,
+                )
+                evaluator.update((feat, pid, camid))
+                img_path_list.extend(imgpath)
+
+        cmc, mAP, _, _, _, _, _ = evaluator.compute()
+        logger.info("=== BPBREID VISIBILITY Results ===")
+        logger.info("mAP: {:.1%}".format(mAP))
+        for r in [1, 5, 10]:
+            logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+        return cmc[0], cmc[4]
+
     # Collect features for all branches
     all_feats = {'backbone': [], 'fused': [], 'concat': []}
     all_pids = []
