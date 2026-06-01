@@ -3,7 +3,6 @@ import torchvision.transforms as T
 from torch.utils.data import DataLoader
 
 from .bases import ImageDataset
-from .bpbreid_transforms import BPReIDTransform
 from timm.data.random_erasing import RandomErasing
 from .sampler import RandomIdentitySampler
 from .dukemtmcreid import DukeMTMCreID
@@ -27,13 +26,6 @@ def train_collate_fn(batch):
     """
     # collate_fn这个函数的输入就是一个list，list的长度是一个batch size，list中的每个元素都是__getitem__得到的结果
     """
-    if len(batch[0]) == 6:
-        imgs, pids, camids, viewids, _, masks = zip(*batch)
-        pids = torch.tensor(pids, dtype=torch.int64)
-        viewids = torch.tensor(viewids, dtype=torch.int64)
-        camids = torch.tensor(camids, dtype=torch.int64)
-        return torch.stack(imgs, dim=0), pids, camids, viewids, torch.stack(masks, dim=0)
-
     imgs, pids, camids, viewids , _ = zip(*batch)
     pids = torch.tensor(pids, dtype=torch.int64)
     viewids = torch.tensor(viewids, dtype=torch.int64)
@@ -41,20 +33,12 @@ def train_collate_fn(batch):
     return torch.stack(imgs, dim=0), pids, camids, viewids,
 
 def val_collate_fn(batch):
-    if len(batch[0]) == 6:
-        imgs, pids, camids, viewids, img_paths, masks = zip(*batch)
-        viewids = torch.tensor(viewids, dtype=torch.int64)
-        camids_batch = torch.tensor(camids, dtype=torch.int64)
-        return torch.stack(imgs, dim=0), pids, camids, camids_batch, viewids, img_paths, torch.stack(masks, dim=0)
-
     imgs, pids, camids, viewids, img_paths = zip(*batch)
     viewids = torch.tensor(viewids, dtype=torch.int64)
     camids_batch = torch.tensor(camids, dtype=torch.int64)
     return torch.stack(imgs, dim=0), pids, camids, camids_batch, viewids, img_paths
 
 def make_dataloader(cfg):
-    bpbreid_enabled = getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ENABLED', False)
-
     train_transforms = T.Compose([
             T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
             T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
@@ -76,33 +60,8 @@ def make_dataloader(cfg):
 
     dataset = __factory[cfg.DATASETS.NAMES](root=cfg.DATASETS.ROOT_DIR)
 
-    if bpbreid_enabled:
-        bp_train_transforms = BPReIDTransform(cfg, is_train=True)
-        bp_val_transforms = BPReIDTransform(cfg, is_train=False)
-        print('[BPBreID] Loading PifPaf parsing masks from {}/{}/{}'.format(
-            cfg.MODEL.BPBREID.MASKS_ROOT or '<dataset-root>',
-            cfg.MODEL.BPBREID.MASKS_BASE_DIR,
-            cfg.MODEL.BPBREID.MASKS_DIR,
-        ))
-        for split_name, samples in [
-            ('train', dataset.train),
-            ('query', dataset.query),
-            ('gallery', dataset.gallery),
-        ]:
-            if not samples:
-                continue
-            mask_path, source_shape, processed_shape = bp_val_transforms.validate_sample(samples[0][0])
-            print('[BPBreID] Validated {} mask: {} {} -> {}'.format(
-                split_name,
-                mask_path,
-                source_shape,
-                processed_shape,
-            ))
-        train_set = ImageDataset(dataset.train, bp_transform=bp_train_transforms)
-        train_set_normal = ImageDataset(dataset.train, bp_transform=bp_val_transforms)
-    else:
-        train_set = ImageDataset(dataset.train, train_transforms)
-        train_set_normal = ImageDataset(dataset.train, val_transforms)
+    train_set = ImageDataset(dataset.train, train_transforms)
+    train_set_normal = ImageDataset(dataset.train, val_transforms)
     num_classes = dataset.num_train_pids
     cam_num = dataset.num_train_cams
     view_num = dataset.num_train_vids
@@ -137,10 +96,7 @@ def make_dataloader(cfg):
     else:
         print('unsupported sampler! expected softmax or triplet but got {}'.format(cfg.SAMPLER))
 
-    if bpbreid_enabled:
-        val_set = ImageDataset(dataset.query + dataset.gallery, bp_transform=bp_val_transforms)
-    else:
-        val_set = ImageDataset(dataset.query + dataset.gallery, val_transforms)
+    val_set = ImageDataset(dataset.query + dataset.gallery, val_transforms)
 
     val_loader = DataLoader(
         val_set, batch_size=cfg.TEST.IMS_PER_BATCH, shuffle=False, num_workers=num_workers,

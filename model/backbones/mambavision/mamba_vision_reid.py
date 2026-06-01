@@ -834,7 +834,6 @@ class MambaVisionBackbone(nn.Module):
         self.dim = dim  # 保存 dim 以供 make_model.py 访问
         self.img_size = img_size
         self.patch_embed = PatchEmbed(in_chans=in_chans, in_dim=in_dim, dim=dim)
-        self.patch_embed_dim = dim
         
         # SIE (Side Information Embedding)
         self.cam_num = camera
@@ -984,8 +983,7 @@ class MambaVisionBackbone(nn.Module):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def forward(self, x, cam_label=None, view_label=None, return_features=False,
-                return_bpbreid_features=False):
+    def forward(self, x, cam_label=None, view_label=None, return_features=False):
         x = self.patch_embed(x)
         
         # Apply SIE embedding (broadcast from 1x1 to HxW)
@@ -1005,7 +1003,6 @@ class MambaVisionBackbone(nn.Module):
             else:
                 sie = 0
             x = x + sie
-        feat_patch = x
         
         if return_features:
             features = []
@@ -1015,23 +1012,24 @@ class MambaVisionBackbone(nn.Module):
             return features
         
         # Stage 1, 2
-        x = self.levels[0](x)  # Stage 1 -> (B, C1, H/8, W/8)
+        x = self.levels[0](x)  # Stage 1 -> (B, 192, 32, 16)
         feat_s1 = x
-        x = self.levels[1](x)  # Stage 2 -> (B, C2, H/16, W/16)
+        x = self.levels[1](x)  # Stage 2 -> (B, 384, 16, 8)
         feat_s2 = x
         
         # Stage 3
-        x = self.levels[2](x)  # Stage 3 keeps H/16, W/16
+        x = self.levels[2](x)  # Stage 3 -> (B, 384, 16, 8)
         feat_s3 = x
         
         # Dimension Projection (384 -> 512) and Stage 4
         x = self.main_proj(x) 
-        x = self.levels[3](x)  # Stage 4 keeps H/16, W/16
+        x = self.levels[3](x)  # Stage 4 -> (B, 512, 16, 8)
         feat_s4 = x
         
         # SFM hierarchical processing
-        fused_maps = []
         if self.use_sfm:
+            fused_maps = []
+            
             # --- Tier 1: S1 + S2 ---
             curr_fused = None
             if self.sfm_depths[0] > 0:
@@ -1050,18 +1048,13 @@ class MambaVisionBackbone(nn.Module):
                 curr_fused = self.sfm_s34(low_feat, feat_s4)
                 fused_maps.append(curr_fused)
             
-        if self.use_sfm or return_bpbreid_features:
-            output = {
+            return {
                 'backbone_map': feat_s4,
+                'fused_maps': fused_maps,  # List of maps for deep supervision
             }
-            if self.use_sfm:
-                output['fused_maps'] = fused_maps  # List of maps for deep supervision
-            if return_bpbreid_features:
-                output['bpbreid_shallow_map'] = feat_patch
-            return output
-
-        # Return SPATIAL MAP (B, C, H, W)
-        return feat_s4
+        else:
+            # Return SPATIAL MAP (B, C, H, W)
+            return feat_s4
 
     def load_param(self, model_path):
         param_dict = torch.load(model_path, map_location='cpu')

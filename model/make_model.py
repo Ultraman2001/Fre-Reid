@@ -4,7 +4,6 @@ from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
 from .backbones.mambavision.mamba_vision_reid import mambavision_tiny_reid, mambavision_small_reid, mambavision_base_reid
-from .heads import BPBreIDHead
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
 
@@ -188,10 +187,6 @@ class build_transformer(nn.Module):
         self.in_planes = 768
         self.is_puzzle = 'puzzle' in cfg.MODEL.TRANSFORMER_TYPE.lower()
         self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
-        self.use_bpbreid = self.is_mambavision and getattr(getattr(cfg.MODEL, 'BPBREID', None), 'ENABLED', False)
-        self.bpbreid_anchor_enabled = self.use_bpbreid and bool(
-            getattr(cfg.MODEL.BPBREID, 'ANCHOR_ENABLED', False)
-        )
         
         self.pooling = None
 
@@ -231,15 +226,6 @@ class build_transformer(nn.Module):
             pooling_type = getattr(cfg.MODEL, 'POOLING_TYPE', 'gem')
             self.pooling = create_pooling(pooling_type)
             print(f'[Model] Using pooling type: {pooling_type}')
-            if self.use_bpbreid:
-                self.bpbreid_head = BPBreIDHead(
-                    self.in_planes,
-                    num_classes,
-                    cfg,
-                    shallow_dim=self.base.patch_embed_dim,
-                    global_pooling=create_pooling(pooling_type),
-                )
-                print(f'[BPBreID] Enabled on MambaVision high-resolution feature adapter, parts={cfg.MODEL.BPBREID.PARTS_NUM}')
             
             # SFM 多级聚合 heads
             if self.use_sfm:
@@ -348,49 +334,11 @@ class build_transformer(nn.Module):
                     head_idx += 1
             print(f'[SFM] Initialized {head_idx} hierarchical fused heads')
 
-    def forward(self, x, label=None, cam_label=None, view_label=None, external_parts_masks=None):
+    def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.is_mambavision or self.is_puzzle:
             # Get backbone output
-            if self.use_bpbreid:
-                output = self.base(
-                    x,
-                    cam_label=cam_label,
-                    view_label=view_label,
-                    return_bpbreid_features=True,
-                )
-            else:
-                output = self.base(x, cam_label=cam_label, view_label=view_label)
-
-            if self.use_bpbreid:
-                feature_map = output['backbone_map']
-                shallow_map = output['bpbreid_shallow_map']
-                bp_output = self.bpbreid_head(
-                    feature_map,
-                    external_parts_masks=external_parts_masks,
-                    shallow_features=shallow_map,
-                )
-                anchor_feat = None
-                if self.bpbreid_anchor_enabled:
-                    anchor_feat = self.pooling(feature_map).flatten(1)
-                    anchor_feat_bn = self.bottleneck(anchor_feat)
-                    if self.training:
-                        if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                            anchor_cls_score = self.classifier(anchor_feat_bn, label)
-                        else:
-                            anchor_cls_score = self.classifier(anchor_feat_bn)
-                        bp_output['anchor_cls_score'] = anchor_cls_score
-                        bp_output['anchor_embedding'] = anchor_feat
-                if self.training:
-                    return bp_output, bp_output
-                eval_output = {
-                    'concat': bp_output['concat'],
-                    'bp_features': bp_output['bp_features'],
-                    'bp_visibility': bp_output['bp_visibility'],
-                }
-                if self.bpbreid_anchor_enabled:
-                    eval_output['bp_anchor'] = anchor_feat_bn if self.neck_feat == 'after' else anchor_feat
-                return eval_output
-
+            output = self.base(x, cam_label=cam_label, view_label=view_label)
+            
             # Check if SFM mode (output is dict) or normal mode (output is tensor)
             if isinstance(output, dict):
                 # SFM mode: hierarchical multi-branch processing

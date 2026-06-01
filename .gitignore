@@ -229,7 +229,6 @@ runs/
 wandb/
 pretrained/
 checkpoints/
-data/
 *.pth
 *.pth.tar
 *.pt
