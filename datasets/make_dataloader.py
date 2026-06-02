@@ -2,7 +2,7 @@ import torch
 import torchvision.transforms as T
 from torch.utils.data import DataLoader
 
-from .bases import ImageDataset
+from .bases import ImageDataset, ParallelAugmentationImageDataset
 from timm.data.random_erasing import RandomErasing
 from .sampler import RandomIdentitySampler
 from .dukemtmcreid import DukeMTMCreID
@@ -32,6 +32,22 @@ def train_collate_fn(batch):
     camids = torch.tensor(camids, dtype=torch.int64)
     return torch.stack(imgs, dim=0), pids, camids, viewids,
 
+
+def pam_train_collate_fn(batch):
+    imgs_base, imgs_crop, imgs_erase, pids, camids, viewids, _ = zip(*batch)
+    pids = torch.tensor(pids, dtype=torch.int64)
+    viewids = torch.tensor(viewids, dtype=torch.int64)
+    camids = torch.tensor(camids, dtype=torch.int64)
+    return (
+        torch.stack(imgs_base, dim=0),
+        torch.stack(imgs_crop, dim=0),
+        torch.stack(imgs_erase, dim=0),
+        pids,
+        camids,
+        viewids,
+    )
+
+
 def val_collate_fn(batch):
     imgs, pids, camids, viewids, img_paths = zip(*batch)
     viewids = torch.tensor(viewids, dtype=torch.int64)
@@ -39,6 +55,7 @@ def val_collate_fn(batch):
     return torch.stack(imgs, dim=0), pids, camids, camids_batch, viewids, img_paths
 
 def make_dataloader(cfg):
+    pam_enabled = cfg.INPUT.PAM.ENABLED
     train_transforms = T.Compose([
             T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
             T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
@@ -48,6 +65,33 @@ def make_dataloader(cfg):
             T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
             RandomErasing(probability=cfg.INPUT.RE_PROB, mode='pixel', max_count=1, device='cpu'),
             # RandomErasing(probability=cfg.INPUT.RE_PROB, mean=cfg.INPUT.PIXEL_MEAN)
+        ])
+
+    if pam_enabled:
+        pam_base_transforms = T.Compose([
+            T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+            T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
+            T.ToTensor(),
+            T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+        ])
+        pam_crop_transforms = T.Compose([
+            T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+            T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
+            T.Pad(cfg.INPUT.PAM.CROP_PADDING),
+            T.RandomResizedCrop(
+                cfg.INPUT.SIZE_TRAIN,
+                scale=tuple(cfg.INPUT.PAM.CROP_SCALE),
+                ratio=tuple(cfg.INPUT.PAM.CROP_RATIO),
+                interpolation=3,
+            ),
+            T.ToTensor(),
+            T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+        ])
+        pam_eraser_transforms = T.Compose([
+            T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+            T.ToTensor(),
+            T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+            RandomErasing(probability=1.0, mode='pixel', max_count=1, device='cpu'),
         ])
 
     val_transforms = T.Compose([
@@ -60,7 +104,18 @@ def make_dataloader(cfg):
 
     dataset = __factory[cfg.DATASETS.NAMES](root=cfg.DATASETS.ROOT_DIR)
 
-    train_set = ImageDataset(dataset.train, train_transforms)
+    if pam_enabled:
+        print('[Data] PAM enabled: BA + CA + EA training views')
+        train_set = ParallelAugmentationImageDataset(
+            dataset.train,
+            pam_base_transforms,
+            pam_crop_transforms,
+            pam_eraser_transforms,
+        )
+        train_collate = pam_train_collate_fn
+    else:
+        train_set = ImageDataset(dataset.train, train_transforms)
+        train_collate = train_collate_fn
     train_set_normal = ImageDataset(dataset.train, val_transforms)
     num_classes = dataset.num_train_pids
     cam_num = dataset.num_train_cams
@@ -76,21 +131,21 @@ def make_dataloader(cfg):
                 train_set,
                 num_workers=num_workers,
                 batch_sampler=batch_sampler,
-                collate_fn=train_collate_fn,
+                collate_fn=train_collate,
                 pin_memory=True,
             )
         else:
             train_loader = DataLoader(
                 train_set, batch_size=cfg.SOLVER.IMS_PER_BATCH,
                 sampler=RandomIdentitySampler(dataset.train, cfg.SOLVER.IMS_PER_BATCH, cfg.DATALOADER.NUM_INSTANCE),
-                num_workers=num_workers, collate_fn=train_collate_fn,
+                num_workers=num_workers, collate_fn=train_collate,
                 pin_memory=True, persistent_workers=True if num_workers > 0 else False,
             )
     elif cfg.DATALOADER.SAMPLER == 'softmax':
         print('using softmax sampler')
         train_loader = DataLoader(
             train_set, batch_size=cfg.SOLVER.IMS_PER_BATCH, shuffle=True, num_workers=num_workers,
-            collate_fn=train_collate_fn, pin_memory=True,
+            collate_fn=train_collate, pin_memory=True,
             persistent_workers=True if num_workers > 0 else False,
         )
     else:

@@ -187,6 +187,8 @@ class build_transformer(nn.Module):
         self.in_planes = 768
         self.is_puzzle = 'puzzle' in cfg.MODEL.TRANSFORMER_TYPE.lower()
         self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
+        self.use_sfm = False
+        self.use_pam = cfg.INPUT.PAM.ENABLED
         
         self.pooling = None
 
@@ -283,6 +285,24 @@ class build_transformer(nn.Module):
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
+
+        if self.use_pam:
+            if not self.is_mambavision:
+                raise ValueError('PAM currently supports the MambaVision backbone only')
+            if self.use_sfm:
+                raise ValueError('PAM and SFM must be evaluated separately')
+
+            self.bottleneck_pam_crop = nn.BatchNorm1d(self.in_planes)
+            self.bottleneck_pam_crop.bias.requires_grad_(False)
+            self.bottleneck_pam_crop.apply(weights_init_kaiming)
+
+            self.bottleneck_pam_erase = nn.BatchNorm1d(self.in_planes)
+            self.bottleneck_pam_erase.bias.requires_grad_(False)
+            self.bottleneck_pam_erase.apply(weights_init_kaiming)
+
+            self.classifier_pam_crop = copy.deepcopy(self.classifier)
+            self.classifier_pam_erase = copy.deepcopy(self.classifier)
+            print('[Model] PAM enabled: shared MambaVision backbone with BA, CA and EA heads')
         
         # SFM fused分支的head (ModuleList 支持多级级联与深层监督)
         if self.is_mambavision and self.use_sfm:
@@ -334,7 +354,51 @@ class build_transformer(nn.Module):
                     head_idx += 1
             print(f'[SFM] Initialized {head_idx} hierarchical fused heads')
 
+    def _classify(self, classifier, feat, label):
+        if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+            return classifier(feat, label)
+        return classifier(feat)
+
+    def _pool_feature_map(self, feature_map):
+        if self.pooling is None:
+            pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
+        else:
+            pooled = self.pooling(feature_map)
+        return pooled.flatten(1)
+
+    def _forward_pam(self, x, label, cam_label, view_label):
+        if not isinstance(x, (tuple, list)) or len(x) != 3:
+            raise ValueError('PAM training expects BA, CA and EA image tensors')
+
+        img_base, img_crop, img_erase = x
+        stacked_img = torch.cat([img_base, img_crop, img_erase], dim=0)
+        stacked_cam = torch.cat([cam_label] * 3, dim=0) if cam_label is not None else None
+        stacked_view = torch.cat([view_label] * 3, dim=0) if view_label is not None else None
+
+        output = self.base(stacked_img, cam_label=stacked_cam, view_label=stacked_view)
+        if isinstance(output, dict):
+            raise ValueError('PAM and SFM must be evaluated separately')
+
+        map_base, map_crop, map_erase = output.chunk(3, dim=0)
+        feat_base = self._pool_feature_map(map_base)
+        feat_crop = self._pool_feature_map(map_crop)
+        feat_erase = self._pool_feature_map(map_erase)
+
+        feat_base_bn = self.bottleneck(feat_base)
+        feat_crop_bn = self.bottleneck_pam_crop(feat_crop)
+        feat_erase_bn = self.bottleneck_pam_erase(feat_erase)
+
+        scores = [
+            self._classify(self.classifier, feat_base_bn, label),
+            self._classify(self.classifier_pam_crop, feat_crop_bn, label),
+            self._classify(self.classifier_pam_erase, feat_erase_bn, label),
+        ]
+        return scores, [feat_base, feat_crop, feat_erase]
+
     def forward(self, x, label=None, cam_label=None, view_label=None):
+        if self.use_pam and self.training:
+            return self._forward_pam(x, label, cam_label, view_label)
+
         if self.is_mambavision or self.is_puzzle:
             # Get backbone output
             output = self.base(x, cam_label=cam_label, view_label=view_label)
@@ -397,19 +461,12 @@ class build_transformer(nn.Module):
                 feature_map = output
                 
                 # Apply pooling
-                if self.pooling is None:
-                    pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
-                else:
-                    pooled = self.pooling(feature_map)
-                global_feat = pooled.flatten(1)
+                global_feat = self._pool_feature_map(feature_map)
                 
                 feat = self.bottleneck(global_feat)
 
                 if self.training:
-                    if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
-                        cls_score = self.classifier(feat, label)
-                    else:
-                        cls_score = self.classifier(feat)
+                    cls_score = self._classify(self.classifier, feat, label)
                     
                     return cls_score, global_feat
                 else:

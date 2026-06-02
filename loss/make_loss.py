@@ -47,8 +47,39 @@ def make_loss(cfg, num_classes):    # modified by gu
             if cfg.MODEL.METRIC_LOSS_TYPE == 'triplet':
                 # 支持多分支模式 (PMS 或 SFM)
                 if isinstance(score, list):
-                    # 检查是 SFM 模式还是 PMS 模式
+                    use_pam = cfg.INPUT.PAM.ENABLED
                     use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
+
+                    if use_pam:
+                        if len(score) != 3 or len(feat) != 3:
+                            raise ValueError('PAM loss expects BA, CA and EA branches')
+
+                        pam_weight = cfg.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT
+                        branch_names = ('ba', 'ca', 'ea')
+                        id_losses = []
+                        tri_losses = []
+
+                        for branch_score, branch_feat in zip(score, feat):
+                            if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                                id_losses.append(xent(branch_score.float(), target))
+                            else:
+                                id_losses.append(F.cross_entropy(branch_score.float(), target))
+                            tri_losses.append(triplet(branch_feat.float(), target)[0])
+
+                        pam_denominator = 1.0 + 2.0 * pam_weight
+                        ID_LOSS = (id_losses[0] + pam_weight * (id_losses[1] + id_losses[2])) / \
+                                  pam_denominator
+                        TRI_LOSS = (tri_losses[0] + pam_weight * (tri_losses[1] + tri_losses[2])) / \
+                                   pam_denominator
+                        total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
+                                     cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
+
+                        loss_detail = {'pam_weight': pam_weight}
+                        for name, id_loss, tri_loss in zip(branch_names, id_losses, tri_losses):
+                            loss_detail[f'id_{name}'] = id_loss.item()
+                            loss_detail[f'tri_{name}'] = tri_loss.item()
+
+                        return total_loss, loss_detail
                     
                     if use_sfm and len(score) >= 2:
                         # SFM 模式：HAT风格多级聚合损失 (归一化版本)

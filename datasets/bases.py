@@ -84,3 +84,26 @@ class ImageDataset(Dataset):
             img = self.transform(img)
 
         return img, pid, camid, trackid,img_path.split('/')[-1]
+
+
+class ParallelAugmentationImageDataset(Dataset):
+    """Return BA, CA and EA views of the same training image."""
+
+    def __init__(self, dataset, base_transform, crop_transform, eraser_transform):
+        self.dataset = dataset
+        self.base_transform = base_transform
+        self.crop_transform = crop_transform
+        self.eraser_transform = eraser_transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        img_path, pid, camid, trackid = self.dataset[index]
+        img = read_image(img_path)
+
+        img_base = self.base_transform(img)
+        img_crop = self.crop_transform(img)
+        img_erase = self.eraser_transform(img)
+
+        return img_base, img_crop, img_erase, pid, camid, trackid, img_path.split('/')[-1]

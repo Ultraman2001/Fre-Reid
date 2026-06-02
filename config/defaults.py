@@ -97,6 +97,12 @@ _C.INPUT.PROB = 0.5
 _C.INPUT.RE_PROB = 0.5
 # 3Augment Data Augmentation
 _C.INPUT.DA_AUGMENT = False
+# Parallel Augmentation Mechanism (BA + CA + EA)
+_C.INPUT.PAM = CN()
+_C.INPUT.PAM.ENABLED = False
+_C.INPUT.PAM.CROP_PADDING = 30
+_C.INPUT.PAM.CROP_SCALE = [0.08, 1.0]
+_C.INPUT.PAM.CROP_RATIO = [0.75, 1.3333]
 # Values to be used for image normalization
 _C.INPUT.PIXEL_MEAN = [0.485, 0.456, 0.406]
 # Values to be used for image normalization
@@ -156,6 +162,9 @@ _C.SOLVER.WEIGHT_DECAY_BIAS = 0.0005
 
 # Gradient Clipping threshold (0.0 means disabled)
 _C.SOLVER.CLIP_GRAD_NORM = 1.0
+
+# PAM loss: normalized L_BA + weight * (L_CA + L_EA)
+_C.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT = 1.0
 
 # decay rate of learning rate
 _C.SOLVER.GAMMA = 0.1

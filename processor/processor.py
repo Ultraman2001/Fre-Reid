@@ -23,6 +23,7 @@ def do_train(cfg,
     log_period = cfg.SOLVER.LOG_PERIOD
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
     eval_period = cfg.SOLVER.EVAL_PERIOD
+    pam_enabled = cfg.INPUT.PAM.ENABLED
 
     device = "cuda"
     epochs = cfg.SOLVER.MAX_EPOCHS
@@ -49,10 +50,21 @@ def do_train(cfg,
         evaluator.reset()
         scheduler.step(epoch)
         model.train()
-        for n_iter, (img, vid, target_cam, target_view) in enumerate(train_loader):
+        for n_iter, batch in enumerate(train_loader):
             optimizer.zero_grad()
             optimizer_center.zero_grad()
-            img = img.to(device)
+            if pam_enabled:
+                img_base, img_crop, img_erase, vid, target_cam, target_view = batch
+                img = (
+                    img_base.to(device),
+                    img_crop.to(device),
+                    img_erase.to(device),
+                )
+                batch_size = img_base.shape[0]
+            else:
+                img, vid, target_cam, target_view = batch
+                img = img.to(device)
+                batch_size = img.shape[0]
             target = vid.to(device)
             target_cam = target_cam.to(device)
             target_view = target_view.to(device)
@@ -86,13 +98,13 @@ def do_train(cfg,
                 scaler.step(optimizer_center)
                 scaler.update()
             
-            # SFM 模式 (score 是 list 时，使用 backbone 分支计算准确率)
+            # Multi-branch modes use their primary branch for training accuracy.
             if isinstance(score, list):
                 acc = (score[0].max(1)[1] == target).float().mean()
             else:
                 acc = (score.max(1)[1] == target).float().mean()
 
-            loss_meter.update(loss.item(), img.shape[0])
+            loss_meter.update(loss.item(), batch_size)
             acc_meter.update(acc, 1)
 
             torch.cuda.synchronize()
@@ -102,24 +114,33 @@ def do_train(cfg,
                     epoch, (n_iter + 1), len(train_loader),
                     loss_meter.avg, acc_meter.avg, scheduler._get_lr(epoch)[0])
                 
-                # SFM模式：追加各分支loss详情 (精简版)
+                # Multi-branch modes: append concise branch details.
                 if loss_detail is not None:
-                    s_lambda = loss_detail.get('sfm_lambda', 0.0)
-                    id_b = loss_detail.get('id_backbone', 0.0)
-                    tri_b = loss_detail.get('tri_backbone', 0.0)
-                    
-                    log_msg += " | SFM[λ={:.1f}]: ID_b={:.2f}, Tri_b={:.4f}".format(s_lambda, id_b, tri_b)
-                    
-                    # 打印各融合分支的 Loss (不含 CS 相似度)
-                    if isinstance(feat, list) and len(feat) > 1:
-                        for i in range(1, len(feat)):
-                            id_val = loss_detail.get(f'id_fused_{i}', loss_detail.get('id_fused', 0.0))
-                            tri_val = loss_detail.get(f'tri_fused_{i}', loss_detail.get('tri_fused', 0.0))
-                            log_msg += " | F{}[ID={:.2f}, Tri={:.4f}]".format(i, id_val, tri_val)
-                    
-                    # RATR 损失
-                    if 'ratr' in loss_detail:
-                        log_msg += " | RATR={:.4f}".format(loss_detail['ratr'])
+                    if 'pam_weight' in loss_detail:
+                        log_msg += " | PAM[w={:.2f}]".format(loss_detail['pam_weight'])
+                        for name in ('ba', 'ca', 'ea'):
+                            log_msg += " | {}[ID={:.2f}, Tri={:.4f}]".format(
+                                name.upper(),
+                                loss_detail[f'id_{name}'],
+                                loss_detail[f'tri_{name}'],
+                            )
+                    else:
+                        s_lambda = loss_detail.get('sfm_lambda', 0.0)
+                        id_b = loss_detail.get('id_backbone', 0.0)
+                        tri_b = loss_detail.get('tri_backbone', 0.0)
+
+                        log_msg += " | SFM[λ={:.1f}]: ID_b={:.2f}, Tri_b={:.4f}".format(s_lambda, id_b, tri_b)
+
+                        # 打印各融合分支的 Loss (不含 CS 相似度)
+                        if isinstance(feat, list) and len(feat) > 1:
+                            for i in range(1, len(feat)):
+                                id_val = loss_detail.get(f'id_fused_{i}', loss_detail.get('id_fused', 0.0))
+                                tri_val = loss_detail.get(f'tri_fused_{i}', loss_detail.get('tri_fused', 0.0))
+                                log_msg += " | F{}[ID={:.2f}, Tri={:.4f}]".format(i, id_val, tri_val)
+
+                        # RATR 损失
+                        if 'ratr' in loss_detail:
+                            log_msg += " | RATR={:.4f}".format(loss_detail['ratr'])
                 
                 logger.info(log_msg)
 
