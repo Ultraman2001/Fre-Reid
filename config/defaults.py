@@ -103,6 +103,16 @@ _C.INPUT.PAM.ENABLED = False
 _C.INPUT.PAM.CROP_PADDING = 30
 _C.INPUT.PAM.CROP_SCALE = [0.08, 1.0]
 _C.INPUT.PAM.CROP_RATIO = [0.75, 1.3333]
+_C.INPUT.PAM.CICO = CN()
+_C.INPUT.PAM.CICO.ENABLED = False
+_C.INPUT.PAM.CICO.NUM_PATCHES = 64
+_C.INPUT.PAM.CICO.MIN_AREA = 1.0 / 5.0
+_C.INPUT.PAM.CICO.MAX_AREA = 1.0 / 2.0
+_C.INPUT.PAM.CICO.MIN_ASPECT = 0.3
+_C.INPUT.PAM.CICO.MAX_ASPECT = 0.0
+_C.INPUT.PAM.CICO.OCCLUSION_PROB = 1.0
+# append: BA+CA+EA+CICO; replace_ea: BA+CA+CICO; replace_ca: BA+EA+CICO
+_C.INPUT.PAM.CICO.BRANCH_MODE = 'append'
 # Values to be used for image normalization
 _C.INPUT.PIXEL_MEAN = [0.485, 0.456, 0.406]
 # Values to be used for image normalization
@@ -163,8 +173,11 @@ _C.SOLVER.WEIGHT_DECAY_BIAS = 0.0005
 # Gradient Clipping threshold (0.0 means disabled)
 _C.SOLVER.CLIP_GRAD_NORM = 1.0
 
-# PAM loss: normalized L_BA + weight * (L_CA + L_EA)
+# PAM loss: normalized L_BA + weight * (L_CA + L_EA [+ L_CICO])
 _C.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT = 1.0
+_C.SOLVER.PAM_CICO_REID_LOSS_WEIGHT = 1.0
+_C.SOLVER.CICO_OCC_LOSS_WEIGHT = 1.0
+_C.SOLVER.CICO_OCC_LOSS_TYPE = 'mse'
 
 # decay rate of learning rate
 _C.SOLVER.GAMMA = 0.1

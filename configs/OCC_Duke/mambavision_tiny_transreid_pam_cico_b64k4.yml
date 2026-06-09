@@ -1,0 +1,92 @@
+MODEL:
+  PRETRAIN_CHOICE: 'imagenet'
+  PRETRAIN_PATH: '/workspace/pretrained/mambavision_tiny_1k.pth.tar'
+  METRIC_LOSS_TYPE: 'triplet'
+  IF_LABELSMOOTH: 'on'
+  IF_WITH_CENTER: 'no'
+  NAME: 'transformer'
+  NO_MARGIN: True
+  DEVICE_ID: ('0')
+  TRANSFORMER_TYPE: 'mambavision_tiny_TransReID'
+  DROP_PATH: 0.5
+  DROP_OUT: 0.0
+  ATT_DROP_RATE: 0.0
+  ID_LOSS_WEIGHT: 1.0
+  TRIPLET_LOSS_WEIGHT: 1.0
+  POOLING_TYPE: 'gem'
+  SIE_CAMERA: False
+  EMA:
+    ENABLED: False
+    DECAY: 0.998
+  MAMBAVISION:
+    SASF_STAGES: []
+    GLOBAL_STAGES: [2, 3]
+    USE_SFM: False
+    USE_FINE_BRANCH: False
+
+INPUT:
+  SIZE_TRAIN: [256, 128]
+  SIZE_TEST: [256, 128]
+  PROB: 0.5
+  RE_PROB: 0.5
+  PADDING: 10
+  PIXEL_MEAN: [0.485, 0.456, 0.406]
+  PIXEL_STD: [0.229, 0.224, 0.225]
+  PAM:
+    ENABLED: True
+    CROP_PADDING: 30
+    CROP_SCALE: [0.08, 1.0]
+    CROP_RATIO: [0.75, 1.3333]
+    CICO:
+      ENABLED: True
+      BRANCH_MODE: 'append'
+      NUM_PATCHES: 64
+      MIN_AREA: 0.2
+      MAX_AREA: 0.5
+      MIN_ASPECT: 0.3
+      MAX_ASPECT: 0.0
+      OCCLUSION_PROB: 1.0
+
+DATASETS:
+  NAMES: ('occ_duke')
+  ROOT_DIR: '/workspace/data'
+
+DATALOADER:
+  SAMPLER: 'softmax_triplet'
+  NUM_INSTANCE: 4
+  NUM_WORKERS: 8
+
+SOLVER:
+  OPTIMIZER_NAME: 'AdamW'
+  MAX_EPOCHS: 160
+  BASE_LR: 0.00035
+  IMS_PER_BATCH: 64
+  WARMUP_METHOD: 'linear'
+  WARMUP_EPOCHS: 20
+  LARGE_FC_LR: False
+  CHECKPOINT_PERIOD: 40
+  LOG_PERIOD: 50
+  EVAL_PERIOD: 20
+  WEIGHT_DECAY: 0.05
+  WEIGHT_DECAY_BIAS: 0.05
+  BIAS_LR_FACTOR: 1
+  SEED: 42
+  MARGIN: 0.3
+  STAGE4_LR_FACTOR: 2.0
+  SASF_LR_FACTOR: 1.0
+  CLIP_GRAD_NORM: 10.0
+  PAM_AUGMENTED_LOSS_WEIGHT: 1.0
+  PAM_CICO_REID_LOSS_WEIGHT: 0.0
+  CICO_OCC_LOSS_WEIGHT: 0.1
+  CICO_OCC_LOSS_TYPE: 'cosine'
+  RATR_ENABLED: False
+
+TEST:
+  EVAL: True
+  IMS_PER_BATCH: 256
+  RE_RANKING: False
+  WEIGHT: ''
+  NECK_FEAT: 'before'
+  FEAT_NORM: 'yes'
+
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-cico-b64k4'

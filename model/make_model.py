@@ -189,6 +189,12 @@ class build_transformer(nn.Module):
         self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
         self.use_sfm = False
         self.use_pam = cfg.INPUT.PAM.ENABLED
+        self.use_pam_cico = self.use_pam and getattr(getattr(cfg.INPUT.PAM, 'CICO', {}), 'ENABLED', False)
+        self.pam_cico_branch_mode = 'append'
+        if self.use_pam_cico:
+            self.pam_cico_branch_mode = getattr(cfg.INPUT.PAM.CICO, 'BRANCH_MODE', 'append').lower()
+            if self.pam_cico_branch_mode not in ('append', 'replace_ea', 'replace_ca'):
+                raise ValueError(f'Unsupported INPUT.PAM.CICO.BRANCH_MODE: {self.pam_cico_branch_mode}')
         
         self.pooling = None
 
@@ -302,7 +308,14 @@ class build_transformer(nn.Module):
 
             self.classifier_pam_crop = copy.deepcopy(self.classifier)
             self.classifier_pam_erase = copy.deepcopy(self.classifier)
-            print('[Model] PAM enabled: shared MambaVision backbone with BA, CA and EA heads')
+            if self.use_pam_cico:
+                self.bottleneck_pam_cico = nn.BatchNorm1d(self.in_planes)
+                self.bottleneck_pam_cico.bias.requires_grad_(False)
+                self.bottleneck_pam_cico.apply(weights_init_kaiming)
+                self.classifier_pam_cico = copy.deepcopy(self.classifier)
+                print(f'[Model] PAM+CICO enabled: mode={self.pam_cico_branch_mode}')
+            else:
+                print('[Model] PAM enabled: shared MambaVision backbone with BA, CA and EA heads')
         
         # SFM fused分支的head (ModuleList 支持多级级联与深层监督)
         if self.is_mambavision and self.use_sfm:
@@ -367,33 +380,64 @@ class build_transformer(nn.Module):
         return pooled.flatten(1)
 
     def _forward_pam(self, x, label, cam_label, view_label):
-        if not isinstance(x, (tuple, list)) or len(x) != 3:
-            raise ValueError('PAM training expects BA, CA and EA image tensors')
+        if not isinstance(x, (tuple, list)):
+            raise ValueError('PAM training expects a tuple/list of image tensors')
 
-        img_base, img_crop, img_erase = x
-        stacked_img = torch.cat([img_base, img_crop, img_erase], dim=0)
-        stacked_cam = torch.cat([cam_label] * 3, dim=0) if cam_label is not None else None
-        stacked_view = torch.cat([view_label] * 3, dim=0) if view_label is not None else None
+        if self.use_pam_cico:
+            if self.pam_cico_branch_mode == 'replace_ea':
+                branch_names = ('ba', 'ca', 'cico')
+                cico_index = 2
+            elif self.pam_cico_branch_mode == 'replace_ca':
+                branch_names = ('ba', 'ea', 'cico')
+                cico_index = 2
+            else:
+                branch_names = ('ba', 'ca', 'ea', 'cico')
+                cico_index = 3
+        else:
+            branch_names = ('ba', 'ca', 'ea')
+            cico_index = None
+
+        expected_len = len(branch_names)
+        if len(x) != expected_len:
+            raise ValueError(f'PAM training expects {expected_len} image tensors')
+
+        stacked_img = torch.cat(list(x), dim=0)
+        num_views = len(x)
+        stacked_cam = torch.cat([cam_label] * num_views, dim=0) if cam_label is not None else None
+        stacked_view = torch.cat([view_label] * num_views, dim=0) if view_label is not None else None
 
         output = self.base(stacked_img, cam_label=stacked_cam, view_label=stacked_view)
         if isinstance(output, dict):
             raise ValueError('PAM and SFM must be evaluated separately')
 
-        map_base, map_crop, map_erase = output.chunk(3, dim=0)
-        feat_base = self._pool_feature_map(map_base)
-        feat_crop = self._pool_feature_map(map_crop)
-        feat_erase = self._pool_feature_map(map_erase)
+        maps = output.chunk(num_views, dim=0)
+        feats = [self._pool_feature_map(feat_map) for feat_map in maps]
 
-        feat_base_bn = self.bottleneck(feat_base)
-        feat_crop_bn = self.bottleneck_pam_crop(feat_crop)
-        feat_erase_bn = self.bottleneck_pam_erase(feat_erase)
+        scores = []
+        for name, branch_feat in zip(branch_names, feats):
+            if name == 'ba':
+                branch_bn = self.bottleneck(branch_feat)
+                branch_classifier = self.classifier
+            elif name == 'ca':
+                branch_bn = self.bottleneck_pam_crop(branch_feat)
+                branch_classifier = self.classifier_pam_crop
+            elif name == 'ea':
+                branch_bn = self.bottleneck_pam_erase(branch_feat)
+                branch_classifier = self.classifier_pam_erase
+            elif name == 'cico':
+                branch_bn = self.bottleneck_pam_cico(branch_feat)
+                branch_classifier = self.classifier_pam_cico
+            else:
+                raise ValueError(f'Unsupported PAM branch: {name}')
+            scores.append(self._classify(branch_classifier, branch_bn, label))
 
-        scores = [
-            self._classify(self.classifier, feat_base_bn, label),
-            self._classify(self.classifier_pam_crop, feat_crop_bn, label),
-            self._classify(self.classifier_pam_erase, feat_erase_bn, label),
-        ]
-        return scores, [feat_base, feat_crop, feat_erase]
+        if self.use_pam_cico:
+            return scores, {
+                'global_feats': feats,
+                'branch_names': branch_names,
+                'cico_map': maps[cico_index],
+            }
+        return scores, feats
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.use_pam and self.training:
