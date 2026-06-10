@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
-from utils.cico_pam import CICOBatchOcclusion
 from torch import amp
 import torch.distributed as dist
 
@@ -43,36 +42,6 @@ def do_train(cfg,
 
     evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
     scaler = amp.GradScaler('cuda')
-    cico_enabled = pam_enabled and getattr(getattr(cfg.INPUT.PAM, 'CICO', {}), 'ENABLED', False)
-    cico_aug = None
-    cico_branch_mode = 'append'
-    if cico_enabled:
-        cico_cfg = cfg.INPUT.PAM.CICO
-        cico_branch_mode = getattr(cico_cfg, 'BRANCH_MODE', 'append').lower()
-        if cico_branch_mode not in ('append', 'replace_ea', 'replace_ca'):
-            raise ValueError(f'Unsupported INPUT.PAM.CICO.BRANCH_MODE: {cico_branch_mode}')
-        cico_max_aspect = getattr(cico_cfg, 'MAX_ASPECT', 0.0)
-        cico_aug = CICOBatchOcclusion(
-            num_patches=cico_cfg.NUM_PATCHES,
-            image_shape=tuple(cfg.INPUT.SIZE_TRAIN),
-            group_size=cfg.DATALOADER.NUM_INSTANCE,
-            min_area=cico_cfg.MIN_AREA,
-            max_area=cico_cfg.MAX_AREA,
-            min_aspect=cico_cfg.MIN_ASPECT,
-            max_aspect=None if cico_max_aspect <= 0 else cico_max_aspect,
-            occlusion_prob=cico_cfg.OCCLUSION_PROB,
-            device=device,
-        ).to(device)
-        logger.info(
-            'CICO-PAM enabled: mode={}, patches={}, area=[{:.3f}, {:.3f}], group_size={}, occ_prob={:.2f}'.format(
-                cico_branch_mode,
-                cico_cfg.NUM_PATCHES,
-                cico_cfg.MIN_AREA,
-                cico_cfg.MAX_AREA,
-                cfg.DATALOADER.NUM_INSTANCE,
-                cico_cfg.OCCLUSION_PROB,
-            )
-        )
     # train
     for epoch in range(1, epochs + 1):
         start_time = time.time()
@@ -86,25 +55,11 @@ def do_train(cfg,
             optimizer_center.zero_grad()
             if pam_enabled:
                 img_base, img_crop, img_erase, vid, target_cam, target_view = batch
-                img_base = img_base.to(device)
-                img_crop = img_crop.to(device)
-                img_erase = img_erase.to(device)
-                cico_mask = None
-                if cico_enabled:
-                    with torch.no_grad():
-                        img_cico, cico_mask = cico_aug(img_base)
-                    if cico_branch_mode == 'replace_ea':
-                        img = (img_base, img_crop, img_cico)
-                    elif cico_branch_mode == 'replace_ca':
-                        img = (img_base, img_erase, img_cico)
-                    else:
-                        img = (img_base, img_crop, img_erase, img_cico)
-                else:
-                    img = (
-                        img_base,
-                        img_crop,
-                        img_erase,
-                    )
+                img = (
+                    img_base.to(device),
+                    img_crop.to(device),
+                    img_erase.to(device),
+                )
                 batch_size = img_base.shape[0]
             else:
                 img, vid, target_cam, target_view = batch
@@ -115,8 +70,6 @@ def do_train(cfg,
             target_view = target_view.to(device)
             with amp.autocast('cuda'):
                 score, feat = model(img, target, cam_label=target_cam, view_label=target_view)
-            if cico_enabled and isinstance(feat, dict):
-                feat['cico_mask'] = cico_mask
             
             # Loss 计算在 FP32 下进行，避免 FP16 溢出导致 NaN
             loss_result = loss_fn(score, feat, target, target_cam)
@@ -165,19 +118,17 @@ def do_train(cfg,
                 if loss_detail is not None:
                     if 'pam_weight' in loss_detail:
                         log_msg += " | PAM[w={:.2f}]".format(loss_detail['pam_weight'])
-                        branch_names = loss_detail.get('branch_names')
-                        if branch_names is None:
-                            branch_names = ('ba', 'ca', 'ea', 'cico') if 'id_cico' in loss_detail else ('ba', 'ca', 'ea')
-                        for name in branch_names:
+                        for name in ('ba', 'ca', 'ea'):
                             log_msg += " | {}[ID={:.2f}, Tri={:.4f}]".format(
                                 name.upper(),
                                 loss_detail[f'id_{name}'],
                                 loss_detail[f'tri_{name}'],
                             )
-                        if 'cico_occ' in loss_detail:
-                            log_msg += " | CICO_OCC[w={:.2f}, loss={:.4f}]".format(
-                                loss_detail.get('cico_occ_weight', 0.0),
-                                loss_detail['cico_occ'],
+                        if 'local_weight' in loss_detail:
+                            log_msg += " | BA-Local[w={:.2f}, ID={:.2f}, Tri={:.4f}]".format(
+                                loss_detail['local_weight'],
+                                loss_detail['id_local'],
+                                loss_detail['tri_local'],
                             )
                     else:
                         s_lambda = loss_detail.get('sfm_lambda', 0.0)

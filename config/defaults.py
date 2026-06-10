@@ -51,6 +51,23 @@ _C.MODEL.COS_LAYER = False
 # Pooling type: 'gem', 'avg', 'max', 'avg_max' (消融实验用)
 _C.MODEL.POOLING_TYPE = 'gem'
 
+# Local stripe descriptors on the final feature map.
+_C.MODEL.LOCAL_STRIPE = CN()
+_C.MODEL.LOCAL_STRIPE.ENABLED = False
+_C.MODEL.LOCAL_STRIPE.NUM_STRIPES = 4
+_C.MODEL.LOCAL_STRIPE.LOSS_WEIGHT = 0.2
+_C.MODEL.LOCAL_STRIPE.USE_TRIPLET = True
+_C.MODEL.LOCAL_STRIPE.INFERENCE = 'concat'  # global, local, concat
+_C.MODEL.LOCAL_STRIPE.POOLING_TYPE = 'gem'
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION = CN()
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.ENABLED = False
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.MIXER_TYPE = 'mambavision'  # mambavision, conv
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.TOKEN_POOLING_TYPE = 'gem'
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.MODE = 'even'  # head, tail, even
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.KERNEL_SIZE = 3
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.MLP_RATIO = 2.0
+_C.MODEL.LOCAL_STRIPE.TOKEN_INSERTION.INIT_SCALE = 1e-3
+
 # Transformer setting
 _C.MODEL.DROP_PATH = 0.1
 _C.MODEL.DROP_OUT = 0.0
@@ -100,19 +117,10 @@ _C.INPUT.DA_AUGMENT = False
 # Parallel Augmentation Mechanism (BA + CA + EA)
 _C.INPUT.PAM = CN()
 _C.INPUT.PAM.ENABLED = False
+_C.INPUT.PAM.AUG_MODE = 'default'  # default: Fre-Reid PAM; pade: PADE-style BA/CA/EA transforms
 _C.INPUT.PAM.CROP_PADDING = 30
 _C.INPUT.PAM.CROP_SCALE = [0.08, 1.0]
 _C.INPUT.PAM.CROP_RATIO = [0.75, 1.3333]
-_C.INPUT.PAM.CICO = CN()
-_C.INPUT.PAM.CICO.ENABLED = False
-_C.INPUT.PAM.CICO.NUM_PATCHES = 64
-_C.INPUT.PAM.CICO.MIN_AREA = 1.0 / 5.0
-_C.INPUT.PAM.CICO.MAX_AREA = 1.0 / 2.0
-_C.INPUT.PAM.CICO.MIN_ASPECT = 0.3
-_C.INPUT.PAM.CICO.MAX_ASPECT = 0.0
-_C.INPUT.PAM.CICO.OCCLUSION_PROB = 1.0
-# append: BA+CA+EA+CICO; replace_ea: BA+CA+CICO; replace_ca: BA+EA+CICO
-_C.INPUT.PAM.CICO.BRANCH_MODE = 'append'
 # Values to be used for image normalization
 _C.INPUT.PIXEL_MEAN = [0.485, 0.456, 0.406]
 # Values to be used for image normalization
@@ -173,11 +181,8 @@ _C.SOLVER.WEIGHT_DECAY_BIAS = 0.0005
 # Gradient Clipping threshold (0.0 means disabled)
 _C.SOLVER.CLIP_GRAD_NORM = 1.0
 
-# PAM loss: normalized L_BA + weight * (L_CA + L_EA [+ L_CICO])
+# PAM loss: normalized L_BA + weight * (L_CA + L_EA)
 _C.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT = 1.0
-_C.SOLVER.PAM_CICO_REID_LOSS_WEIGHT = 1.0
-_C.SOLVER.CICO_OCC_LOSS_WEIGHT = 1.0
-_C.SOLVER.CICO_OCC_LOSS_TYPE = 'mse'
 
 # decay rate of learning rate
 _C.SOLVER.GAMMA = 0.1

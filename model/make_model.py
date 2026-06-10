@@ -3,7 +3,12 @@ import torch.nn as nn
 from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
-from .backbones.mambavision.mamba_vision_reid import mambavision_tiny_reid, mambavision_small_reid, mambavision_base_reid
+from .backbones.mambavision.mamba_vision_reid import (
+    MambaVisionMixer,
+    mambavision_tiny_reid,
+    mambavision_small_reid,
+    mambavision_base_reid,
+)
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
 
@@ -73,6 +78,121 @@ def create_pooling(pooling_type: str):
         return GeM()
 
 
+
+
+class StripeTokenInsertion(nn.Module):
+    """Insert pooled stripe tokens into the flattened spatial-token sequence."""
+
+    def __init__(
+        self,
+        dim,
+        num_stripes=4,
+        mixer_type='mambavision',
+        token_pooling_type='gem',
+        mode='even',
+        kernel_size=3,
+        mlp_ratio=2.0,
+        init_scale=1e-3,
+    ):
+        super().__init__()
+        if mode not in ('head', 'tail', 'even'):
+            raise ValueError("TOKEN_INSERTION.MODE must be one of: head, tail, even")
+        if kernel_size % 2 == 0:
+            raise ValueError("TOKEN_INSERTION.KERNEL_SIZE must be odd")
+
+        self.num_stripes = num_stripes
+        self.mixer_type = mixer_type
+        self.mode = mode
+        self.token_pooling = create_pooling(token_pooling_type)
+        self.norm = nn.LayerNorm(dim)
+        if mixer_type == 'mambavision':
+            self.mixer = MambaVisionMixer(
+                d_model=dim,
+                d_state=8,
+                d_conv=kernel_size,
+                expand=1,
+                use_sasf=False,
+            )
+        elif mixer_type == 'conv':
+            hidden_dim = int(dim * mlp_ratio)
+            self.fc1 = nn.Linear(dim, hidden_dim)
+            self.act = nn.GELU()
+            self.dwconv = nn.Conv1d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                groups=hidden_dim,
+            )
+            self.fc2 = nn.Linear(hidden_dim, dim)
+        else:
+            raise ValueError("TOKEN_INSERTION.MIXER_TYPE must be one of: mambavision, conv")
+        self.gamma = nn.Parameter(torch.ones(1) * init_scale)
+
+    def _stripe_tokens(self, feature_map):
+        stripes = torch.chunk(feature_map, self.num_stripes, dim=2)
+        return torch.stack(
+            [self.token_pooling(stripe).flatten(1) for stripe in stripes],
+            dim=1,
+        )
+
+    def _insert_even(self, seq, stripe_tokens, height, width):
+        stripe_h = height // self.num_stripes
+        stripe_len = stripe_h * width
+        pieces = []
+        for idx in range(self.num_stripes):
+            start = idx * stripe_len
+            end = (idx + 1) * stripe_len
+            pieces.append(stripe_tokens[:, idx:idx + 1])
+            pieces.append(seq[:, start:end])
+        return torch.cat(pieces, dim=1), stripe_len
+
+    def _remove_even(self, tokens, stripe_len):
+        pieces = []
+        cursor = 0
+        for _ in range(self.num_stripes):
+            cursor += 1
+            pieces.append(tokens[:, cursor:cursor + stripe_len])
+            cursor += stripe_len
+        return torch.cat(pieces, dim=1)
+
+    def forward(self, feature_map):
+        b, c, h, w = feature_map.shape
+        if h % self.num_stripes != 0:
+            raise ValueError(
+                "Feature-map height must be divisible by LOCAL_STRIPE.NUM_STRIPES"
+            )
+
+        seq = feature_map.flatten(2).transpose(1, 2).contiguous()
+        stripe_tokens = self._stripe_tokens(feature_map)
+
+        if self.mode == 'head':
+            tokens = torch.cat([stripe_tokens, seq], dim=1)
+            stripe_len = None
+        elif self.mode == 'tail':
+            tokens = torch.cat([seq, stripe_tokens], dim=1)
+            stripe_len = None
+        else:
+            tokens, stripe_len = self._insert_even(seq, stripe_tokens, h, w)
+
+        y = self.norm(tokens)
+        if self.mixer_type == 'mambavision':
+            y = self.mixer(y)
+        else:
+            y = self.fc1(y)
+            y = self.act(y)
+            y = self.dwconv(y.transpose(1, 2)).transpose(1, 2).contiguous()
+            y = self.fc2(y)
+        tokens = tokens + self.gamma * y
+
+        if self.mode == 'head':
+            seq = tokens[:, self.num_stripes:]
+        elif self.mode == 'tail':
+            seq = tokens[:, :h * w]
+        else:
+            seq = self._remove_even(tokens, stripe_len)
+
+        return seq.transpose(1, 2).contiguous().view(b, c, h, w)
 
 
 def weights_init_kaiming(m):
@@ -189,14 +309,23 @@ class build_transformer(nn.Module):
         self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
         self.use_sfm = False
         self.use_pam = cfg.INPUT.PAM.ENABLED
-        self.use_pam_cico = self.use_pam and getattr(getattr(cfg.INPUT.PAM, 'CICO', {}), 'ENABLED', False)
-        self.pam_cico_branch_mode = 'append'
-        if self.use_pam_cico:
-            self.pam_cico_branch_mode = getattr(cfg.INPUT.PAM.CICO, 'BRANCH_MODE', 'append').lower()
-            if self.pam_cico_branch_mode not in ('append', 'replace_ea', 'replace_ca'):
-                raise ValueError(f'Unsupported INPUT.PAM.CICO.BRANCH_MODE: {self.pam_cico_branch_mode}')
         
         self.pooling = None
+        local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
+        token_cfg = getattr(local_cfg, 'TOKEN_INSERTION', None) if local_cfg is not None else None
+        self.local_stripe_enabled = bool(getattr(local_cfg, 'ENABLED', False))
+        self.local_num_stripes = int(getattr(local_cfg, 'NUM_STRIPES', 4))
+        self.local_inference = str(getattr(local_cfg, 'INFERENCE', 'concat')).lower()
+        self.local_pooling = None
+        self.stripe_token_insertion = None
+        self.local_token_insertion_enabled = bool(getattr(token_cfg, 'ENABLED', False))
+        self.local_token_insertion_mixer_type = str(getattr(token_cfg, 'MIXER_TYPE', 'mambavision')).lower()
+        default_token_pooling = str(getattr(local_cfg, 'POOLING_TYPE', 'gem')) if local_cfg is not None else 'gem'
+        self.local_token_pooling_type = str(getattr(token_cfg, 'TOKEN_POOLING_TYPE', default_token_pooling)).lower()
+        self.local_token_insertion_mode = str(getattr(token_cfg, 'MODE', 'even')).lower()
+        self.local_token_insertion_kernel = int(getattr(token_cfg, 'KERNEL_SIZE', 3))
+        self.local_token_insertion_mlp_ratio = float(getattr(token_cfg, 'MLP_RATIO', 2.0))
+        self.local_token_insertion_init_scale = float(getattr(token_cfg, 'INIT_SCALE', 1e-3))
 
         if self.is_mambavision:
             # 获取配置
@@ -292,6 +421,48 @@ class build_transformer(nn.Module):
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
 
+        if self.local_stripe_enabled:
+            if not self.is_mambavision:
+                raise ValueError('LOCAL_STRIPE currently supports the MambaVision backbone only')
+            if not self.use_pam:
+                raise ValueError('LOCAL_STRIPE currently expects PAM training to be enabled')
+            if self.use_sfm:
+                raise ValueError('LOCAL_STRIPE and SFM must be evaluated separately')
+            if self.local_num_stripes <= 0:
+                raise ValueError('LOCAL_STRIPE.NUM_STRIPES must be positive')
+
+            local_pooling_type = getattr(cfg.MODEL.LOCAL_STRIPE, 'POOLING_TYPE', 'gem')
+            self.local_pooling = create_pooling(local_pooling_type)
+            if self.local_token_insertion_enabled:
+                self.stripe_token_insertion = StripeTokenInsertion(
+                    dim=self.in_planes,
+                    num_stripes=self.local_num_stripes,
+                    mixer_type=self.local_token_insertion_mixer_type,
+                    token_pooling_type=self.local_token_pooling_type,
+                    mode=self.local_token_insertion_mode,
+                    kernel_size=self.local_token_insertion_kernel,
+                    mlp_ratio=self.local_token_insertion_mlp_ratio,
+                    init_scale=self.local_token_insertion_init_scale,
+                )
+
+            self.local_bottlenecks = nn.ModuleList()
+            self.local_classifiers = nn.ModuleList()
+            for _ in range(self.local_num_stripes):
+                bn = nn.BatchNorm1d(self.in_planes)
+                bn.bias.requires_grad_(False)
+                bn.apply(weights_init_kaiming)
+                self.local_bottlenecks.append(bn)
+                self.local_classifiers.append(copy.deepcopy(self.classifier))
+            print(
+                '[Model] LocalStripe enabled on BA branch: stripes={}, pooling={}, token_insertion={}, mixer={}, token_pooling={}'.format(
+                    self.local_num_stripes,
+                    local_pooling_type,
+                    self.local_token_insertion_enabled,
+                    self.local_token_insertion_mixer_type,
+                    self.local_token_pooling_type,
+                )
+            )
+
         if self.use_pam:
             if not self.is_mambavision:
                 raise ValueError('PAM currently supports the MambaVision backbone only')
@@ -308,14 +479,7 @@ class build_transformer(nn.Module):
 
             self.classifier_pam_crop = copy.deepcopy(self.classifier)
             self.classifier_pam_erase = copy.deepcopy(self.classifier)
-            if self.use_pam_cico:
-                self.bottleneck_pam_cico = nn.BatchNorm1d(self.in_planes)
-                self.bottleneck_pam_cico.bias.requires_grad_(False)
-                self.bottleneck_pam_cico.apply(weights_init_kaiming)
-                self.classifier_pam_cico = copy.deepcopy(self.classifier)
-                print(f'[Model] PAM+CICO enabled: mode={self.pam_cico_branch_mode}')
-            else:
-                print('[Model] PAM enabled: shared MambaVision backbone with BA, CA and EA heads')
+            print('[Model] PAM enabled: shared MambaVision backbone with BA, CA and EA heads')
         
         # SFM fused分支的head (ModuleList 支持多级级联与深层监督)
         if self.is_mambavision and self.use_sfm:
@@ -372,71 +536,96 @@ class build_transformer(nn.Module):
             return classifier(feat, label)
         return classifier(feat)
 
-    def _pool_feature_map(self, feature_map):
-        if self.pooling is None:
+    def _pool_feature_map(self, feature_map, pooling=None):
+        pool_layer = self.pooling if pooling is None else pooling
+        if pool_layer is None:
             pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
         else:
-            pooled = self.pooling(feature_map)
+            pooled = pool_layer(feature_map)
         return pooled.flatten(1)
 
-    def _forward_pam(self, x, label, cam_label, view_label):
-        if not isinstance(x, (tuple, list)):
-            raise ValueError('PAM training expects a tuple/list of image tensors')
+    def _refine_local_tokens(self, feature_map):
+        if self.stripe_token_insertion is not None:
+            return self.stripe_token_insertion(feature_map)
+        return feature_map
 
-        if self.use_pam_cico:
-            if self.pam_cico_branch_mode == 'replace_ea':
-                branch_names = ('ba', 'ca', 'cico')
-                cico_index = 2
-            elif self.pam_cico_branch_mode == 'replace_ca':
-                branch_names = ('ba', 'ea', 'cico')
-                cico_index = 2
-            else:
-                branch_names = ('ba', 'ca', 'ea', 'cico')
-                cico_index = 3
+    def _pool_local_stripes(self, feature_map):
+        if feature_map.shape[2] % self.local_num_stripes != 0:
+            raise ValueError(
+                "Feature-map height must be divisible by LOCAL_STRIPE.NUM_STRIPES"
+            )
+        stripes = torch.chunk(feature_map, self.local_num_stripes, dim=2)
+        return [self._pool_feature_map(stripe, self.local_pooling) for stripe in stripes]
+
+    def _local_head_index(self, stripe_idx):
+        return stripe_idx
+
+    def _append_local_outputs(self, scores, feats, feature_map, label):
+        local_feats = self._pool_local_stripes(feature_map)
+        for stripe_idx, local_feat in enumerate(local_feats):
+            head_idx = self._local_head_index(stripe_idx)
+            local_feat_bn = self.local_bottlenecks[head_idx](local_feat)
+            scores.append(
+                self._classify(self.local_classifiers[head_idx], local_feat_bn, label)
+            )
+            feats.append(local_feat)
+
+    def _local_inference_features(self, feature_map):
+        local_feats = self._pool_local_stripes(feature_map)
+        if self.neck_feat == 'after':
+            local_feats = [
+                self.local_bottlenecks[self._local_head_index(idx)](feat)
+                for idx, feat in enumerate(local_feats)
+            ]
+        return torch.cat(local_feats, dim=1)
+
+    def _format_local_inference(self, global_feat, feature_map):
+        local_feat = self._local_inference_features(feature_map)
+        if self.local_inference == 'global':
+            final_feat = global_feat
+        elif self.local_inference == 'local':
+            final_feat = local_feat
         else:
-            branch_names = ('ba', 'ca', 'ea')
-            cico_index = None
+            final_feat = torch.cat([global_feat, local_feat], dim=1)
+        return {
+            'backbone': global_feat,
+            'fused': local_feat,
+            'concat': final_feat,
+        }
 
-        expected_len = len(branch_names)
-        if len(x) != expected_len:
-            raise ValueError(f'PAM training expects {expected_len} image tensors')
+    def _forward_pam(self, x, label, cam_label, view_label):
+        if not isinstance(x, (tuple, list)) or len(x) != 3:
+            raise ValueError('PAM training expects BA, CA and EA image tensors')
 
-        stacked_img = torch.cat(list(x), dim=0)
-        num_views = len(x)
-        stacked_cam = torch.cat([cam_label] * num_views, dim=0) if cam_label is not None else None
-        stacked_view = torch.cat([view_label] * num_views, dim=0) if view_label is not None else None
+        img_base, img_crop, img_erase = x
+        stacked_img = torch.cat([img_base, img_crop, img_erase], dim=0)
+        stacked_cam = torch.cat([cam_label] * 3, dim=0) if cam_label is not None else None
+        stacked_view = torch.cat([view_label] * 3, dim=0) if view_label is not None else None
 
         output = self.base(stacked_img, cam_label=stacked_cam, view_label=stacked_view)
         if isinstance(output, dict):
             raise ValueError('PAM and SFM must be evaluated separately')
 
-        maps = output.chunk(num_views, dim=0)
-        feats = [self._pool_feature_map(feat_map) for feat_map in maps]
+        map_base, map_crop, map_erase = output.chunk(3, dim=0)
+        if self.local_stripe_enabled:
+            map_base = self._refine_local_tokens(map_base)
 
-        scores = []
-        for name, branch_feat in zip(branch_names, feats):
-            if name == 'ba':
-                branch_bn = self.bottleneck(branch_feat)
-                branch_classifier = self.classifier
-            elif name == 'ca':
-                branch_bn = self.bottleneck_pam_crop(branch_feat)
-                branch_classifier = self.classifier_pam_crop
-            elif name == 'ea':
-                branch_bn = self.bottleneck_pam_erase(branch_feat)
-                branch_classifier = self.classifier_pam_erase
-            elif name == 'cico':
-                branch_bn = self.bottleneck_pam_cico(branch_feat)
-                branch_classifier = self.classifier_pam_cico
-            else:
-                raise ValueError(f'Unsupported PAM branch: {name}')
-            scores.append(self._classify(branch_classifier, branch_bn, label))
+        feat_base = self._pool_feature_map(map_base)
+        feat_crop = self._pool_feature_map(map_crop)
+        feat_erase = self._pool_feature_map(map_erase)
 
-        if self.use_pam_cico:
-            return scores, {
-                'global_feats': feats,
-                'branch_names': branch_names,
-                'cico_map': maps[cico_index],
-            }
+        feat_base_bn = self.bottleneck(feat_base)
+        feat_crop_bn = self.bottleneck_pam_crop(feat_crop)
+        feat_erase_bn = self.bottleneck_pam_erase(feat_erase)
+
+        scores = [
+            self._classify(self.classifier, feat_base_bn, label),
+            self._classify(self.classifier_pam_crop, feat_crop_bn, label),
+            self._classify(self.classifier_pam_erase, feat_erase_bn, label),
+        ]
+        feats = [feat_base, feat_crop, feat_erase]
+        if self.local_stripe_enabled:
+            self._append_local_outputs(scores, feats, map_base, label)
         return scores, feats
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
@@ -503,6 +692,8 @@ class build_transformer(nn.Module):
             else:
                 # Normal mode: single tensor output
                 feature_map = output
+                if self.local_stripe_enabled:
+                    feature_map = self._refine_local_tokens(feature_map)
                 
                 # Apply pooling
                 global_feat = self._pool_feature_map(feature_map)
@@ -515,9 +706,12 @@ class build_transformer(nn.Module):
                     return cls_score, global_feat
                 else:
                     if self.neck_feat == 'after':
-                        return feat
+                        global_output = feat
                     else:
-                        return global_feat
+                        global_output = global_feat
+                    if self.local_stripe_enabled:
+                        return self._format_local_inference(global_output, feature_map)
+                    return global_output
 
         else:
             # ViT/DeiT backbone

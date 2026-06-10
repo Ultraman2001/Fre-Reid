@@ -37,15 +37,6 @@ INPUT:
     CROP_PADDING: 30
     CROP_SCALE: [0.08, 1.0]
     CROP_RATIO: [0.75, 1.3333]
-    CICO:
-      ENABLED: True
-      BRANCH_MODE: 'append'
-      NUM_PATCHES: 64
-      MIN_AREA: 0.2
-      MAX_AREA: 0.5
-      MIN_ASPECT: 0.3
-      MAX_ASPECT: 0.0
-      OCCLUSION_PROB: 1.0
 
 DATASETS:
   NAMES: ('occ_duke')
@@ -76,9 +67,6 @@ SOLVER:
   SASF_LR_FACTOR: 1.0
   CLIP_GRAD_NORM: 10.0
   PAM_AUGMENTED_LOSS_WEIGHT: 1.0
-  PAM_CICO_REID_LOSS_WEIGHT: 0.0
-  CICO_OCC_LOSS_WEIGHT: 0.1
-  CICO_OCC_LOSS_TYPE: 'cosine'
   RATR_ENABLED: False
 
 TEST:
@@ -89,4 +77,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-cico-b64k4'
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-b64k4'

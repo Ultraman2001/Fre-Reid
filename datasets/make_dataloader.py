@@ -68,31 +68,59 @@ def make_dataloader(cfg):
         ])
 
     if pam_enabled:
-        pam_base_transforms = T.Compose([
-            T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
-            T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
-            T.ToTensor(),
-            T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
-        ])
-        pam_crop_transforms = T.Compose([
-            T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
-            T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
-            T.Pad(cfg.INPUT.PAM.CROP_PADDING),
-            T.RandomResizedCrop(
-                cfg.INPUT.SIZE_TRAIN,
-                scale=tuple(cfg.INPUT.PAM.CROP_SCALE),
-                ratio=tuple(cfg.INPUT.PAM.CROP_RATIO),
-                interpolation=3,
-            ),
-            T.ToTensor(),
-            T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
-        ])
-        pam_eraser_transforms = T.Compose([
-            T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
-            T.ToTensor(),
-            T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
-            RandomErasing(probability=1.0, mode='pixel', max_count=1, device='cpu'),
-        ])
+        pam_aug_mode = getattr(cfg.INPUT.PAM, 'AUG_MODE', 'default').lower()
+        if pam_aug_mode == 'pade':
+            pam_base_transforms = T.Compose([
+                T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+                T.ToTensor(),
+                T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+            ])
+            pam_crop_transforms = T.Compose([
+                T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+                T.Pad(cfg.INPUT.PAM.CROP_PADDING),
+                T.ToTensor(),
+                T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+                T.RandomResizedCrop(
+                    cfg.INPUT.SIZE_TRAIN,
+                    scale=tuple(cfg.INPUT.PAM.CROP_SCALE),
+                    ratio=tuple(cfg.INPUT.PAM.CROP_RATIO),
+                    interpolation=3,
+                ),
+            ])
+            pam_eraser_transforms = T.Compose([
+                T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+                T.ToTensor(),
+                T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+                RandomErasing(probability=1.0, mode='pixel', max_count=1, device='cpu'),
+            ])
+        elif pam_aug_mode == 'default':
+            pam_base_transforms = T.Compose([
+                T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+                T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
+                T.ToTensor(),
+                T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+            ])
+            pam_crop_transforms = T.Compose([
+                T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+                T.RandomHorizontalFlip(p=cfg.INPUT.PROB),
+                T.Pad(cfg.INPUT.PAM.CROP_PADDING),
+                T.RandomResizedCrop(
+                    cfg.INPUT.SIZE_TRAIN,
+                    scale=tuple(cfg.INPUT.PAM.CROP_SCALE),
+                    ratio=tuple(cfg.INPUT.PAM.CROP_RATIO),
+                    interpolation=3,
+                ),
+                T.ToTensor(),
+                T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+            ])
+            pam_eraser_transforms = T.Compose([
+                T.Resize(cfg.INPUT.SIZE_TRAIN, interpolation=3),
+                T.ToTensor(),
+                T.Normalize(mean=cfg.INPUT.PIXEL_MEAN, std=cfg.INPUT.PIXEL_STD),
+                RandomErasing(probability=1.0, mode='pixel', max_count=1, device='cpu'),
+            ])
+        else:
+            raise ValueError(f'Unsupported INPUT.PAM.AUG_MODE: {pam_aug_mode}')
 
     val_transforms = T.Compose([
         T.Resize(cfg.INPUT.SIZE_TEST),
@@ -105,7 +133,7 @@ def make_dataloader(cfg):
     dataset = __factory[cfg.DATASETS.NAMES](root=cfg.DATASETS.ROOT_DIR)
 
     if pam_enabled:
-        print('[Data] PAM enabled: BA + CA + EA training views')
+        print(f'[Data] PAM enabled: BA + CA + EA training views ({pam_aug_mode} aug)')
         train_set = ParallelAugmentationImageDataset(
             dataset.train,
             pam_base_transforms,

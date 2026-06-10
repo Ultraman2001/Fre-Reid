@@ -9,7 +9,6 @@ from .softmax_loss import CrossEntropyLabelSmooth, LabelSmoothingCrossEntropy
 from .triplet_loss import TripletLoss
 from .center_loss import CenterLoss
 from .ratr_loss import RATRLoss
-from utils.cico_pam import cico_occ_consistency_loss
 
 
 def make_loss(cfg, num_classes):    # modified by gu
@@ -52,73 +51,67 @@ def make_loss(cfg, num_classes):    # modified by gu
                     use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
 
                     if use_pam:
-                        use_cico = getattr(getattr(cfg.INPUT.PAM, 'CICO', {}), 'ENABLED', False)
-                        if isinstance(feat, dict):
-                            branch_feats = feat['global_feats']
-                            branch_names = tuple(feat.get('branch_names', ()))
-                        else:
-                            branch_feats = feat
-                            branch_names = ()
-                        if not branch_names:
-                            branch_names = ('ba', 'ca', 'ea', 'cico') if use_cico else ('ba', 'ca', 'ea')
-                        expected_len = len(branch_names)
-                        if len(score) != expected_len or len(branch_feats) != expected_len:
-                            raise ValueError(f'PAM loss expects {expected_len} branches')
+                        local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
+                        local_enabled = bool(getattr(local_cfg, 'ENABLED', False))
+                        local_num_stripes = int(getattr(local_cfg, 'NUM_STRIPES', 4))
+                        expected_len = 3 + local_num_stripes if local_enabled else 3
+                        if len(score) != expected_len or len(feat) != expected_len:
+                            raise ValueError(
+                                'PAM loss expects BA, CA, EA plus optional BA local stripes'
+                            )
 
                         pam_weight = cfg.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT
-                        cico_reid_weight = getattr(cfg.SOLVER, 'PAM_CICO_REID_LOSS_WEIGHT', pam_weight)
-                        branch_weights = []
-                        for name in branch_names:
-                            if name == 'ba':
-                                branch_weights.append(1.0)
-                            elif name == 'cico':
-                                branch_weights.append(cico_reid_weight)
-                            else:
-                                branch_weights.append(pam_weight)
+                        branch_names = ('ba', 'ca', 'ea')
                         id_losses = []
                         tri_losses = []
 
-                        for branch_score, branch_feat, branch_weight in zip(score, branch_feats, branch_weights):
-                            if branch_weight <= 0:
-                                zero = branch_feat.new_tensor(0.0)
-                                id_losses.append(zero)
-                                tri_losses.append(zero)
-                                continue
+                        for branch_score, branch_feat in zip(score[:3], feat[:3]):
                             if cfg.MODEL.IF_LABELSMOOTH == 'on':
                                 id_losses.append(xent(branch_score.float(), target))
                             else:
                                 id_losses.append(F.cross_entropy(branch_score.float(), target))
                             tri_losses.append(triplet(branch_feat.float(), target)[0])
 
-                        pam_denominator = sum(branch_weights)
-                        ID_LOSS = sum(w * loss for w, loss in zip(branch_weights, id_losses)) / pam_denominator
-                        TRI_LOSS = sum(w * loss for w, loss in zip(branch_weights, tri_losses)) / pam_denominator
-                        total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
-                                     cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
+                        pam_denominator = 1.0 + 2.0 * pam_weight
+                        ID_LOSS = (id_losses[0] + pam_weight * (id_losses[1] + id_losses[2])) / \
+                                  pam_denominator
+                        TRI_LOSS = (tri_losses[0] + pam_weight * (tri_losses[1] + tri_losses[2])) / \
+                                   pam_denominator
 
-                        loss_detail = {
-                            'pam_weight': pam_weight,
-                            'branch_names': branch_names,
-                        }
-                        if use_cico:
-                            loss_detail['cico_reid_weight'] = cico_reid_weight
+                        loss_detail = {'pam_weight': pam_weight}
                         for name, id_loss, tri_loss in zip(branch_names, id_losses, tri_losses):
                             loss_detail[f'id_{name}'] = id_loss.item()
                             loss_detail[f'tri_{name}'] = tri_loss.item()
 
-                        if use_cico and isinstance(feat, dict):
-                            cico_occ_weight = getattr(cfg.SOLVER, 'CICO_OCC_LOSS_WEIGHT', 1.0)
-                            if cico_occ_weight > 0:
-                                occ_loss_type = getattr(cfg.SOLVER, 'CICO_OCC_LOSS_TYPE', 'mse')
-                                cico_occ = cico_occ_consistency_loss(
-                                    feat['cico_map'].float(),
-                                    feat['cico_mask'].float(),
-                                    group_size=cfg.DATALOADER.NUM_INSTANCE,
-                                    loss_type=occ_loss_type,
-                                )
-                                total_loss = total_loss + cico_occ_weight * cico_occ
-                                loss_detail['cico_occ_weight'] = cico_occ_weight
-                                loss_detail['cico_occ'] = cico_occ.item()
+                        if local_enabled:
+                            local_weight = float(getattr(local_cfg, 'LOSS_WEIGHT', 0.2))
+                            local_use_triplet = bool(getattr(local_cfg, 'USE_TRIPLET', True))
+                            local_id_losses = []
+                            local_tri_losses = []
+
+                            for local_score, local_feat in zip(score[3:], feat[3:]):
+                                if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                                    local_id_losses.append(xent(local_score.float(), target))
+                                else:
+                                    local_id_losses.append(F.cross_entropy(local_score.float(), target))
+                                if local_use_triplet:
+                                    local_tri_losses.append(triplet(local_feat.float(), target)[0])
+
+                            LOCAL_ID_LOSS = sum(local_id_losses) / len(local_id_losses)
+                            ID_LOSS = ID_LOSS + local_weight * LOCAL_ID_LOSS
+
+                            if local_use_triplet:
+                                LOCAL_TRI_LOSS = sum(local_tri_losses) / len(local_tri_losses)
+                                TRI_LOSS = TRI_LOSS + local_weight * LOCAL_TRI_LOSS
+                                loss_detail['tri_local'] = LOCAL_TRI_LOSS.item()
+                            else:
+                                loss_detail['tri_local'] = 0.0
+
+                            loss_detail['local_weight'] = local_weight
+                            loss_detail['id_local'] = LOCAL_ID_LOSS.item()
+
+                        total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
+                                     cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
 
                         return total_loss, loss_detail
                     
