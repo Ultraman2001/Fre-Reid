@@ -32,15 +32,14 @@ def apply_osbbm_batch(
     num_mix_blocks=4,
     gray_prob=0.5,
 ):
-    """Apply OSBBM-style horizontal block replacement to a normalized batch.
+    """Apply OSBBM-style horizontal block mixing to a normalized image batch.
 
-    Donor blocks are treated as occluders, so labels are kept unchanged. This
-    is the variant used by the PAM + scheduled OSBBM experiments.
+    The mixed blocks are treated as occluders, so labels are kept unchanged.
     """
     if prob <= 0 or images.shape[0] <= 1:
         return images
 
-    _, channels, height, _ = images.shape
+    batch_size, channels, height, _ = images.shape
     num_blocks = max(1, int(num_blocks))
     num_mix_blocks = max(1, min(int(num_mix_blocks), num_blocks))
     gray_prob = float(gray_prob)
@@ -53,7 +52,7 @@ def apply_osbbm_batch(
 
     labels = labels.detach()
     donor_perm = _different_identity_permutation(labels)
-    apply_mask = torch.rand(images.shape[0], device=work.device) < float(prob)
+    apply_mask = torch.rand(batch_size, device=work.device) < float(prob)
     block_edges = [round(i * height / num_blocks) for i in range(num_blocks + 1)]
 
     for idx in torch.nonzero(apply_mask, as_tuple=False).flatten().tolist():
