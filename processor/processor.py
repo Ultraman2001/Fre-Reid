@@ -6,8 +6,32 @@ import torch.nn as nn
 import torch.nn.functional as F
 from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
+from utils.osbbm import apply_osbbm_batch
 from torch import amp
 import torch.distributed as dist
+
+
+def _osbbm_active_for_epoch(osbbm_cfg, epoch, max_epochs):
+    schedule = str(getattr(osbbm_cfg, 'SCHEDULE', 'always')).lower()
+    start_epoch = int(getattr(osbbm_cfg, 'START_EPOCH', 1))
+    end_epoch = int(getattr(osbbm_cfg, 'END_EPOCH', 0))
+    if end_epoch <= 0:
+        end_epoch = max_epochs
+
+    if schedule == 'always':
+        return True
+    if epoch < start_epoch or epoch > end_epoch:
+        return False
+    if schedule == 'range':
+        return True
+    if schedule == 'cycle':
+        period = max(int(getattr(osbbm_cfg, 'PERIOD_EPOCHS', 20)), 1)
+        on_epochs = int(getattr(osbbm_cfg, 'ON_EPOCHS', 10))
+        on_epochs = min(max(on_epochs, 0), period)
+        cycle_pos = (epoch - start_epoch) % period
+        return cycle_pos < on_epochs
+    raise ValueError("INPUT.OSBBM.SCHEDULE must be 'always', 'range', or 'cycle'")
+
 
 def do_train(cfg,
              model,
@@ -30,6 +54,26 @@ def do_train(cfg,
 
     logger = logging.getLogger("transreid.train")
     logger.info('start training')
+    osbbm_cfg = getattr(cfg.INPUT, 'OSBBM', None)
+    osbbm_enabled = bool(getattr(osbbm_cfg, 'ENABLED', False))
+    if osbbm_enabled:
+        osbbm_end_epoch = int(getattr(osbbm_cfg, 'END_EPOCH', 0))
+        if osbbm_end_epoch <= 0:
+            osbbm_end_epoch = epochs
+        logger.info(
+            "[OSBBM] enabled: prob={:.2f}, blocks={}, mix_blocks={}, gray_prob={:.2f}, apply_to={}, schedule={}, start={}, end={}, period={}, on={}".format(
+                float(getattr(osbbm_cfg, 'PROB', 0.5)),
+                int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
+                int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                str(getattr(osbbm_cfg, 'APPLY_TO', 'base')).lower(),
+                str(getattr(osbbm_cfg, 'SCHEDULE', 'always')).lower(),
+                int(getattr(osbbm_cfg, 'START_EPOCH', 1)),
+                osbbm_end_epoch,
+                int(getattr(osbbm_cfg, 'PERIOD_EPOCHS', 20)),
+                int(getattr(osbbm_cfg, 'ON_EPOCHS', 10)),
+            )
+        )
     _LOCAL_PROCESS_GROUP = None
     if device:
         model.to(local_rank)
@@ -50,22 +94,75 @@ def do_train(cfg,
         evaluator.reset()
         scheduler.step(epoch)
         model.train()
+        osbbm_active = osbbm_enabled and _osbbm_active_for_epoch(osbbm_cfg, epoch, epochs)
+        if osbbm_enabled and (epoch == 1 or str(getattr(osbbm_cfg, 'SCHEDULE', 'always')).lower() != 'always'):
+            logger.info("[OSBBM] Epoch {} active={}".format(epoch, osbbm_active))
         for n_iter, batch in enumerate(train_loader):
             optimizer.zero_grad()
             optimizer_center.zero_grad()
             if pam_enabled:
                 img_base, img_crop, img_erase, vid, target_cam, target_view = batch
+                target = vid.to(device)
+                img_base = img_base.to(device)
+                img_crop = img_crop.to(device)
+                img_erase = img_erase.to(device)
+                if osbbm_active:
+                    apply_to = str(getattr(osbbm_cfg, 'APPLY_TO', 'base')).lower()
+                    if apply_to not in ('base', 'all'):
+                        raise ValueError("INPUT.OSBBM.APPLY_TO must be 'base' or 'all'")
+                    img_base = apply_osbbm_batch(
+                        img_base,
+                        target,
+                        cfg.INPUT.PIXEL_MEAN,
+                        cfg.INPUT.PIXEL_STD,
+                        prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
+                        num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
+                        num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                        gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                    )
+                    if apply_to == 'all':
+                        img_crop = apply_osbbm_batch(
+                            img_crop,
+                            target,
+                            cfg.INPUT.PIXEL_MEAN,
+                            cfg.INPUT.PIXEL_STD,
+                            prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
+                            num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
+                            num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                            gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                        )
+                        img_erase = apply_osbbm_batch(
+                            img_erase,
+                            target,
+                            cfg.INPUT.PIXEL_MEAN,
+                            cfg.INPUT.PIXEL_STD,
+                            prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
+                            num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
+                            num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                            gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                        )
                 img = (
-                    img_base.to(device),
-                    img_crop.to(device),
-                    img_erase.to(device),
+                    img_base,
+                    img_crop,
+                    img_erase,
                 )
                 batch_size = img_base.shape[0]
             else:
                 img, vid, target_cam, target_view = batch
                 img = img.to(device)
+                target = vid.to(device)
+                if osbbm_active:
+                    img = apply_osbbm_batch(
+                        img,
+                        target,
+                        cfg.INPUT.PIXEL_MEAN,
+                        cfg.INPUT.PIXEL_STD,
+                        prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
+                        num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
+                        num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                        gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                    )
                 batch_size = img.shape[0]
-            target = vid.to(device)
             target_cam = target_cam.to(device)
             target_view = target_view.to(device)
             with amp.autocast('cuda'):
@@ -192,6 +289,30 @@ def do_train(cfg,
                 for s in sasf_stats:
                     layer_name = f"Stage{s['lvl']+1}.Blk{s['blk']}"
                     logger.info(f"  {layer_name:<15} {s['sasf_scale']:>6.4f} {s['k3_norm']:>8.2f} {s['k5_norm']:>8.2f}")
+
+            fslora_adapters = [
+                module for module in _model.modules()
+                if getattr(module, 'is_fslora_adapter', False)
+            ]
+            if fslora_adapters:
+                gammas = torch.stack([
+                    module.fslora_gamma.detach().float().view(-1)[0]
+                    for module in fslora_adapters
+                ])
+                freq_weights = torch.stack([
+                    module.fslora_flm.last_freq_weight.detach().float()
+                    for module in fslora_adapters
+                ])
+                logger.info(
+                    "[FSLoRA Monitor] Epoch {}: adapters={}, gamma_mean={:.6f}, gamma_max={:.6f}, freq_w[low/high]=[{:.3f}, {:.3f}]".format(
+                        epoch,
+                        len(fslora_adapters),
+                        gammas.mean().item(),
+                        gammas.max().item(),
+                        freq_weights[:, 0].mean().item(),
+                        freq_weights[:, 1].mean().item(),
+                    )
+                )
 
         if epoch % checkpoint_period == 0:
             if cfg.MODEL.DIST_TRAIN:

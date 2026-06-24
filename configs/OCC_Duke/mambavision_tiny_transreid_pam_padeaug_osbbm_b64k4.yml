@@ -39,7 +39,17 @@ INPUT:
     CROP_SCALE: [0.08, 1.0]
     CROP_RATIO: [0.75, 1.3333]
   OSBBM:
-    ENABLED: False
+    ENABLED: True
+    PROB: 0.25
+    NUM_BLOCKS: 8
+    NUM_MIX_BLOCKS: 2
+    GRAY_PROB: 0.5
+    APPLY_TO: 'base'
+    SCHEDULE: 'cycle'
+    START_EPOCH: 21
+    END_EPOCH: 120
+    PERIOD_EPOCHS: 20
+    ON_EPOCHS: 10
 
 DATASETS:
   NAMES: ('occ_duke')
@@ -80,4 +90,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-pamw05-b64k4'
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-pamw05-osbbm-m2-c21-120-p20-on10-b64k4'

@@ -51,6 +51,19 @@ _C.MODEL.COS_LAYER = False
 # Pooling type: 'gem', 'avg', 'max', 'avg_max' (消融实验用)
 _C.MODEL.POOLING_TYPE = 'gem'
 
+# Freq-Spatial Low-Rank Adapter on the final MambaVision feature map.
+_C.MODEL.FSLORA = CN()
+_C.MODEL.FSLORA.ENABLED = False
+_C.MODEL.FSLORA.RANK = 32
+_C.MODEL.FSLORA.NUM_EXPERTS = 2
+_C.MODEL.FSLORA.INIT_GAMMA = 1e-3
+_C.MODEL.FSLORA.FREQ_LOW_CUTOFF = 0.30
+_C.MODEL.FSLORA.FREQ_HIGH_CUTOFF = 0.40
+_C.MODEL.FSLORA.FREQ_TRANSITION = 0.0
+_C.MODEL.FSLORA.WRAP_CONV = True
+_C.MODEL.FSLORA.FREEZE_BASE = True
+_C.MODEL.FSLORA.TARGET_STAGES = []  # empty means all MambaVision backbone stages
+
 # Local stripe descriptors on the final feature map.
 _C.MODEL.LOCAL_STRIPE = CN()
 _C.MODEL.LOCAL_STRIPE.ENABLED = False
@@ -121,6 +134,22 @@ _C.INPUT.PAM.AUG_MODE = 'default'  # default: Fre-Reid PAM; pade: PADE-style BA/
 _C.INPUT.PAM.CROP_PADDING = 30
 _C.INPUT.PAM.CROP_SCALE = [0.08, 1.0]
 _C.INPUT.PAM.CROP_RATIO = [0.75, 1.3333]
+# Occlusion Simulation Based on Block Mixing. Training only.
+# Adapted from the occlusion simulation idea in
+# "Occlusion Simulation and Token-Constrained Feature Coupling Network for
+# Occluded Person Reidentification".
+_C.INPUT.OSBBM = CN()
+_C.INPUT.OSBBM.ENABLED = False
+_C.INPUT.OSBBM.PROB = 0.5
+_C.INPUT.OSBBM.NUM_BLOCKS = 8
+_C.INPUT.OSBBM.NUM_MIX_BLOCKS = 4
+_C.INPUT.OSBBM.GRAY_PROB = 0.5
+_C.INPUT.OSBBM.APPLY_TO = 'base'  # base, all
+_C.INPUT.OSBBM.SCHEDULE = 'always'  # always, range, cycle
+_C.INPUT.OSBBM.START_EPOCH = 1
+_C.INPUT.OSBBM.END_EPOCH = 0  # 0 means SOLVER.MAX_EPOCHS
+_C.INPUT.OSBBM.PERIOD_EPOCHS = 20
+_C.INPUT.OSBBM.ON_EPOCHS = 10
 # Values to be used for image normalization
 _C.INPUT.PIXEL_MEAN = [0.485, 0.456, 0.406]
 # Values to be used for image normalization
@@ -224,6 +253,9 @@ _C.SOLVER.SFM_LAMBDA_AUX = 0.2    # 中间聚合级 (F12, F23) 的损失权重
 
 # Multiplier for SFM module learning rate (SFM is new, use 1.0 by default)
 _C.SOLVER.SFM_LR_FACTOR = 1.0
+
+# Multiplier for FSLoRA adapter learning rate.
+_C.SOLVER.FSLORA_LR_FACTOR = 2.0
 
 # RATR (Ranking-aware Triplet Regularization) 损失配置
 _C.SOLVER.RATR_ENABLED = False    # 是否启用 RATR

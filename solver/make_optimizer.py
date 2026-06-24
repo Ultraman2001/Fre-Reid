@@ -24,7 +24,14 @@ def make_optimizer(cfg, model, center_criterion):
         # 1. state_fusion / sasf_scale: StateFusion modules (uses SASF_LR_FACTOR)
         # 2. levels.3 (Stage 4 backbone): Random init due to structure change
         
-        if "state_fusion" in key or "sasf_scale" in key:
+        if "fslora" in key:
+            fslora_lr_factor = getattr(cfg.SOLVER, 'FSLORA_LR_FACTOR', 2.0)
+            lr = cfg.SOLVER.BASE_LR * fslora_lr_factor
+            if "fslora" not in printed_high_lr_keys:
+                print(f"Using {fslora_lr_factor}x learning rate for FSLoRA adapter: {key}")
+                printed_high_lr_keys.add("fslora")
+
+        elif "state_fusion" in key or "sasf_scale" in key:
             lr = cfg.SOLVER.BASE_LR * cfg.SOLVER.SASF_LR_FACTOR
             if "state_fusion" not in printed_high_lr_keys:
                 print(f"Using {cfg.SOLVER.SASF_LR_FACTOR}x learning rate for StateFusion: {key}")

@@ -23,21 +23,25 @@ MODEL:
     GLOBAL_STAGES: [2, 3]
     USE_SFM: False
     USE_FINE_BRANCH: False
-  LOCAL_STRIPE:
+  STRIPE_AUX:
+    ENABLED: False
+  LOCAL_CLS:
     ENABLED: True
-    NUM_STRIPES: 4
-    LOSS_WEIGHT: 0.2
-    USE_TRIPLET: True
-    INFERENCE: 'concat'
+    NUM_TOKENS: 8
+    MODE: 's3_s4'
+    INSERT_MODE: 'scatter'
+    SOURCE_STAGE: 2
+    INIT: 'learnable'
     POOLING_TYPE: 'gem'
-    TOKEN_INSERTION:
-      ENABLED: True
-      MIXER_TYPE: 'mambavision'
-      TOKEN_POOLING_TYPE: 'gem'
-      MODE: 'even'
-      KERNEL_SIZE: 3
-      MLP_RATIO: 2.0
-      INIT_SCALE: 0.001
+    FEATURE_MODE: 'guided_pool'
+    FEAT_DIM: 256
+    ID_WEIGHT: 0.2
+    TRI_WEIGHT: 0.05
+    TRI_WARMUP_EPOCHS: 10
+    DISSIMILAR_WEIGHT: 0.0
+    GRAD_SCALE: 0.2
+    INFERENCE: 'global'
+    LOCAL_SCALE: 0.8
 
 INPUT:
   SIZE_TRAIN: [256, 128]
@@ -93,4 +97,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-logstripe-b64k4'
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-localcls-s3s4-scat-k4-gpool-d256-id020-tri005-gs02-b64k4'

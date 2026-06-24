@@ -15,6 +15,17 @@ MODEL:
   TRIPLET_LOSS_WEIGHT: 1.0
   POOLING_TYPE: 'gem'
   SIE_CAMERA: False
+  FSLORA:
+    ENABLED: True
+    RANK: 32
+    NUM_EXPERTS: 2
+    INIT_GAMMA: 0.001
+    FREQ_LOW_CUTOFF: 0.30
+    FREQ_HIGH_CUTOFF: 0.40
+    FREQ_TRANSITION: 0.0
+    WRAP_CONV: True
+    FREEZE_BASE: True
+    TARGET_STAGES: []
   EMA:
     ENABLED: False
     DECAY: 0.998
@@ -23,15 +34,6 @@ MODEL:
     GLOBAL_STAGES: [2, 3]
     USE_SFM: False
     USE_FINE_BRANCH: False
-  LOCAL_STRIPE:
-    ENABLED: True
-    NUM_STRIPES: 4
-    LOSS_WEIGHT: 0.2
-    USE_TRIPLET: True
-    INFERENCE: 'concat'
-    POOLING_TYPE: 'gem'
-    TOKEN_INSERTION:
-      ENABLED: False
 
 INPUT:
   SIZE_TRAIN: [256, 128]
@@ -47,6 +49,18 @@ INPUT:
     CROP_PADDING: 30
     CROP_SCALE: [0.08, 1.0]
     CROP_RATIO: [0.75, 1.3333]
+  OSBBM:
+    ENABLED: True
+    PROB: 0.25
+    NUM_BLOCKS: 8
+    NUM_MIX_BLOCKS: 2
+    GRAY_PROB: 0.5
+    APPLY_TO: 'base'
+    SCHEDULE: 'cycle'
+    START_EPOCH: 21
+    END_EPOCH: 120
+    PERIOD_EPOCHS: 20
+    ON_EPOCHS: 10
 
 DATASETS:
   NAMES: ('occ_duke')
@@ -75,8 +89,9 @@ SOLVER:
   MARGIN: 0.3
   STAGE4_LR_FACTOR: 2.0
   SASF_LR_FACTOR: 1.0
+  FSLORA_LR_FACTOR: 2.0
   CLIP_GRAD_NORM: 10.0
-  PAM_AUGMENTED_LOSS_WEIGHT: 1.0
+  PAM_AUGMENTED_LOSS_WEIGHT: 0.5
   RATR_ENABLED: False
 
 TEST:
@@ -87,4 +102,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-localstripe-b64k4'
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-pamw05-osbbm-m2-fslora-r32n2-freeze-b64k4'
