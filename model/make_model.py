@@ -1,1178 +1,773 @@
-"""
-MambaVision backbone for ReID tasks
-Adapted from NVIDIA MambaVision for TransReID framework
-"""
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-from timm.models.layers import trunc_normal_, DropPath
-from timm.models.vision_transformer import Mlp
-from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-from einops import rearrange, repeat
+from .backbones.resnet import ResNet, Bottleneck
+import copy
+from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
+from .backbones.mambavision.mamba_vision_reid import (
+    MambaVisionMixer,
+    mambavision_tiny_reid,
+    mambavision_small_reid,
+    mambavision_base_reid,
+)
+from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
-try:
-    from Dwconv.dwconv_layer import DepthwiseFunction
-except:
-    DepthwiseFunction = None
 
-class StateFusion(nn.Module):
-    """
-    Ultra-simplified SASF: Pure multi-scale depthwise conv (DWConv).
-    Uses GroupNorm for stability in small-batch ReID.
-    Returns a spatial residual feature (to be injected by sasf_scale outside).
-    """
-    def __init__(self, dim):
+class GeM(nn.Module):
+    """Generalized Mean Pooling."""
+
+    def __init__(self, p: float = 3.0, eps: float = 1e-6, learnable: bool = True):
         super().__init__()
-        # Branch 1: 3x3 local (Capture fine textures)
-        self.dw3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim, bias=False)
-        # Branch 2: 3x3 with dilation=2 (5x5 effective context)
-        self.dw5 = nn.Conv2d(dim, dim, 3, padding=2, dilation=2, groups=dim, bias=False)
-        
-        # Stability: GroupNorm is more robust than BatchNorm for small batches
-        num_groups = min(32, dim) if dim % 32 == 0 else (dim // 8 if dim % 8 == 0 else 1)
-        self.norm = nn.GroupNorm(num_groups=num_groups, num_channels=dim)
-        self.act = nn.SiLU(inplace=True)
-        
-        # Initialization
-        nn.init.kaiming_normal_(self.dw3.weight, mode='fan_out', nonlinearity='relu')
-        nn.init.kaiming_normal_(self.dw5.weight, mode='fan_out', nonlinearity='relu')
-
-    def forward(self, h):
-        """
-        h: (B, C, H, W)
-        """
-        # Multi-scale 2D structural perception
-        spatial = self.dw3(h) + self.dw5(h)
-        # Apply normalization and SiLU activation
-        spatial = self.act(self.norm(spatial))
-        
-        return spatial
-
-
-class NeABottleneck(nn.Module):
-    """
-    SASF-Style Multi-Scale Non-linear Enhancement (NeA) module.
-    
-    借鉴 Spatial-Mamba StateFusion 的设计:
-    - 深度可分离卷积 (groups=dim)
-    - 多尺度空洞卷积 (dilation=1, 2)
-    - 可学习的 alpha 加权融合
-    - Replicate padding 保持边界连续性
-    
-    感受野: 3×3 (dilation=1) + 5×5 (dilation=2)
-    """
-    def __init__(self, inplanes, planes):
-        super().__init__()
-        # 1x1 降维
-        self.conv1 = nn.Conv2d(inplanes, planes, 1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        
-        # 多尺度深度可分离卷积 (SASF 风格)
-        # dilation=1: RF=3×3, dilation=2: RF=5×5
-        self.kernel_d1 = nn.Parameter(torch.ones(planes, 1, 3, 3) * 0.1)  # 深度可分离
-        self.kernel_d2 = nn.Parameter(torch.ones(planes, 1, 3, 3) * 0.1)  # 深度可分离
-        
-        # 可学习的融合权重 [α₀, α₁]
-        self.alpha = nn.Parameter(torch.ones(2))
-        
-        self.bn2 = nn.BatchNorm2d(planes)
-        
-        # 1x1 升维
-        self.conv3 = nn.Conv2d(planes, inplanes, 1, bias=False)
-        self.bn3 = nn.BatchNorm2d(inplanes)
-        self.act = nn.GELU()
-    
-    def forward(self, x):
-        identity = x
-        out = self.act(self.bn1(self.conv1(x)))
-        
-        # 多尺度深度可分离卷积 (SASF 风格)
-        # Replicate padding 保持边界连续性
-        h1 = F.conv2d(
-            F.pad(out, (1, 1, 1, 1), mode='replicate'),
-            self.kernel_d1,
-            padding=0, dilation=1, groups=out.size(1)
-        )
-        h2 = F.conv2d(
-            F.pad(out, (2, 2, 2, 2), mode='replicate'),
-            self.kernel_d2,
-            padding=0, dilation=2, groups=out.size(1)
-        )
-        
-        # 加权融合
-        out = self.alpha[0] * h1 + self.alpha[1] * h2
-        out = self.act(self.bn2(out))
-        
-        out = self.bn3(self.conv3(out))
-        return self.act(out + identity)
-
-
-def _resize_to(x, size):
-    """
-    抗混叠 resize：下采样用 area，上采样用 bilinear
-    """
-    H, W = x.shape[-2:]
-    tH, tW = size
-    if H > tH or W > tW:
-        # 下采样：使用 area 模式抗混叠（或 adaptive_avg_pool2d）
-        return F.interpolate(x, size=size, mode='area')
-    elif H < tH or W < tW:
-        # 上采样：使用 bilinear 插值
-        return F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-    return x
-
-
-class LinearAlign(nn.Module):
-    """
-    线性对齐模块 (用于 SFM_34 深层融合)
-    
-    结构: Resize + Conv1x1 + BN (无激活、无DW)
-    
-    设计理由:
-    - 深层特征已包含高度抽象的行人语义
-    - 过多处理会破坏特征的"流形结构"
-    - 只做维度投影，最大程度保留原始语义
-    """
-    def __init__(self, in_dim, out_dim, target_size=(16, 8)):
-        super().__init__()
-        self.target_size = target_size
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_dim, out_dim, 1, bias=False),
-            nn.BatchNorm2d(out_dim),
-        )
-    
-    def forward(self, x):
-        x = _resize_to(x, self.target_size)
-        return self.proj(x)
-
-class DenoiseAlign(nn.Module):
-    """
-    去噪对齐模块 (用于 SFM_12/SFM_23 浅层融合)
-    
-    结构: Resize + Conv1x1 + BN + 残差 DWConv3x3
-    
-    设计理由:
-    - 浅层特征噪声多，下采样跨度大
-    - 先抗混叠 (area resize)，再做轻去噪 (residual DWConv)
-    - DWConv 用残差式避免"强改分布"
-    
-    Args:
-        in_dim: 输入通道数
-        out_dim: 输出通道数
-        target_size: 目标空间尺寸
-        use_act: 是否在 DW 分支使用激活 (SFM_12=True, SFM_23=False)
-    """
-    def __init__(self, in_dim, out_dim, target_size=(16, 8), use_act=True):
-        super().__init__()
-        self.target_size = target_size
-        
-        # 通道投影: Conv1x1 + BN
-        self.proj = nn.Sequential(
-            nn.Conv2d(in_dim, out_dim, 1, bias=False),
-            nn.BatchNorm2d(out_dim),
-        )
-        
-        # 残差去噪分支: DWConv3x3 + BN (+ 可选激活)
-        if use_act:
-            self.dw = nn.Sequential(
-                nn.Conv2d(out_dim, out_dim, 3, padding=1, groups=out_dim, bias=False),
-                nn.BatchNorm2d(out_dim),
-                nn.SiLU(inplace=True),
-            )
+        if learnable:
+            self.p = nn.Parameter(torch.ones(1) * p)
         else:
-            self.dw = nn.Sequential(
-                nn.Conv2d(out_dim, out_dim, 3, padding=1, groups=out_dim, bias=False),
-                nn.BatchNorm2d(out_dim),
-            )
-    
-    def forward(self, x):
-        x = _resize_to(x, self.target_size)
-        x = self.proj(x)
-        x = x + self.dw(x)  # 残差式：轻去噪，不强改分布
-        return x
+            self.register_buffer('p', torch.ones(1) * p)
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        p = torch.clamp(self.p, min=1e-6)
+        # 强制在 FP32 下计算，防止 FP16 下 x.pow(3) 溢出
+        x_dtype = x.dtype
+        x = x.float().clamp(min=self.eps).pow(p.view(1, 1, 1, 1))
+        x = x.mean(dim=(-1, -2), keepdim=True)
+        return x.pow(1.0 / p.view(1, 1, 1, 1)).to(x_dtype)
 
 
-class GateNet(nn.Module):
+class AvgPool(nn.Module):
+    """Average Pooling wrapper with FP32 protection."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.adaptive_avg_pool2d(x.float(), 1).to(x.dtype)
+
+
+class MaxPool(nn.Module):
+    """Max Pooling wrapper with FP32 protection."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return nn.functional.adaptive_max_pool2d(x.float(), 1).to(x.dtype)
+
+
+class AvgMaxPool(nn.Module):
+    """Average + Max Pooling with FP32 protection and mean scaling."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_f = x.float()
+        avg = nn.functional.adaptive_avg_pool2d(x_f, 1)
+        max_p = nn.functional.adaptive_max_pool2d(x_f, 1)
+        # 使用均值 (Avg + Max) / 2 保持与原特征相同的量级
+        return ((avg + max_p) / 2.0).to(x.dtype)
+
+
+def create_pooling(pooling_type: str):
     """
-    统一通道门控模块 (Unified Channel Gating Module)
-    
-    基于 SFM_UNIFIED_GATENET_PLAN.md 规范实现：
-    - 输入: 对齐后的两路特征 x_l, x_h (B, C, H, W)
-    - 输出: 通道门控 g ∈ [0, 1]^(B, C, 1, 1)
-    
-    结构: Concat -> GAP -> 2-layer Bottleneck MLP -> Sigmoid
+    工厂函数：根据配置创建池化层
     
     Args:
-        dim: 通道数 (对齐后的统一通道数)
-        reduction: 瓶颈降维比例 (default: 8)
-        temperature: Sigmoid 温度参数 (default: 2.0, 高温度使输出更平滑)
-    """
-    def __init__(self, dim, reduction=8, temperature=2.0):
-        super().__init__()
-        self.temperature = temperature
-        hidden_dim = max(dim * 2 // reduction, 16)  # 保证最小隐层维度
-        
-        # 两层瓶颈 MLP (等价于 1x1 Conv)
-        self.gate_mlp = nn.Sequential(
-            nn.Linear(dim * 2, hidden_dim, bias=False),
-            nn.ReLU(inplace=True),  # 原文建议 SiLU/GELU，这里用 ReLU 保持简洁
-            nn.Linear(hidden_dim, dim, bias=True),
-        )
-        
-        # 初始化: 让初始门控接近 0.5 (平衡状态)
-        nn.init.zeros_(self.gate_mlp[-1].bias)
+        pooling_type: 'gem', 'avg', 'max', 'avg_max'
     
-    def forward(self, x_low, x_high):
-        """
-        Args:
-            x_low: 对齐后的低层特征 (B, C, H, W)
-            x_high: 对齐后的高层特征 (B, C, H, W)
-        Returns:
-            gate: 通道门控 (B, C, 1, 1)
-        """
-        B, C, H, W = x_low.shape
-        
-        # 1. 拼接两路特征
-        concat = torch.cat([x_low, x_high], dim=1)  # (B, 2C, H, W)
-        
-        # 2. 全局平均池化 (GAP)
-        z = concat.mean(dim=(2, 3))  # (B, 2C)
-        
-        # 3. 两层瓶颈 MLP (FP32 保护，防止 FP16 溢出)
-        orig_dtype = z.dtype
-        with torch.cuda.amp.autocast(enabled=False):
-            u = self.gate_mlp(z.float())  # (B, C)
-        
-        # 4. 温度缩放 Sigmoid (高温度使输出更平滑，减少极端值)
-        gate = torch.sigmoid(u / self.temperature)  # (B, C)
-        
-        # 5. Soft clamp: [0.05, 0.95] 防止完全的 0 或 1 导致梯度消失
-        gate = 0.05 + 0.9 * gate
-        
-        # 6. Reshape 为通道门控并恢复原始 dtype
-        gate = gate.view(B, C, 1, 1).to(orig_dtype)  # (B, C, 1, 1)
-        
-        return gate
-
-
-class SimpleFusionMambaBlock(nn.Module):
-    """
-    Simple Fusion Mamba Block (SFM) with Unified GateNet Fusion.
-    
-    基于 SFM_UNIFIED_GATENET_PLAN.md 规范实现 (附录 A: Gated Concat 版本)：
-    - 统一门控: GateNet (GAP + 2-layer bottleneck) 
-    - Gated Concat: 保留 2C 交互空间，门控只调制 high 分支的贡献
-    - 差分注入公式: x_in = Concat(x_l, g ⊙ x_h)
-    
-    Architecture:
-        1. Align low/high features (保留分层对齐策略)
-        2. Pre-Normalize aligned features for gate computation
-        3. Generate channel gate via GateNet
-        4. Gated Concat: Concat(low, gate * high) -> 保留 2C 交互
-        5. Process through SS2D (MambaVisionMixer) in 2C space
-        6. Split and residual injection
-        7. Enhance with NeA bottleneck
-    
-    Args:
-        low_dim: Channel dimension of low-level features
-        high_dim: Channel dimension of high-level features
-        out_dim: Output channel dimension (default: 512)
-        target_size: Target spatial size (H, W) for alignment
-        depth: Number of Mamba blocks in the fusion module (default: 1)
-        align_type: Alignment strategy ('denoise_strong', 'denoise_weak', 'linear')
-        gate_reduction: GateNet bottleneck reduction ratio (default: 8)
-    """
-    def __init__(self, low_dim, high_dim, out_dim=512, 
-                 target_size=(16, 8), depth=1, drop_path=0.1, 
-                 align_type='linear', gate_reduction=8):
-        super().__init__()
-        self.target_size = target_size
-        self.out_dim = out_dim
-        self.depth = depth
-        self.align_type = align_type
-        
-        # ========== 分层对齐模块 ==========
-        if align_type == 'denoise_strong':
-            # SFM_12: 最浅层，需要强去噪 (DWConv + SiLU)
-            self.align_low = DenoiseAlign(low_dim, out_dim, target_size, use_act=True)
-            self.align_high = DenoiseAlign(high_dim, out_dim, target_size, use_act=True)
-        elif align_type == 'denoise_weak':
-            # SFM_23: 中层，弱去噪 (DWConv only, 无激活)
-            self.align_low = DenoiseAlign(low_dim, out_dim, target_size, use_act=False)
-            self.align_high = DenoiseAlign(high_dim, out_dim, target_size, use_act=False)
-        else:  # 'linear'
-            # SFM_34: 深层，只做线性投影，保留语义
-            self.align_low = LinearAlign(low_dim, out_dim, target_size)
-            self.align_high = LinearAlign(high_dim, out_dim, target_size)
-        
-        # ========== Pre-Normalization (仅用于门控计算，消除量纲差异) ==========
-        self.norm_low = nn.LayerNorm(out_dim)
-        self.norm_high = nn.LayerNorm(out_dim)
-        
-        # ========== 统一通道门控 (Unified GateNet) ==========
-        self.gate_net = GateNet(out_dim, reduction=gate_reduction)
-        
-        # ========== SS2D fusion blocks (2C 交互空间) ==========
-        self.fusion_mamba = nn.ModuleList([
-            Block(
-                dim=out_dim * 2,  # 保持 2C 空间以保留 cross-stream interaction
-                counter=i,
-                transformer_blocks=[],
-                num_heads=8,
-                mlp_ratio=2.,  # 将膨胀率从 4 降至 2，大幅削减参数和显存负担
-                qkv_bias=True,
-                qk_scale=False,
-                drop=0.,
-                attn_drop=0.,
-                drop_path=drop_path,
-                layer_scale=1e-5,
-                use_sasf=False,
-            ) for i in range(depth)
-        ])
-        
-        # ========== Split projections (从 2C 回到 C) ==========
-        self.split_proj_low = nn.Sequential(
-            nn.Conv2d(out_dim * 2, out_dim, 1, bias=False),
-            nn.BatchNorm2d(out_dim),
-        )
-        self.split_proj_high = nn.Sequential(
-            nn.Conv2d(out_dim * 2, out_dim, 1, bias=False),
-            nn.BatchNorm2d(out_dim),
-        )
-        
-        # ========== NeA non-linear enhancement ==========
-        self.NeA = NeABottleneck(out_dim, out_dim // 4)
-
-        print(f"[SimpleFusionMambaBlock] low={low_dim}, high={high_dim}, "
-              f"out={out_dim}, align={align_type}, depth={depth}, gate_r={gate_reduction}")
-    
-    def forward(self, feat_low, feat_high):
-        """
-        Args:
-            feat_low: Low-level features (B, low_dim, H1, W1)
-            feat_high: High-level features (B, high_dim, H2, W2)
-        
-        Returns:
-            fused_map: Fused feature map (B, out_dim, H, W)
-        """
-        # 1. 对齐两路特征到相同空间尺寸与通道
-        low_aligned = self.align_low(feat_low)    # (B, out_dim, tH, tW)
-        high_aligned = self.align_high(feat_high)  # (B, out_dim, tH, tW)
-        
-        
-        # 2. Pre-Normalization (仅用于门控计算)
-        B, C, H, W = low_aligned.shape
-        low_normed = self.norm_low(low_aligned.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        high_normed = self.norm_high(high_aligned.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        
-        # 3. GateNet: 生成通道门控
-        gate = self.gate_net(low_normed, high_normed)  # (B, C, 1, 1)
-        
-        # 4. Gated Concat (附录 A 方案，保留 2C 交互空间)
-        # x_in = Concat(x_l, g ⊙ x_h)
-        gated_high = gate * high_aligned  # (B, C, H, W)
-        concat_feat = torch.cat([low_aligned, gated_high], dim=1)  # (B, 2C, H, W)
-        
-        # 5. SS2D 深度交互 (在 2C 空间进行 cross-stream interaction)
-        # 垂直扫描: 先 W 后 H，沿行人身体方向展平
-        concat_seq = rearrange(concat_feat, 'b c h w -> b (w h) c')  # vertical scan
-        for blk in self.fusion_mamba:
-            concat_seq = blk(concat_seq, H=W, W=H)  # 注意: H/W 参数交换
-        fused_feat = rearrange(concat_seq, 'b (w h) c -> b c h w', w=W, h=H)  # restore
-        
-        # 6. Split and residual injection (FP32 保护)
-        orig_dtype = fused_feat.dtype
-        fused_feat_fp32 = fused_feat.float()
-        
-        with torch.cuda.amp.autocast(enabled=False):
-            trans_low = self.split_proj_low(fused_feat_fp32)
-            trans_high = self.split_proj_high(fused_feat_fp32)
-            
-        trans_low = trans_low.to(orig_dtype)
-        trans_high = trans_high.to(orig_dtype)
-        
-        out_low = low_aligned + trans_low
-        out_high = high_aligned + trans_high
-        
-        # 7. Merge and NeA enhancement
-        fused_map = out_low + out_high
-        fused_map = self.NeA(fused_map)
-        
-        return fused_map  # (B, out_dim, H, W)
-
-
-
-
-def window_partition(x, window_size):
-    """
-    Args:
-        x: (B, C, H, W)
-        window_size: window size
     Returns:
-        local window features (num_windows*B, window_size*window_size, C)
+        Pooling module
     """
-    B, C, H, W = x.shape
-    x = x.view(B, C, H // window_size, window_size, W // window_size, window_size)
-    windows = x.permute(0, 2, 4, 3, 5, 1).reshape(-1, window_size*window_size, C)
-    return windows
+    pooling_type = pooling_type.lower()
+    if pooling_type == 'gem':
+        return GeM()
+    elif pooling_type == 'avg':
+        return AvgPool()
+    elif pooling_type == 'max':
+        return MaxPool()
+    elif pooling_type in ('avg_max', 'avgmax'):
+        return AvgMaxPool()
+    else:
+        print(f"[Warning] Unknown pooling type '{pooling_type}', using GeM")
+        return GeM()
 
 
-def window_reverse(windows, window_size, H, W):
-    """
-    Args:
-        windows: local window features (num_windows*B, window_size, window_size, C)
-        window_size: Window size
-        H: Height of image
-        W: Width of image
-    Returns:
-        x: (B, C, H, W)
-    """
-    B = int(windows.shape[0] / (H * W / window_size / window_size))
-    x = windows.reshape(B, H // window_size, W // window_size, window_size, window_size, -1)
-    x = x.permute(0, 5, 1, 3, 2, 4).reshape(B, windows.shape[2], H, W)
-    return x
+class StripeTokenInsertion(nn.Module):
+    """Insert pooled stripe tokens into the flattened spatial-token sequence."""
 
-
-class Downsample(nn.Module):
-    """Down-sampling block"""
-    def __init__(self, dim, keep_dim=False):
-        super().__init__()
-        if keep_dim:
-            dim_out = dim
-        else:
-            dim_out = 2 * dim
-        self.reduction = nn.Sequential(
-            nn.Conv2d(dim, dim_out, 3, 2, 1, bias=False),
-        )
-
-    def forward(self, x):
-        x = self.reduction(x)
-        return x
-
-
-class PatchEmbed(nn.Module):
-    """Patch embedding block"""
-    def __init__(self, in_chans=3, in_dim=64, dim=96):
-        super().__init__()
-        self.proj = nn.Identity()
-        self.conv_down = nn.Sequential(
-            nn.Conv2d(in_chans, in_dim, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(in_dim, eps=1e-4),
-            nn.ReLU(),
-            nn.Conv2d(in_dim, dim, 3, 2, 1, bias=False),
-            nn.BatchNorm2d(dim, eps=1e-4),
-            nn.ReLU()
-        )
-
-    def forward(self, x):
-        x = self.proj(x)
-        x = self.conv_down(x)
-        return x
-
-
-class ConvBlock(nn.Module):
-    def __init__(self, dim, drop_path=0., layer_scale=None, kernel_size=3):
-        super().__init__()
-        self.conv1 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
-        self.norm1 = nn.BatchNorm2d(dim, eps=1e-5)
-        self.act1 = nn.GELU(approximate='tanh')
-        self.conv2 = nn.Conv2d(dim, dim, kernel_size=kernel_size, stride=1, padding=1)
-        self.norm2 = nn.BatchNorm2d(dim, eps=1e-5)
-        self.layer_scale = layer_scale
-        if layer_scale is not None and type(layer_scale) in [int, float]:
-            self.gamma = nn.Parameter(layer_scale * torch.ones(dim))
-            self.layer_scale = True
-        else:
-            self.layer_scale = False
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x):
-        input = x
-        x = self.conv1(x)
-        x = self.norm1(x)
-        x = self.act1(x)
-        x = self.conv2(x)
-        x = self.norm2(x)
-        
-        
-        if self.layer_scale:
-            x = x * self.gamma.view(1, -1, 1, 1)
-        x = input + self.drop_path(x)
-        return x
-
-
-class MambaVisionMixer(nn.Module):
     def __init__(
         self,
-        d_model,
-        d_state=16,
-        d_conv=4,
-        expand=2,
-        dt_rank="auto",
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
-        conv_bias=True,
-        bias=False,
-        use_fast_path=True,
-        layer_idx=None,
-        device=None,
-        dtype=None,
-        use_sasf=False,
-    ):
-        factory_kwargs = {"device": device, "dtype": dtype}
-        super().__init__()
-        self.d_model = d_model
-        self.d_state = d_state
-        self.d_conv = d_conv
-        self.expand = expand
-        self.d_inner = int(self.expand * self.d_model)
-        
-        self.use_sasf = use_sasf
-        if use_sasf:
-            # SASF operates AFTER concat, so input is full d_inner (SSM + Conv1d branches)
-            self.state_fusion = StateFusion(self.d_inner)
-            # Initialize with 0 scale to ensure "identity" behavior at start
-            self.sasf_scale = nn.Parameter(torch.zeros(1))
-            
-        self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
-        self.layer_idx = layer_idx
-        self.in_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs)
-        self.x_proj = nn.Linear(
-            self.d_inner//2, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
-        )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner//2, bias=True, **factory_kwargs)
-        dt_init_std = self.dt_rank**-0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError
-        dt = torch.exp(
-            torch.rand(self.d_inner//2, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
-        self.dt_proj.bias._no_reinit = True
-        A = repeat(
-            torch.arange(1, self.d_state + 1, dtype=torch.float32, device=device),
-            "n -> d n",
-            d=self.d_inner//2,
-        ).contiguous()
-        A_log = torch.log(A)
-        self.A_log = nn.Parameter(A_log)
-        self.A_log._no_weight_decay = True
-        self.D = nn.Parameter(torch.ones(self.d_inner//2, device=device))
-        self.D._no_weight_decay = True
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
-        self.conv1d_x = nn.Conv1d(
-            in_channels=self.d_inner//2,
-            out_channels=self.d_inner//2,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=self.d_inner//2,
-            padding=d_conv//2,
-            **factory_kwargs,
-        )
-        self.conv1d_z = nn.Conv1d(
-            in_channels=self.d_inner//2,
-            out_channels=self.d_inner//2,
-            bias=conv_bias,
-            kernel_size=d_conv,
-            groups=self.d_inner//2,
-            padding=d_conv//2,
-            **factory_kwargs,
-        )
-
-    def forward(self, hidden_states, H=None, W=None):
-        """
-        hidden_states: (B, L, D)
-        H, W: spatial dimensions for non-square feature maps
-        Returns: same shape as hidden_states
-        """
-        _, seqlen, _ = hidden_states.shape
-        xz = self.in_proj(hidden_states)
-        xz = rearrange(xz, "b l d -> b d l")
-        x, z = xz.chunk(2, dim=1)
-        A = -torch.exp(self.A_log.float())
-        x = F.silu(self.conv1d_x(x))
-        z = F.silu(self.conv1d_z(z))
-        
-        # Slice to original seqlen (conv padding may add 1)
-        # Slice to original seqlen and ensure contiguous memory
-        x = x[..., :seqlen].contiguous()
-        z = z[..., :seqlen].contiguous()
-        
-        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
-        dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen).contiguous()
-        B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
-        
-        # SSM 扫描
-        # SSM 扫描 (强制 FP32 计算，防止长序列数值溢出)
-        y = selective_scan_fn(x.float(), dt.float(), A.float(), B.float(), C.float(), self.D.float(), z=None,
-                              delta_bias=self.dt_proj.bias.float(),
-                              delta_softplus=True, return_last_state=None).to(x.dtype)
-        
-        # Concatenation FIRST: merge SSM branch (y) and Conv1d branch (z)
-        # y: has global sequential context, but lacks 2D vertical structure
-        # z: has local horizontal texture, but lacks 2D vertical structure
-        y = torch.cat([y, z], dim=1)  # (B, D_inner, L)
-        
-        # Apply SASF AFTER concat - unified 2D spatial calibration for both branches
-        B_batch, D_inner, L_seq = y.shape
-        if self.use_sasf:
-            # Determine H, W for reshape
-            if H is not None and W is not None and H * W == L_seq:
-                H_feat, W_feat = H, W
-            else:
-                # Fallback: try perfect square
-                H_feat = int(math.sqrt(L_seq))
-                if H_feat * H_feat == L_seq:
-                    W_feat = H_feat
-                else:
-                    H_feat, W_feat = None, None
-            
-            if H_feat is not None and W_feat is not None:
-                y = rearrange(y, "b d (h w) -> b d h w", h=H_feat, w=W_feat)
-                # SASF now sees BOTH SSM and Conv features, can calibrate vertical structure for both
-                y_sasf = self.state_fusion(y)
-                y = y + self.sasf_scale * y_sasf
-                y = rearrange(y, "b d h w -> b d (h w)").contiguous()
-
-        y = rearrange(y, "b d l -> b l d")
-        out = self.out_proj(y)
-        return out
-
-
-class Attention(nn.Module):
-    def __init__(
-            self,
-            dim,
-            num_heads=8,
-            qkv_bias=False,
-            qk_norm=False,
-            attn_drop=0.,
-            proj_drop=0.,
-            norm_layer=nn.LayerNorm,
+        dim,
+        num_stripes=4,
+        mixer_type='mambavision',
+        token_pooling_type='gem',
+        mode='even',
+        kernel_size=3,
+        mlp_ratio=2.0,
+        init_scale=1e-3,
     ):
         super().__init__()
-        assert dim % num_heads == 0
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        self.fused_attn = True
+        if mode not in ('head', 'tail', 'even'):
+            raise ValueError("TOKEN_INSERTION.MODE must be one of: head, tail, even")
+        if kernel_size % 2 == 0:
+            raise ValueError("TOKEN_INSERTION.KERNEL_SIZE must be odd")
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv.unbind(0)
-        q, k = self.q_norm(q), self.k_norm(k)
-
-        if self.fused_attn:
-            x = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p)
-        else:
-            q = q * self.scale
-            attn = q @ k.transpose(-2, -1)
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            x = attn @ v
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-
-class Block(nn.Module):
-    def __init__(self, dim, num_heads, counter, transformer_blocks,
-                 mlp_ratio=4., qkv_bias=False, qk_scale=False, drop=0.,
-                 attn_drop=0., drop_path=0., act_layer=nn.GELU,
-                 norm_layer=nn.LayerNorm, Mlp_block=Mlp, layer_scale=None, use_sasf=False):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        
-        if counter in transformer_blocks:
-            self.mixer = Attention(
-                dim,
-                num_heads=num_heads,
-                qkv_bias=qkv_bias,
-                qk_norm=qk_scale,
-                attn_drop=attn_drop,
-                proj_drop=drop,
-                norm_layer=norm_layer,
+        self.num_stripes = num_stripes
+        self.mixer_type = mixer_type
+        self.mode = mode
+        self.token_pooling = create_pooling(token_pooling_type)
+        self.norm = nn.LayerNorm(dim)
+        if mixer_type == 'mambavision':
+            self.mixer = MambaVisionMixer(
+                d_model=dim,
+                d_state=8,
+                d_conv=kernel_size,
+                expand=1,
+                use_sasf=False,
             )
-        else:
-            self.mixer = MambaVisionMixer(d_model=dim, d_state=8, d_conv=3, expand=1, use_sasf=use_sasf)
-
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp_block(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        use_layer_scale = layer_scale is not None and type(layer_scale) in [int, float]
-        self.gamma_1 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
-        self.gamma_2 = nn.Parameter(layer_scale * torch.ones(dim)) if use_layer_scale else 1
-
-    def forward(self, x, H=None, W=None):
-        # Pass H, W to mixer if it's MambaVisionMixer (which has use_sasf)
-        if hasattr(self.mixer, 'use_sasf'):
-            x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x), H=H, W=W))
-        else:
-            x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x)))
-        x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
-        return x
-
-
-class MambaVisionLayer(nn.Module):
-    """MambaVision layer"""
-    def __init__(self, dim, depth, num_heads, window_size, conv=False,
-                 downsample=True, mlp_ratio=4., qkv_bias=True, qk_scale=None,
-                 drop=0., attn_drop=0., drop_path=0., layer_scale=None,
-                 layer_scale_conv=None, transformer_blocks=[], use_global=False, use_sasf=False):
-        super().__init__()
-        self.conv = conv
-        self.transformer_block = False
-        self.use_global = use_global
-        
-        if conv:
-            self.blocks = nn.ModuleList([ConvBlock(dim=dim,
-                                                   drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                                   layer_scale=layer_scale_conv)
-                                        for i in range(depth)])
-            self.transformer_block = False
-        else:
-            self.blocks = nn.ModuleList([Block(dim=dim, counter=i,
-                                               transformer_blocks=transformer_blocks,
-                                               num_heads=num_heads, mlp_ratio=mlp_ratio,
-                                               qkv_bias=qkv_bias, qk_scale=qk_scale,
-                                               drop=drop, attn_drop=attn_drop,
-                                               drop_path=drop_path[i] if isinstance(drop_path, list) else drop_path,
-                                               layer_scale=layer_scale,
-                                               use_sasf=use_sasf)
-                                        for i in range(depth)])
-            self.transformer_block = True
-
-        self.downsample = None if not downsample else Downsample(dim=dim)
-        self.window_size = window_size
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-
-        if self.transformer_block:
-            if self.use_global:
-                # 全局注意力：不做窗口划分，直接展平为序列
-                x = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, H*W, C)
-                for blk in self.blocks:
-                    x = blk(x, H=H, W=W)  # Pass real H, W for non-square feature maps
-                x = x.transpose(1, 2).view(B, C, H, W)  # (B, H*W, C) -> (B, C, H, W)
-            else:
-                # 窗口注意力：原有逻辑
-                pad_r = (self.window_size - W % self.window_size) % self.window_size
-                pad_b = (self.window_size - H % self.window_size) % self.window_size
-                if pad_r > 0 or pad_b > 0:
-                    x = torch.nn.functional.pad(x, (0, pad_r, 0, pad_b))
-                    _, _, Hp, Wp = x.shape
-                else:
-                    Hp, Wp = H, W
-                x = window_partition(x, self.window_size)
-
-                for blk in self.blocks:
-                    # In window mode, each window is window_size × window_size (square)
-                    x = blk(x, H=self.window_size, W=self.window_size)
-                    
-                x = window_reverse(x, self.window_size, Hp, Wp)
-                if pad_r > 0 or pad_b > 0:
-                    x = x[:, :, :H, :W].contiguous()
-        else:
-            # 卷积层：直接处理
-            for blk in self.blocks:
-                x = blk(x)
-
-        if self.downsample is None:
-            return x
-        return self.downsample(x)
-
-
-class MambaVisionBackbone(nn.Module):
-    """MambaVision backbone for ReID with optional Fine-Grained Branch"""
-    def __init__(self, img_size=(256, 128), dim=80, in_dim=32, depths=[1, 3, 8, 4],
-                 window_size=[8, 8, 16, 8], mlp_ratio=4, num_heads=[2, 4, 8, 16],
-                 drop_path_rate=0.2, in_chans=3, qkv_bias=True, qk_scale=None,
-                 drop_rate=0., attn_drop_rate=0., layer_scale=None, layer_scale_conv=None,
-                 global_stages=[], sasf_stages=[],
-                 camera=0, view=0, sie_xishu=1.5,
-                 use_sfm=False, sfm_num_layers=1, sfm_depths=[1, 1], sfm_drop_path=0.0):
-        """
-        Args:
-            global_stages: list of stage indices to use global attention instead of window attention.
-            sasf_stages: list of stage indices to enable SASF in MambaMixer.
-            camera: number of cameras for SIE.
-            view: number of views for SIE.
-            sie_xishu: scaling factor for SIE embedding.
-            use_sfm: whether to enable SimpleFusionMamba module.
-            sfm_num_layers: number of SFM layers (1 or 2).
-            sfm_depths: list of depths for each SFM module [sfm_1_depth, sfm_2_depth].
-            sfm_drop_path: drop path rate for SFM modules.
-        """
-        super().__init__()
-        
-        self.dim = dim  # 保存 dim 以供 make_model.py 访问
-        self.img_size = img_size
-        self.patch_embed = PatchEmbed(in_chans=in_chans, in_dim=in_dim, dim=dim)
-        
-        # SIE (Side Information Embedding)
-        self.cam_num = camera
-        self.view_num = view
-        self.sie_xishu = sie_xishu
-        if camera > 1 and view > 1:
-            self.sie_embed = nn.Parameter(torch.zeros(camera * view, dim, 1, 1))
-            trunc_normal_(self.sie_embed, std=.02)
-            print(f'[MambaVision SIE] camera={camera}, view={view}')
-        elif camera > 1:
-            self.sie_embed = nn.Parameter(torch.zeros(camera, dim, 1, 1))
-            trunc_normal_(self.sie_embed, std=.02)
-            print(f'[MambaVision SIE] camera={camera}')
-        elif view > 1:
-            self.sie_embed = nn.Parameter(torch.zeros(view, dim, 1, 1))
-            trunc_normal_(self.sie_embed, std=.02)
-            print(f'[MambaVision SIE] view={view}')
-        else:
-            self.sie_embed = None
-        
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        self.levels = nn.ModuleList()
-
-        current_dim = dim
-        num_features = current_dim
-        
-        # Target projection dimension (always 512, regardless of fine_branch)
-        self.proj_dim = 512
-        
-        for i in range(len(depths)):
-            conv = True if (i == 0 or i == 1) else False
-            use_global = (i in global_stages) and (not conv)
-            use_sasf = (i in sasf_stages) and (not conv)
-            
-            # Stage 3 always uses 512-dim (after main_proj at original downsample position)
-            stage_dim = current_dim
-            if i == 3:
-                stage_dim = self.proj_dim  # 512 for Stage 3
-            
-            level = MambaVisionLayer(
-                dim=stage_dim,
-                depth=depths[i],
-                num_heads=num_heads[i],
-                window_size=window_size[i],
-                mlp_ratio=mlp_ratio,
-                qkv_bias=qkv_bias,
-                qk_scale=qk_scale,
-                conv=conv,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-                drop_path=dpr[sum(depths[:i]):sum(depths[:i + 1])],
-                downsample=(i < 2),
-                layer_scale=layer_scale,
-                layer_scale_conv=layer_scale_conv,
-                transformer_blocks=list(range(depths[i]//2+1, depths[i])) if depths[i]%2!=0 else list(range(depths[i]//2, depths[i])),
-                use_global=use_global,
-                use_sasf=use_sasf,
+        elif mixer_type == 'conv':
+            hidden_dim = int(dim * mlp_ratio)
+            self.fc1 = nn.Linear(dim, hidden_dim)
+            self.act = nn.GELU()
+            self.dwconv = nn.Conv1d(
+                hidden_dim,
+                hidden_dim,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                groups=hidden_dim,
             )
-            self.levels.append(level)
-            if level.downsample is not None:
-                current_dim = level.downsample.reduction[0].out_channels
-            else:
-                current_dim = stage_dim  # Update for Stage 3 (512)
-            num_features = current_dim
-        
-        if global_stages:
-            print(f'[MambaVision] Global attention enabled for stages: {global_stages}')
-        
-        # Dimension Projection (384 → 512) - ALWAYS ACTIVE
-        # Applied between Stage 2 and Stage 3 (at original downsample position)
-        # Using 1x1 Conv to preserve spatial structure and semantics
-        # No ReLU: matches native Downsample behavior (linear projection only)
-        final_dim = dim * 4  # 384
-        self.main_proj = nn.Sequential(
-            nn.Conv2d(final_dim, self.proj_dim, 1, bias=False),
-            nn.BatchNorm2d(self.proj_dim),
+            self.fc2 = nn.Linear(hidden_dim, dim)
+        else:
+            raise ValueError("TOKEN_INSERTION.MIXER_TYPE must be one of: mambavision, conv")
+        self.gamma = nn.Parameter(torch.ones(1) * init_scale)
+
+    def _stripe_tokens(self, feature_map):
+        stripes = torch.chunk(feature_map, self.num_stripes, dim=2)
+        return torch.stack(
+            [self.token_pooling(stripe).flatten(1) for stripe in stripes],
+            dim=1,
         )
-        print(f'[MambaVision] Dimension projection: {final_dim} -> {self.proj_dim} (between Stage 2-3)')
-        
-        # num_features is always 512 now (after Stage 3)
-        self.num_features = self.proj_dim
-        
-        # Hierarchical SimpleFusionMamba (SFM) modules
-        self.use_sfm = use_sfm
-        self.sfm_depths = list(sfm_depths)
-        while len(self.sfm_depths) < 3:
-            self.sfm_depths.append(0)
-        self.sfm_drop_path = sfm_drop_path
-        
-        if self.use_sfm:
-            s1_dim = dim * 2  # 160 or 192
-            s2_dim = dim * 4  # 320 or 384
-            s3_dim = dim * 4  # 320 or 384
-            s4_dim = self.proj_dim # 512
-            
-            # ========== 统一 GateNet 融合 (Gated Concat 方案) ==========
-            # 门控机制统一使用 GateNet，对齐策略分层 (浅层去噪、深层线性)
-            # 1. SFM_S12 (Stage 1 + Stage 2) - 强去噪
-            if self.sfm_depths[0] > 0:
-                self.sfm_s12 = SimpleFusionMambaBlock(
-                    low_dim=s1_dim,
-                    high_dim=s2_dim,
-                    out_dim=s2_dim,
-                    target_size=(16, 8),
-                    depth=self.sfm_depths[0],
-                    drop_path=self.sfm_drop_path,
-                    align_type='denoise_strong',
-                )
-            
-            # 2. SFM_S23 (F12 or Stage 2 + Stage 3) - 弱去噪
-            if self.sfm_depths[1] > 0:
-                self.sfm_s23 = SimpleFusionMambaBlock(
-                    low_dim=s2_dim,
-                    high_dim=s3_dim,
-                    out_dim=s3_dim,
-                    target_size=(16, 8),
-                    depth=self.sfm_depths[1],
-                    drop_path=self.sfm_drop_path,
-                    align_type='denoise_weak',
-                )
-            
-            # 3. SFM_S34 (F23 or Stage 3 + Stage 4) - 线性对齐
-            if self.sfm_depths[2] > 0:
-                self.sfm_s34 = SimpleFusionMambaBlock(
-                    low_dim=s3_dim,
-                    high_dim=s4_dim,
-                    out_dim=s4_dim,
-                    target_size=(16, 8),
-                    depth=self.sfm_depths[2],
-                    drop_path=self.sfm_drop_path,
-                    align_type='linear',
-                )
-            print(f'[MambaVision] Unified GateNet SFM enabled, depths={self.sfm_depths}')
 
-        
-        self.apply(self._init_weights)
+    def _insert_even(self, seq, stripe_tokens, height, width):
+        stripe_h = height // self.num_stripes
+        stripe_len = stripe_h * width
+        pieces = []
+        for idx in range(self.num_stripes):
+            start = idx * stripe_len
+            end = (idx + 1) * stripe_len
+            pieces.append(stripe_tokens[:, idx:idx + 1])
+            pieces.append(seq[:, start:end])
+        return torch.cat(pieces, dim=1), stripe_len
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
+    def _remove_even(self, tokens, stripe_len):
+        pieces = []
+        cursor = 0
+        for _ in range(self.num_stripes):
+            cursor += 1
+            pieces.append(tokens[:, cursor:cursor + stripe_len])
+            cursor += stripe_len
+        return torch.cat(pieces, dim=1)
+
+    def forward(self, feature_map):
+        b, c, h, w = feature_map.shape
+        if h % self.num_stripes != 0:
+            raise ValueError(
+                "Feature-map height must be divisible by LOCAL_STRIPE.NUM_STRIPES"
+            )
+
+        seq = feature_map.flatten(2).transpose(1, 2).contiguous()
+        stripe_tokens = self._stripe_tokens(feature_map)
+
+        if self.mode == 'head':
+            tokens = torch.cat([stripe_tokens, seq], dim=1)
+            stripe_len = None
+        elif self.mode == 'tail':
+            tokens = torch.cat([seq, stripe_tokens], dim=1)
+            stripe_len = None
+        else:
+            tokens, stripe_len = self._insert_even(seq, stripe_tokens, h, w)
+
+        y = self.norm(tokens)
+        if self.mixer_type == 'mambavision':
+            y = self.mixer(y)
+        else:
+            y = self.fc1(y)
+            y = self.act(y)
+            y = self.dwconv(y.transpose(1, 2)).transpose(1, 2).contiguous()
+            y = self.fc2(y)
+        tokens = tokens + self.gamma * y
+
+        if self.mode == 'head':
+            seq = tokens[:, self.num_stripes:]
+        elif self.mode == 'tail':
+            seq = tokens[:, :h * w]
+        else:
+            seq = self._remove_even(tokens, stripe_len)
+
+        return seq.transpose(1, 2).contiguous().view(b, c, h, w)
+
+
+def weights_init_kaiming(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
+        nn.init.constant_(m.bias, 0.0)
+
+    elif classname.find('Conv') != -1:
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
+    elif classname.find('BatchNorm') != -1:
+        if m.affine:
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
+            nn.init.constant_(m.bias, 0.0)
 
-    def forward(self, x, cam_label=None, view_label=None, return_features=False):
-        x = self.patch_embed(x)
-        
-        # Apply SIE embedding (broadcast from 1x1 to HxW)
-        if self.sie_embed is not None and cam_label is not None:
-            # Clamp indices to valid range for safety
-            max_idx = self.sie_embed.shape[0] - 1
-            if self.cam_num > 1 and self.view_num > 1 and view_label is not None:
-                idx = cam_label * self.view_num + view_label
-                idx = idx.clamp(0, max_idx)
-                sie = self.sie_xishu * self.sie_embed[idx]
-            elif self.cam_num > 1:
-                idx = cam_label.clamp(0, max_idx)
-                sie = self.sie_xishu * self.sie_embed[idx]
-            elif self.view_num > 1 and view_label is not None:
-                idx = view_label.clamp(0, max_idx)
-                sie = self.sie_xishu * self.sie_embed[idx]
+
+def weights_init_classifier(m):
+    classname = m.__class__.__name__
+    if classname.find('Linear') != -1:
+        nn.init.normal_(m.weight, std=0.001)
+        if m.bias:
+            nn.init.constant_(m.bias, 0.0)
+
+
+class Backbone(nn.Module):
+    def __init__(self, num_classes, cfg):
+        super(Backbone, self).__init__()
+        last_stride = cfg.MODEL.LAST_STRIDE
+        model_path = cfg.MODEL.PRETRAIN_PATH
+        model_name = cfg.MODEL.NAME
+        pretrain_choice = cfg.MODEL.PRETRAIN_CHOICE
+        self.cos_layer = cfg.MODEL.COS_LAYER
+        self.neck = cfg.MODEL.NECK
+        self.neck_feat = cfg.TEST.NECK_FEAT
+
+        if model_name == 'resnet50':
+            self.in_planes = 2048
+            self.base = ResNet(last_stride=last_stride,
+                               block=Bottleneck,
+                               layers=[3, 4, 6, 3])
+            print('using resnet50 as a backbone')
+        elif model_name == 'resnet50_ibn_a':
+            self.in_planes = 2048
+            self.base = resnet50_ibn_a(last_stride)
+            print('using resnet50_ibn_a as a backbone')
+        elif model_name == 'resnet101_ibn_a':
+            self.in_planes = 2048
+            self.base = resnet101_ibn_a(last_stride)
+            print('using resnet101_ibn_a as a backbone')
+
+        if pretrain_choice == 'imagenet':
+            self.base.load_param(model_path)
+            print('Loading pretrained ImageNet model......from {}'.format(model_path))
+
+        self.gap = nn.AdaptiveAvgPool2d(1)
+        self.num_classes = num_classes
+
+        self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
+        self.classifier.apply(weights_init_classifier)
+
+        self.bottleneck = nn.BatchNorm1d(self.in_planes)
+        self.bottleneck.bias.requires_grad_(False)
+        self.bottleneck.apply(weights_init_kaiming)
+
+    def forward(self, x, label=None):  # label is unused if self.cos_layer == 'no'
+        x = self.base(x)
+        global_feat = nn.functional.avg_pool2d(x, x.shape[2:4])
+        global_feat = global_feat.view(global_feat.shape[0], -1)  # flatten to (bs, 2048)
+
+        if self.neck == 'no':
+            feat = global_feat
+        elif self.neck == 'bnneck':
+            feat = self.bottleneck(global_feat)
+
+        if self.training:
+            if self.cos_layer:
+                cls_score = self.arcface(feat, label)
             else:
-                sie = 0
-            x = x + sie
-        
-        if return_features:
-            features = []
-            for i, level in enumerate(self.levels):
-                x = level(x)
-                features.append(x)
-            return features
-        
-        # Stage 1, 2
-        x = self.levels[0](x)  # Stage 1 -> (B, 192, 32, 16)
-        feat_s1 = x
-        x = self.levels[1](x)  # Stage 2 -> (B, 384, 16, 8)
-        feat_s2 = x
-        
-        # Stage 3
-        x = self.levels[2](x)  # Stage 3 -> (B, 384, 16, 8)
-        feat_s3 = x
-        
-        # Dimension Projection (384 -> 512) and Stage 4
-        x = self.main_proj(x)
-        x = self.levels[3](x)  # Stage 4 -> (B, 512, 16, 8)
-        feat_s4 = x
-        
-        # SFM hierarchical processing
-        if self.use_sfm:
-            fused_maps = []
-            
-            # --- Tier 1: S1 + S2 ---
-            curr_fused = None
-            if self.sfm_depths[0] > 0:
-                curr_fused = self.sfm_s12(feat_s1, feat_s2)
-                fused_maps.append(curr_fused)
-            
-            # --- Tier 2: (F12 or S2) + S3 ---
-            if self.sfm_depths[1] > 0:
-                low_feat = curr_fused if curr_fused is not None else feat_s2
-                curr_fused = self.sfm_s23(low_feat, feat_s3)
-                fused_maps.append(curr_fused)
-            
-            # --- Tier 3: (F23 or S3) + S4 ---
-            if self.sfm_depths[2] > 0:
-                low_feat = curr_fused if curr_fused is not None else feat_s3
-                curr_fused = self.sfm_s34(low_feat, feat_s4)
-                fused_maps.append(curr_fused)
-            
-            return {
-                'backbone_map': feat_s4,
-                'fused_maps': fused_maps,  # List of maps for deep supervision
-            }
+                cls_score = self.classifier(feat)
+            return cls_score, global_feat
         else:
-            # Return SPATIAL MAP (B, C, H, W)
-            return feat_s4
+            if self.neck_feat == 'after':
+                return feat
+            else:
+                return global_feat
 
-    def load_param(self, model_path):
-        param_dict = torch.load(model_path, map_location='cpu')
-        if 'state_dict' in param_dict:
-            param_dict = param_dict['state_dict']
-        elif 'model' in param_dict:
-            param_dict = param_dict['model']
+    def load_param(self, trained_path):
+        param_dict = torch.load(trained_path)
+        for i in param_dict:
+            if 'classifier' in i or 'arcface' in i:
+                continue
+            self.state_dict()[i].copy_(param_dict[i])
+        print('Loading pretrained model from {}'.format(trained_path))
+
+    def load_param_finetune(self, model_path):
+        param_dict = torch.load(model_path)
+        for i in param_dict:
+            self.state_dict()[i].copy_(param_dict[i])
+        print('Loading pretrained model for finetuning from {}'.format(model_path))
+
+
+class build_transformer(nn.Module):
+    def __init__(self, num_classes, camera_num, view_num, cfg, factory):
+        super(build_transformer, self).__init__()
+        model_path = cfg.MODEL.PRETRAIN_PATH
+        pretrain_choice = cfg.MODEL.PRETRAIN_CHOICE
+        self.cos_layer = cfg.MODEL.COS_LAYER
+        self.neck = cfg.MODEL.NECK
+        self.neck_feat = cfg.TEST.NECK_FEAT
+        self.in_planes = 768
+        self.is_puzzle = 'puzzle' in cfg.MODEL.TRANSFORMER_TYPE.lower()
+        self.is_mambavision = 'mamba' in cfg.MODEL.TRANSFORMER_TYPE.lower()
+        self.use_sfm = False
+        self.use_pam = cfg.INPUT.PAM.ENABLED
         
-        # Remove module. prefix if exists
-        if list(param_dict.keys())[0].startswith('module.'):
-            param_dict = {k[7:]: v for k, v in param_dict.items()}
+        self.pooling = None
+        local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
+        token_cfg = getattr(local_cfg, 'TOKEN_INSERTION', None) if local_cfg is not None else None
+        self.local_stripe_enabled = bool(getattr(local_cfg, 'ENABLED', False))
+        self.local_num_stripes = int(getattr(local_cfg, 'NUM_STRIPES', 4))
+        self.local_inference = str(getattr(local_cfg, 'INFERENCE', 'concat')).lower()
+        self.local_pooling = None
+        self.stripe_token_insertion = None
+        self.local_token_insertion_enabled = bool(getattr(token_cfg, 'ENABLED', False))
+        self.local_token_insertion_mixer_type = str(getattr(token_cfg, 'MIXER_TYPE', 'mambavision')).lower()
+        default_token_pooling = str(getattr(local_cfg, 'POOLING_TYPE', 'gem')) if local_cfg is not None else 'gem'
+        self.local_token_pooling_type = str(getattr(token_cfg, 'TOKEN_POOLING_TYPE', default_token_pooling)).lower()
+        self.local_token_insertion_mode = str(getattr(token_cfg, 'MODE', 'even')).lower()
+        self.local_token_insertion_kernel = int(getattr(token_cfg, 'KERNEL_SIZE', 3))
+        self.local_token_insertion_mlp_ratio = float(getattr(token_cfg, 'MLP_RATIO', 2.0))
+        self.local_token_insertion_init_scale = float(getattr(token_cfg, 'INIT_SCALE', 1e-3))
+
+        if self.is_mambavision:
+            # 获取配置
+            global_stages = list(getattr(cfg.MODEL.MAMBAVISION, 'GLOBAL_STAGES', []))
+            sasf_stages = list(getattr(cfg.MODEL.MAMBAVISION, 'SASF_STAGES', []))
+            
+            # SFM 配置
+            self.use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
+            sfm_num_layers = getattr(cfg.MODEL.MAMBAVISION, 'SFM_NUM_LAYERS', 1)
+            sfm_depths = list(getattr(cfg.MODEL.MAMBAVISION, 'SFM_DEPTHS', [1, 1]))
+            sfm_drop_path = getattr(cfg.MODEL.MAMBAVISION, 'SFM_DROP_PATH', 0.0)
+            
+            # SIE 配置
+            self.use_sie = getattr(cfg.MODEL, 'SIE_CAMERA', False)
+            sie_xishu = getattr(cfg.MODEL, 'SIE_XISHU', 1.5)
+            
+            self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](
+                img_size=cfg.INPUT.SIZE_TRAIN,
+                pretrained_path=model_path if pretrain_choice == 'imagenet' else '',
+                sie_xishu=sie_xishu,
+                camera=camera_num if self.use_sie else 0,
+                view=view_num if self.use_sie else 0,
+                drop_path_rate=cfg.MODEL.DROP_PATH,
+                drop_rate=cfg.MODEL.DROP_OUT,
+                attn_drop_rate=cfg.MODEL.ATT_DROP_RATE,
+                global_stages=global_stages,
+                sasf_stages=sasf_stages,
+                use_sfm=self.use_sfm,
+                sfm_num_layers=sfm_num_layers,
+                sfm_depths=sfm_depths,
+                sfm_drop_path=sfm_drop_path,
+            )
+            # Get feature dimension from MambaVision
+            self.in_planes = self.base.num_features
+            pooling_type = getattr(cfg.MODEL, 'POOLING_TYPE', 'gem')
+            self.pooling = create_pooling(pooling_type)
+            print(f'[Model] Using pooling type: {pooling_type}')
+            
+            # SFM 多级聚合 heads
+            if self.use_sfm:
+                self.pooling_fused = nn.ModuleList()
+                self.bottleneck_fused = nn.ModuleList()
+                self.classifier_fused = nn.ModuleList()
+
+        else:
+            extra_kwargs = {}
+            if 'mamba_hybrid' in cfg.MODEL.TRANSFORMER_TYPE.lower():
+                m_layers = cfg.MODEL.get('MAMBA_LAYERS', None)
+                if m_layers is not None:
+                    extra_kwargs['mamba_layers'] = m_layers
+                m_d_state = cfg.MODEL.get('MAMBA_D_STATE', None)
+                if m_d_state is not None:
+                    extra_kwargs.setdefault('mamba_cfg', {})
+                    extra_kwargs['mamba_cfg']['d_state'] = m_d_state
+                m_d_conv = cfg.MODEL.get('MAMBA_D_CONV', None)
+                if m_d_conv is not None:
+                    extra_kwargs.setdefault('mamba_cfg', {})
+                    extra_kwargs['mamba_cfg']['d_conv'] = m_d_conv
+            self.base = factory[cfg.MODEL.TRANSFORMER_TYPE](img_size=cfg.INPUT.SIZE_TRAIN, sie_xishu=3.0,
+                                                            camera=0, view=0, stride_size=cfg.MODEL.STRIDE_SIZE, drop_path_rate=cfg.MODEL.DROP_PATH,
+                                                            drop_rate= cfg.MODEL.DROP_OUT,
+                                                            attn_drop_rate=cfg.MODEL.ATT_DROP_RATE,
+                                                            **extra_kwargs)
+            if cfg.MODEL.TRANSFORMER_TYPE == 'deit_small_patch16_224_TransReID':
+                self.in_planes = 384
+            if pretrain_choice == 'imagenet':
+                self.base.load_param(model_path)
+                print('Loading pretrained ImageNet model......from {}'.format(model_path))
+
+        self.num_classes = num_classes
+        self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
+        if self.ID_LOSS_TYPE == 'arcface':
+            print('using {} with s:{}, m: {}'.format(self.ID_LOSS_TYPE,cfg.SOLVER.COSINE_SCALE,cfg.SOLVER.COSINE_MARGIN))
+            self.classifier = Arcface(self.in_planes, self.num_classes,
+                                      s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        elif self.ID_LOSS_TYPE == 'cosface':
+            print('using {} with s:{}, m: {}'.format(self.ID_LOSS_TYPE,cfg.SOLVER.COSINE_SCALE,cfg.SOLVER.COSINE_MARGIN))
+            self.classifier = Cosface(self.in_planes, self.num_classes,
+                                      s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        elif self.ID_LOSS_TYPE == 'amsoftmax':
+            print('using {} with s:{}, m: {}'.format(self.ID_LOSS_TYPE,cfg.SOLVER.COSINE_SCALE,cfg.SOLVER.COSINE_MARGIN))
+            self.classifier = AMSoftmax(self.in_planes, self.num_classes,
+                                        s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        elif self.ID_LOSS_TYPE == 'circle':
+            print('using {} with s:{}, m: {}'.format(self.ID_LOSS_TYPE, cfg.SOLVER.COSINE_SCALE, cfg.SOLVER.COSINE_MARGIN))
+            self.classifier = CircleLoss(self.in_planes, self.num_classes,
+                                        s=cfg.SOLVER.COSINE_SCALE, m=cfg.SOLVER.COSINE_MARGIN)
+        else:
+            self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
+            self.classifier.apply(weights_init_classifier)
+
+        self.bottleneck = nn.BatchNorm1d(self.in_planes)
+        self.bottleneck.bias.requires_grad_(False)
+        self.bottleneck.apply(weights_init_kaiming)
+
+        if self.local_stripe_enabled:
+            if not self.is_mambavision:
+                raise ValueError('LOCAL_STRIPE currently supports the MambaVision backbone only')
+            if not self.use_pam:
+                raise ValueError('LOCAL_STRIPE currently expects PAM training to be enabled')
+            if self.use_sfm:
+                raise ValueError('LOCAL_STRIPE and SFM must be evaluated separately')
+            if self.local_num_stripes <= 0:
+                raise ValueError('LOCAL_STRIPE.NUM_STRIPES must be positive')
+
+            local_pooling_type = getattr(cfg.MODEL.LOCAL_STRIPE, 'POOLING_TYPE', 'gem')
+            self.local_pooling = create_pooling(local_pooling_type)
+            if self.local_token_insertion_enabled:
+                self.stripe_token_insertion = StripeTokenInsertion(
+                    dim=self.in_planes,
+                    num_stripes=self.local_num_stripes,
+                    mixer_type=self.local_token_insertion_mixer_type,
+                    token_pooling_type=self.local_token_pooling_type,
+                    mode=self.local_token_insertion_mode,
+                    kernel_size=self.local_token_insertion_kernel,
+                    mlp_ratio=self.local_token_insertion_mlp_ratio,
+                    init_scale=self.local_token_insertion_init_scale,
+                )
+
+            self.local_bottlenecks = nn.ModuleList()
+            self.local_classifiers = nn.ModuleList()
+            for _ in range(self.local_num_stripes):
+                bn = nn.BatchNorm1d(self.in_planes)
+                bn.bias.requires_grad_(False)
+                bn.apply(weights_init_kaiming)
+                self.local_bottlenecks.append(bn)
+                self.local_classifiers.append(copy.deepcopy(self.classifier))
+            print(
+                '[Model] LocalStripe enabled on BA branch: stripes={}, pooling={}, token_insertion={}, mixer={}, token_pooling={}'.format(
+                    self.local_num_stripes,
+                    local_pooling_type,
+                    self.local_token_insertion_enabled,
+                    self.local_token_insertion_mixer_type,
+                    self.local_token_pooling_type,
+                )
+            )
+
+        if self.use_pam:
+            if not self.is_mambavision:
+                raise ValueError('PAM currently supports the MambaVision backbone only')
+            if self.use_sfm:
+                raise ValueError('PAM and SFM must be evaluated separately')
+
+            self.bottleneck_pam_crop = nn.BatchNorm1d(self.in_planes)
+            self.bottleneck_pam_crop.bias.requires_grad_(False)
+            self.bottleneck_pam_crop.apply(weights_init_kaiming)
+
+            self.bottleneck_pam_erase = nn.BatchNorm1d(self.in_planes)
+            self.bottleneck_pam_erase.bias.requires_grad_(False)
+            self.bottleneck_pam_erase.apply(weights_init_kaiming)
+
+            self.classifier_pam_crop = copy.deepcopy(self.classifier)
+            self.classifier_pam_erase = copy.deepcopy(self.classifier)
+            print('[Model] PAM enabled: shared MambaVision backbone with BA, CA and EA heads')
         
-        # Filter and load compatible weights
-        model_dict = self.state_dict()
-        pretrained_dict = {k: v for k, v in param_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
-        model_dict.update(pretrained_dict)
-        self.load_state_dict(model_dict, strict=False)
-        print(f'Loading pretrained MambaVision model from {model_path}')
-        print(f'Loaded {len(pretrained_dict)}/{len(model_dict)} parameters')
+        # SFM fused分支的head (ModuleList 支持多级级联与深层监督)
+        if self.is_mambavision and self.use_sfm:
+            # 极致稳健的维度检测方案
+            # 1. 优先从 backbone 实例属性获取
+            dim = getattr(self.base, 'dim', None)
+            
+            # 2. 如果失败，尝试从 patch_embed 获取
+            if dim is None and hasattr(self.base, 'patch_embed'):
+                dim = getattr(self.base.patch_embed, 'dim', None)
+                
+            # 3. 如果仍然失败，从配置文件字符串猜测
+            if dim is None:
+                t_type = cfg.MODEL.TRANSFORMER_TYPE.lower()
+                if 'tiny' in t_type: dim = 80
+                elif 'small' in t_type: dim = 96
+                elif 'base' in t_type: dim = 128
+                else: dim = 80 # 最后的兜底
+            
+            print(f'[SFM Head Init] Infallible detection: Detected dim={dim} for transformer {cfg.MODEL.TRANSFORMER_TYPE}')
+            
+            s1_dim = dim * 2  # 160 (Tiny) or 192 (Small)
+            s2_dim = dim * 4  # 320 (Tiny) or 384 (Small)
+            s3_dim = dim * 4  # 320 (Tiny) or 384 (Small)
+            s4_dim = self.in_planes # 通常是 512
+            # fused_maps = [F12(s2_dim), F23(s3_dim), F34(s4_dim)]
+            possible_dims = [s2_dim, s3_dim, s4_dim]
+            
+            sfm_depths = list(getattr(cfg.MODEL.MAMBAVISION, 'SFM_DEPTHS', [0, 0, 0]))
+            while len(sfm_depths) < 3:
+                sfm_depths.append(0)
+            
+            head_idx = 0
+            sfm_pooling_type = getattr(cfg.MODEL.MAMBAVISION, 'SFM_POOLING_TYPE', 'gem')
+            print(f'[SFM] Using pooling type: {sfm_pooling_type}')
+            for i, d in enumerate(sfm_depths):
+                if d > 0:
+                    current_in_dim = possible_dims[i]
+                    self.pooling_fused.append(create_pooling(sfm_pooling_type))
+                    
+                    bn = nn.BatchNorm1d(current_in_dim)
+                    bn.bias.requires_grad_(False)
+                    bn.apply(weights_init_kaiming)
+                    self.bottleneck_fused.append(bn)
+                    
+                    cls = nn.Linear(current_in_dim, self.num_classes, bias=False)
+                    cls.apply(weights_init_classifier)
+                    self.classifier_fused.append(cls)
+                    head_idx += 1
+            print(f'[SFM] Initialized {head_idx} hierarchical fused heads')
+
+    def _classify(self, classifier, feat, label):
+        if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+            return classifier(feat, label)
+        return classifier(feat)
+
+    def _pool_feature_map(self, feature_map, pooling=None):
+        pool_layer = self.pooling if pooling is None else pooling
+        if pool_layer is None:
+            pooled = nn.functional.adaptive_avg_pool2d(feature_map, 1)
+        else:
+            pooled = pool_layer(feature_map)
+        return pooled.flatten(1)
+
+    def _refine_local_tokens(self, feature_map):
+        if self.stripe_token_insertion is not None:
+            return self.stripe_token_insertion(feature_map)
+        return feature_map
+
+    def _pool_local_stripes(self, feature_map):
+        if feature_map.shape[2] % self.local_num_stripes != 0:
+            raise ValueError(
+                "Feature-map height must be divisible by LOCAL_STRIPE.NUM_STRIPES"
+            )
+        stripes = torch.chunk(feature_map, self.local_num_stripes, dim=2)
+        return [self._pool_feature_map(stripe, self.local_pooling) for stripe in stripes]
+
+    def _local_head_index(self, stripe_idx):
+        return stripe_idx
+
+    def _append_local_outputs(self, scores, feats, feature_map, label):
+        local_feats = self._pool_local_stripes(feature_map)
+        for stripe_idx, local_feat in enumerate(local_feats):
+            head_idx = self._local_head_index(stripe_idx)
+            local_feat_bn = self.local_bottlenecks[head_idx](local_feat)
+            scores.append(
+                self._classify(self.local_classifiers[head_idx], local_feat_bn, label)
+            )
+            feats.append(local_feat)
+
+    def _local_inference_features(self, feature_map):
+        local_feats = self._pool_local_stripes(feature_map)
+        if self.neck_feat == 'after':
+            local_feats = [
+                self.local_bottlenecks[self._local_head_index(idx)](feat)
+                for idx, feat in enumerate(local_feats)
+            ]
+        return torch.cat(local_feats, dim=1)
+
+    def _format_local_inference(self, global_feat, feature_map):
+        local_feat = self._local_inference_features(feature_map)
+        if self.local_inference == 'global':
+            final_feat = global_feat
+        elif self.local_inference == 'local':
+            final_feat = local_feat
+        else:
+            final_feat = torch.cat([global_feat, local_feat], dim=1)
+        return {
+            'backbone': global_feat,
+            'fused': local_feat,
+            'concat': final_feat,
+        }
+
+    def _forward_pam(self, x, label, cam_label, view_label):
+        if not isinstance(x, (tuple, list)) or len(x) != 3:
+            raise ValueError('PAM training expects BA, CA and EA image tensors')
+
+        img_base, img_crop, img_erase = x
+        stacked_img = torch.cat([img_base, img_crop, img_erase], dim=0)
+        stacked_cam = torch.cat([cam_label] * 3, dim=0) if cam_label is not None else None
+        stacked_view = torch.cat([view_label] * 3, dim=0) if view_label is not None else None
+
+        output = self.base(stacked_img, cam_label=stacked_cam, view_label=stacked_view)
+        if isinstance(output, dict):
+            if 'fused_maps' in output:
+                raise ValueError('PAM and SFM must be evaluated separately')
+            output = output['backbone_map']
+        map_base, map_crop, map_erase = output.chunk(3, dim=0)
+
+        if self.local_stripe_enabled:
+            map_base = self._refine_local_tokens(map_base)
+
+        feat_base = self._pool_feature_map(map_base)
+        feat_crop = self._pool_feature_map(map_crop)
+        feat_erase = self._pool_feature_map(map_erase)
+
+        feat_base_bn = self.bottleneck(feat_base)
+        feat_crop_bn = self.bottleneck_pam_crop(feat_crop)
+        feat_erase_bn = self.bottleneck_pam_erase(feat_erase)
+
+        scores = [
+            self._classify(self.classifier, feat_base_bn, label),
+            self._classify(self.classifier_pam_crop, feat_crop_bn, label),
+            self._classify(self.classifier_pam_erase, feat_erase_bn, label),
+        ]
+        feats = [feat_base, feat_crop, feat_erase]
+        if self.local_stripe_enabled:
+            self._append_local_outputs(scores, feats, map_base, label)
+        return scores, feats
+
+    def forward(self, x, label=None, cam_label=None, view_label=None):
+        if self.use_pam and self.training:
+            return self._forward_pam(x, label, cam_label, view_label)
+
+        if self.is_mambavision or self.is_puzzle:
+            # Get backbone output
+            output = self.base(x, cam_label=cam_label, view_label=view_label)
+            
+            # Check if SFM mode (output is dict) or normal mode (output is tensor)
+            if isinstance(output, dict):
+                # SFM mode: hierarchical multi-branch processing
+                backbone_map = output['backbone_map']  # (B, 512, 16, 8)
+                fused_maps = output['fused_maps']     # List of intermediate fused maps
+                
+                # Backbone head
+                feat_backbone = self.pooling(backbone_map).flatten(1)
+                feat_backbone_bn = self.bottleneck(feat_backbone)
+                
+                # Fused heads (Loop over all active fusion stages)
+                all_feats = [feat_backbone]
+                all_feats_bn = [feat_backbone_bn]
+                
+                for i, f_map in enumerate(fused_maps):
+                    f_feat = self.pooling_fused[i](f_map).flatten(1)
+                    f_feat_bn = self.bottleneck_fused[i](f_feat)
+                    all_feats.append(f_feat)
+                    all_feats_bn.append(f_feat_bn)
+                
+                if self.training:
+                    all_scores = []
+                    # 1. Backbone score
+                    if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                        all_scores.append(self.classifier(all_feats_bn[0], label))
+                    else:
+                        all_scores.append(self.classifier(all_feats_bn[0]))
+                    
+                    # 2. Fused branch scores (Deep Supervision)
+                    for i in range(len(fused_maps)):
+                        if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                            all_scores.append(self.classifier_fused[i](all_feats_bn[i+1], label))
+                        else:
+                            all_scores.append(self.classifier_fused[i](all_feats_bn[i+1]))
+                    
+                    return all_scores, all_feats
+                else:
+                    # Inference: return dict with separate features for evaluation
+                    if self.neck_feat == 'after':
+                        backbone_feat = all_feats_bn[0]
+                        fused_feat = all_feats_bn[-1]
+                    else:
+                        backbone_feat = all_feats[0]
+                        fused_feat = all_feats[-1]
+                    
+                    concat_feat = torch.cat([backbone_feat, fused_feat], dim=1)
+                    
+                    # Return dict for multi-feature evaluation
+                    return {
+                        'backbone': backbone_feat,
+                        'fused': fused_feat,
+                        'concat': concat_feat,
+                    }
+            else:
+                # Normal mode: single tensor output
+                feature_map = output
+                if self.local_stripe_enabled:
+                    feature_map = self._refine_local_tokens(feature_map)
+                
+                # Apply pooling
+                global_feat = self._pool_feature_map(feature_map)
+                
+                feat = self.bottleneck(global_feat)
+
+                if self.training:
+                    cls_score = self._classify(self.classifier, feat, label)
+                    
+                    return cls_score, global_feat
+                else:
+                    if self.neck_feat == 'after':
+                        global_output = feat
+                    else:
+                        global_output = global_feat
+                    if self.local_stripe_enabled:
+                        return self._format_local_inference(global_output, feature_map)
+                    return global_output
+
+        else:
+            # ViT/DeiT backbone
+            global_feat = self.base(x, cam_label=cam_label, view_label=view_label)
+            feat = self.bottleneck(global_feat)
+
+            if self.training:
+                if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+                    cls_score = self.classifier(feat, label)
+                else:
+                    cls_score = self.classifier(feat)
+                return cls_score, global_feat
+            else:
+                if self.neck_feat == 'after':
+                    return feat
+                else:
+                    return global_feat
+
+    def load_param(self, trained_path):
+        param_dict = torch.load(trained_path)
+        for i in param_dict:
+            self.state_dict()[i.replace('module.', '')].copy_(param_dict[i])
+        print('Loading pretrained model from {}'.format(trained_path))
+
+    def load_param_finetune(self, model_path):
+        param_dict = torch.load(model_path)
+        for i in param_dict:
+            self.state_dict()[i].copy_(param_dict[i])
+        print('Loading pretrained model for finetuning from {}'.format(model_path))
 
 
-def mambavision_tiny_reid(img_size=(256, 128), pretrained_path='', **kwargs):
-    """MambaVision-Tiny for ReID"""
-    # Extract parameters from kwargs
-    drop_path_rate = kwargs.pop('drop_path_rate', 0.2)
-    global_stages = kwargs.pop('global_stages', [])
-    sasf_stages = kwargs.pop('sasf_stages', [])
-    use_sfm = kwargs.pop('use_sfm', False)
-    sfm_num_layers = kwargs.pop('sfm_num_layers', 1)
-    sfm_depths = kwargs.pop('sfm_depths', [1, 1])
-    sfm_drop_path = kwargs.pop('sfm_drop_path', 0.0)
+__factory_T_type = {
+    'vit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
+    'deit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
+    'vit_small_patch16_224_TransReID': vit_small_patch16_224_TransReID,
+    'deit_small_patch16_224_TransReID': deit_small_patch16_224_TransReID,
+    'mambavision_tiny_reid': mambavision_tiny_reid,
+    'mambavision_small_reid': mambavision_small_reid,
+    'mambavision_base_reid': mambavision_base_reid,
+    'mambavision_tiny_TransReID': mambavision_tiny_reid,
+    'mambavision_small_TransReID': mambavision_small_reid,
+    'mambavision_base_TransReID': mambavision_base_reid,
+}
+
+
+def make_model(cfg, num_class, camera_num, view_num):
+    model = None
+    if cfg.MODEL.NAME == 'transformer':
+        model = build_transformer(num_class, camera_num, view_num, cfg, __factory_T_type)
+        print('===========building transformer===========')
+    else:
+        model = Backbone(num_class, cfg)
+        print('===========building ResNet===========')
     
-    model = MambaVisionBackbone(
-        img_size=img_size,
-        dim=80,
-        in_dim=32,
-        depths=[1, 3, 8, 4],
-        num_heads=[2, 4, 8, 16],
-        window_size=[8, 8, 14, 7],
-        mlp_ratio=4,
-        drop_path_rate=drop_path_rate,
-        global_stages=global_stages,
-        sasf_stages=sasf_stages,
-        use_sfm=use_sfm,
-        sfm_num_layers=sfm_num_layers,
-        sfm_depths=sfm_depths,
-        sfm_drop_path=sfm_drop_path,
-        **kwargs
-    )
-    if pretrained_path:
-        model.load_param(pretrained_path)
-    return model
-
-
-def mambavision_small_reid(img_size=(256, 128), pretrained_path='', **kwargs):
-    """MambaVision-Small for ReID"""
-    # Extract parameters from kwargs
-    drop_path_rate = kwargs.pop('drop_path_rate', 0.2)
-    global_stages = kwargs.pop('global_stages', [])
-    sasf_stages = kwargs.pop('sasf_stages', [])
-    use_sfm = kwargs.pop('use_sfm', False)
-    sfm_num_layers = kwargs.pop('sfm_num_layers', 1)
-    sfm_depths = kwargs.pop('sfm_depths', [1, 1])
-    sfm_drop_path = kwargs.pop('sfm_drop_path', 0.0)
-    
-    model = MambaVisionBackbone(
-        img_size=img_size,
-        dim=96,
-        in_dim=64,
-        depths=[3, 3, 7, 5],
-        num_heads=[2, 4, 8, 16],
-        window_size=[8, 8, 16, 8],
-        mlp_ratio=4,
-        drop_path_rate=drop_path_rate,
-        global_stages=global_stages,
-        sasf_stages=sasf_stages,
-        use_sfm=use_sfm,
-        sfm_num_layers=sfm_num_layers,
-        sfm_depths=sfm_depths,
-        sfm_drop_path=sfm_drop_path,
-        **kwargs
-    )
-
-    if pretrained_path:
-        model.load_param(pretrained_path)
-    return model
-
-
-def mambavision_base_reid(img_size=(256, 128), pretrained_path='', **kwargs):
-    """MambaVision-Base for ReID"""
-    # Extract parameters from kwargs
-    drop_path_rate = kwargs.pop('drop_path_rate', 0.3)
-    global_stages = kwargs.pop('global_stages', [])
-    sasf_stages = kwargs.pop('sasf_stages', [])
-    use_sfm = kwargs.pop('use_sfm', False)
-    sfm_num_layers = kwargs.pop('sfm_num_layers', 1)
-    sfm_depths = kwargs.pop('sfm_depths', [1, 1])
-    sfm_drop_path = kwargs.pop('sfm_drop_path', 0.0)
-    
-    model = MambaVisionBackbone(
-        img_size=img_size,
-        dim=128,
-        in_dim=64,
-        depths=[3, 3, 10, 5],
-        num_heads=[2, 4, 8, 16],
-        window_size=[8, 8, 16, 16],
-        mlp_ratio=4,
-        drop_path_rate=drop_path_rate,
-        global_stages=global_stages,
-        layer_scale=1e-5,
-        sasf_stages=sasf_stages,
-        use_sfm=use_sfm,
-        sfm_num_layers=sfm_num_layers,
-        sfm_depths=sfm_depths,
-        sfm_drop_path=sfm_drop_path,
-        **kwargs
-    )
-    if pretrained_path:
-        model.load_param(pretrained_path)
+    if model is None:
+        raise RuntimeError("Model was not initialized correctly in make_model!")
+        
     return model
 
