@@ -193,6 +193,360 @@ class StripeTokenInsertion(nn.Module):
         return seq.transpose(1, 2).contiguous().view(b, c, h, w)
 
 
+class FSLoRAFLM(nn.Module):
+    """Frequency learning module used inside layer-wise FSLoRA adapters."""
+
+    def __init__(self, rank, low_cutoff=0.30, high_cutoff=0.40, transition=0.0):
+        super().__init__()
+        self.low_cutoff = float(low_cutoff)
+        self.high_cutoff = float(high_cutoff)
+        self.transition = max(float(transition), 0.0)
+        hidden_dim = max(rank // 4, 4)
+        self.router = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(rank, hidden_dim, 1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, 2, 1, bias=True),
+        )
+        self.register_buffer('last_freq_weight', torch.ones(2) * 0.5, persistent=False)
+
+    def _masks(self, height, width, device, dtype):
+        fy = torch.fft.fftfreq(height, device=device).abs().view(height, 1)
+        fx = torch.fft.rfftfreq(width, device=device).abs().view(1, width // 2 + 1)
+        radius = torch.sqrt(fy * fy + fx * fx)
+        radius = radius / radius.max().clamp_min(1e-6)
+        if self.transition > 0:
+            low = torch.sigmoid((self.low_cutoff - radius) / self.transition)
+            high = torch.sigmoid((radius - self.high_cutoff) / self.transition)
+        else:
+            low = (radius <= self.low_cutoff).float()
+            high = (radius >= self.high_cutoff).float()
+        low = low.view(1, 1, height, width // 2 + 1).to(dtype=dtype)
+        high = high.view(1, 1, height, width // 2 + 1).to(dtype=dtype)
+        return low, high
+
+    def forward(self, x):
+        batch_size, _, height, width = x.shape
+        freq = torch.fft.rfft2(x, norm='ortho')
+        low, high = self._masks(height, width, x.device, x.dtype)
+        weight = torch.softmax(self.router(x.float()), dim=1).to(dtype=freq.real.dtype)
+        self.last_freq_weight = weight.detach().mean(dim=(0, 2, 3))
+        low_weight = weight[:, 0:1].view(batch_size, 1, 1, 1)
+        high_weight = weight[:, 1:2].view(batch_size, 1, 1, 1)
+        freq = low_weight * freq * low + high_weight * freq * high
+        return torch.fft.irfft2(freq, s=(height, width), norm='ortho')
+
+
+class FSLoRASLM(nn.Module):
+    """Spatial router that produces expert masks for FSLoRA."""
+
+    def __init__(self, in_dim, num_experts):
+        super().__init__()
+        self.num_experts = int(num_experts)
+        self.router = nn.Conv2d(in_dim, self.num_experts, 1, bias=False)
+
+    def forward(self, x):
+        return torch.softmax(self.router(x.float()), dim=1)
+
+
+class FSLoRALinear(nn.Module):
+    """LoRA wrapper for Linear weights: W0(x) + B(SLM(FLM(A(x))))."""
+
+    accepts_spatial_context = True
+    is_fslora_adapter = True
+
+    def __init__(
+        self,
+        linear,
+        rank=16,
+        num_experts=2,
+        init_gamma=1e-3,
+        freq_low_cutoff=0.30,
+        freq_high_cutoff=0.40,
+        freq_transition=0.08,
+        freeze_base=False,
+    ):
+        super().__init__()
+        self.base = linear
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.rank = min(max(int(rank), 4), self.in_features, self.out_features)
+        self.num_experts = max(int(num_experts), 1)
+        self.fslora_A = nn.Linear(self.in_features, self.rank, bias=False)
+        self.fslora_flm = FSLoRAFLM(
+            self.rank,
+            low_cutoff=freq_low_cutoff,
+            high_cutoff=freq_high_cutoff,
+            transition=freq_transition,
+        )
+        self.fslora_slm = FSLoRASLM(self.in_features, self.num_experts)
+        self.fslora_B = nn.ModuleList([
+            nn.Linear(self.rank, self.out_features, bias=False)
+            for _ in range(self.num_experts)
+        ])
+        self.fslora_gamma = nn.Parameter(torch.ones(1) * float(init_gamma))
+        self.fslora_gamma._no_weight_decay = True
+        self._context = None
+        if freeze_base:
+            for param in self.base.parameters():
+                param.requires_grad_(False)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.fslora_A.weight, a=0, mode='fan_out')
+        for expert in self.fslora_B:
+            nn.init.zeros_(expert.weight)
+
+    def set_spatial_context(self, H=None, W=None, batch_size=None, seq_len=None):
+        self._context = (H, W, batch_size, seq_len)
+
+    def _to_map(self, z, H, W, batch_size, seq_len):
+        if H is None or W is None:
+            return None
+        H, W = int(H), int(W)
+        if z.dim() == 3 and H * W == z.shape[1]:
+            return z.transpose(1, 2).contiguous().view(z.shape[0], self.rank, H, W)
+        if (
+            z.dim() == 2
+            and batch_size is not None
+            and seq_len is not None
+            and H * W == int(seq_len)
+            and z.shape[0] == int(batch_size) * int(seq_len)
+        ):
+            return z.view(int(batch_size), int(seq_len), self.rank).transpose(1, 2).contiguous().view(
+                int(batch_size), self.rank, H, W
+            )
+        return None
+
+    def _from_map(self, z_map, ref, batch_size, seq_len):
+        if ref.dim() == 3:
+            return z_map.flatten(2).transpose(1, 2).contiguous()
+        return z_map.flatten(2).transpose(1, 2).contiguous().view(int(batch_size) * int(seq_len), self.rank)
+
+    def _router_mask(self, x, H, W, batch_size, seq_len):
+        x_map = self._to_input_map(x.float(), H, W, batch_size, seq_len)
+        if x_map is None:
+            return None
+        return self.fslora_slm(x_map)
+
+    def _to_input_map(self, x, H, W, batch_size, seq_len):
+        if H is None or W is None:
+            return None
+        H, W = int(H), int(W)
+        if x.dim() == 3 and H * W == x.shape[1]:
+            return x.transpose(1, 2).contiguous().view(x.shape[0], self.in_features, H, W)
+        if (
+            x.dim() == 2
+            and batch_size is not None
+            and seq_len is not None
+            and H * W == int(seq_len)
+            and x.shape[0] == int(batch_size) * int(seq_len)
+        ):
+            return x.view(int(batch_size), int(seq_len), self.in_features).transpose(1, 2).contiguous().view(
+                int(batch_size), self.in_features, H, W
+            )
+        return None
+
+    def _apply_experts(self, z, mask, batch_size, seq_len):
+        expert_outs = [expert(z) for expert in self.fslora_B]
+        if mask is None:
+            return sum(expert_outs) / float(len(expert_outs))
+        if z.dim() == 3:
+            mask_seq = mask.flatten(2).transpose(1, 2).contiguous()
+            out = 0
+            for idx, expert_out in enumerate(expert_outs):
+                out = out + mask_seq[:, :, idx:idx + 1] * expert_out
+            return out
+        mask_seq = mask.flatten(2).transpose(1, 2).contiguous().view(
+            int(batch_size) * int(seq_len),
+            self.num_experts,
+        )
+        out = 0
+        for idx, expert_out in enumerate(expert_outs):
+            out = out + mask_seq[:, idx:idx + 1] * expert_out
+        return out
+
+    def forward(self, x, H=None, W=None, batch_size=None, seq_len=None):
+        out = self.base(x)
+        if H is None and self._context is not None:
+            H, W, batch_size, seq_len = self._context
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x_float = x.float()
+            z = self.fslora_A(x_float)
+            z_map = self._to_map(z, H, W, batch_size, seq_len)
+            if z_map is not None:
+                z_map = self.fslora_flm(z_map)
+                z = self._from_map(z_map, z, batch_size, seq_len)
+            mask = self._router_mask(x_float, H, W, batch_size, seq_len)
+            delta = self._apply_experts(z, mask, batch_size, seq_len)
+            delta = self.fslora_gamma.float() * delta
+        return out + delta.to(out.dtype)
+
+
+class FSLoRAConv2d(nn.Module):
+    """LoRA wrapper for ConvBlock convolutions in shallow MambaVision stages."""
+
+    is_fslora_adapter = True
+
+    def __init__(
+        self,
+        conv,
+        rank=16,
+        num_experts=2,
+        init_gamma=1e-3,
+        freq_low_cutoff=0.30,
+        freq_high_cutoff=0.40,
+        freq_transition=0.08,
+        freeze_base=False,
+    ):
+        super().__init__()
+        self.base = conv
+        self.rank = min(max(int(rank), 4), conv.in_channels, conv.out_channels)
+        self.num_experts = max(int(num_experts), 1)
+        self.fslora_A = nn.Conv2d(conv.in_channels, self.rank, 1, bias=False)
+        self.fslora_flm = FSLoRAFLM(
+            self.rank,
+            low_cutoff=freq_low_cutoff,
+            high_cutoff=freq_high_cutoff,
+            transition=freq_transition,
+        )
+        self.fslora_slm = FSLoRASLM(conv.in_channels, self.num_experts)
+        self.fslora_B = nn.ModuleList([
+            nn.Conv2d(self.rank, conv.out_channels, 1, bias=False)
+            for _ in range(self.num_experts)
+        ])
+        self.fslora_gamma = nn.Parameter(torch.ones(1) * float(init_gamma))
+        self.fslora_gamma._no_weight_decay = True
+        if freeze_base:
+            for param in self.base.parameters():
+                param.requires_grad_(False)
+        self._init_weights()
+
+    def _init_weights(self):
+        nn.init.kaiming_normal_(self.fslora_A.weight, a=0, mode='fan_out')
+        for expert in self.fslora_B:
+            nn.init.zeros_(expert.weight)
+
+    def forward(self, x):
+        out = self.base(x)
+        with torch.amp.autocast(x.device.type, enabled=False):
+            x_float = x.float()
+            z = self.fslora_A(x_float)
+            z = self.fslora_flm(z)
+            mask = self.fslora_slm(x_float)
+            delta = 0
+            for idx, expert in enumerate(self.fslora_B):
+                delta = delta + mask[:, idx:idx + 1] * expert(z)
+            delta = self.fslora_gamma.float().view(1, 1, 1, 1) * delta
+        return out + delta.to(out.dtype)
+
+
+def _wrap_fslora_children(
+    module,
+    rank,
+    num_experts,
+    init_gamma,
+    freq_low_cutoff,
+    freq_high_cutoff,
+    freq_transition,
+    freeze_base,
+    wrap_conv,
+):
+    count = 0
+    parent_type = module.__class__.__name__
+    for name, child in list(module.named_children()):
+        if getattr(child, 'is_fslora_adapter', False):
+            continue
+        if isinstance(child, nn.Linear) and (
+            (parent_type == 'MambaVisionMixer' and name in ('in_proj', 'out_proj'))
+            or (parent_type == 'Attention' and name in ('qkv', 'proj'))
+            or (parent_type == 'Mlp' and name in ('fc1', 'fc2'))
+        ):
+            setattr(module, name, FSLoRALinear(
+                child,
+                rank=rank,
+                num_experts=num_experts,
+                init_gamma=init_gamma,
+                freq_low_cutoff=freq_low_cutoff,
+                freq_high_cutoff=freq_high_cutoff,
+                freq_transition=freq_transition,
+                freeze_base=freeze_base,
+            ))
+            count += 1
+        elif (
+            wrap_conv
+            and isinstance(child, nn.Conv2d)
+            and child.stride == (1, 1)
+            and child.groups == 1
+            and parent_type == 'ConvBlock'
+            and name in ('conv1', 'conv2')
+        ):
+            setattr(module, name, FSLoRAConv2d(
+                child,
+                rank=rank,
+                num_experts=num_experts,
+                init_gamma=init_gamma,
+                freq_low_cutoff=freq_low_cutoff,
+                freq_high_cutoff=freq_high_cutoff,
+                freq_transition=freq_transition,
+                freeze_base=freeze_base,
+            ))
+            count += 1
+        else:
+            count += _wrap_fslora_children(
+                child,
+                rank=rank,
+                num_experts=num_experts,
+                init_gamma=init_gamma,
+                freq_low_cutoff=freq_low_cutoff,
+                freq_high_cutoff=freq_high_cutoff,
+                freq_transition=freq_transition,
+                freeze_base=freeze_base,
+                wrap_conv=wrap_conv,
+            )
+    return count
+
+
+def install_fslora_adapters(
+    backbone,
+    rank=16,
+    num_experts=2,
+    init_gamma=1e-3,
+    freq_low_cutoff=0.30,
+    freq_high_cutoff=0.40,
+    freq_transition=0.08,
+    freeze_base=False,
+    wrap_conv=True,
+    target_stages=None,
+):
+    if not hasattr(backbone, 'levels'):
+        return 0
+    if target_stages is None or len(target_stages) == 0:
+        target_stages = set(range(len(backbone.levels)))
+    else:
+        target_stages = {int(stage) for stage in target_stages}
+
+    count = 0
+    for stage_idx, level in enumerate(backbone.levels):
+        if stage_idx not in target_stages:
+            continue
+        if not hasattr(level, 'blocks'):
+            continue
+        for block in level.blocks:
+            count += _wrap_fslora_children(
+                block,
+                rank=rank,
+                num_experts=num_experts,
+                init_gamma=init_gamma,
+                freq_low_cutoff=freq_low_cutoff,
+                freq_high_cutoff=freq_high_cutoff,
+                freq_transition=freq_transition,
+                freeze_base=freeze_base,
+                wrap_conv=wrap_conv,
+            )
+    return count
+
+
 def weights_init_kaiming(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
@@ -311,6 +665,18 @@ class build_transformer(nn.Module):
         self.pooling = None
         local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
         token_cfg = getattr(local_cfg, 'TOKEN_INSERTION', None) if local_cfg is not None else None
+        fslora_cfg = getattr(cfg.MODEL, 'FSLORA', None)
+        self.fslora_enabled = bool(getattr(fslora_cfg, 'ENABLED', False))
+        self.fslora_rank = int(getattr(fslora_cfg, 'RANK', 32))
+        self.fslora_num_experts = int(getattr(fslora_cfg, 'NUM_EXPERTS', 2))
+        self.fslora_init_gamma = float(getattr(fslora_cfg, 'INIT_GAMMA', 1e-3))
+        self.fslora_freq_low_cutoff = float(getattr(fslora_cfg, 'FREQ_LOW_CUTOFF', 0.30))
+        self.fslora_freq_high_cutoff = float(getattr(fslora_cfg, 'FREQ_HIGH_CUTOFF', 0.40))
+        self.fslora_freq_transition = float(getattr(fslora_cfg, 'FREQ_TRANSITION', 0.0))
+        self.fslora_wrap_conv = bool(getattr(fslora_cfg, 'WRAP_CONV', True))
+        self.fslora_freeze_base = bool(getattr(fslora_cfg, 'FREEZE_BASE', False))
+        self.fslora_target_stages = list(getattr(fslora_cfg, 'TARGET_STAGES', []))
+        self.fslora_num_adapters = 0
         self.local_stripe_enabled = bool(getattr(local_cfg, 'ENABLED', False))
         self.local_num_stripes = int(getattr(local_cfg, 'NUM_STRIPES', 4))
         self.local_inference = str(getattr(local_cfg, 'INFERENCE', 'concat')).lower()
@@ -418,6 +784,37 @@ class build_transformer(nn.Module):
         self.bottleneck = nn.BatchNorm1d(self.in_planes)
         self.bottleneck.bias.requires_grad_(False)
         self.bottleneck.apply(weights_init_kaiming)
+
+        if self.fslora_enabled:
+            if not self.is_mambavision:
+                raise ValueError('FSLORA currently supports the MambaVision backbone only')
+            if self.use_sfm:
+                raise ValueError('FSLORA and SFM must be evaluated separately')
+            self.fslora_num_adapters = install_fslora_adapters(
+                self.base,
+                rank=self.fslora_rank,
+                num_experts=self.fslora_num_experts,
+                init_gamma=self.fslora_init_gamma,
+                freq_low_cutoff=self.fslora_freq_low_cutoff,
+                freq_high_cutoff=self.fslora_freq_high_cutoff,
+                freq_transition=self.fslora_freq_transition,
+                freeze_base=self.fslora_freeze_base,
+                wrap_conv=self.fslora_wrap_conv,
+                target_stages=self.fslora_target_stages,
+            )
+            print(
+                '[Model] FSLoRA enabled in backbone blocks: adapters={}, rank={}, experts={}, init_gamma={}, freq_cutoff=({:.2f},{:.2f}), wrap_conv={}, freeze_base={}, target_stages={}'.format(
+                    self.fslora_num_adapters,
+                    self.fslora_rank,
+                    self.fslora_num_experts,
+                    self.fslora_init_gamma,
+                    self.fslora_freq_low_cutoff,
+                    self.fslora_freq_high_cutoff,
+                    self.fslora_wrap_conv,
+                    self.fslora_freeze_base,
+                    self.fslora_target_stages if self.fslora_target_stages else 'all',
+                )
+            )
 
         if self.local_stripe_enabled:
             if not self.is_mambavision:
