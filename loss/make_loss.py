@@ -11,6 +11,38 @@ from .center_loss import CenterLoss
 from .ratr_loss import RATRLoss
 
 
+def _cosine_distance(left, right):
+    return 1.0 - (left * right).sum(dim=1)
+
+
+def _pam_consistency_loss(features, mode='pairwise', detach_base=True):
+    branch_feats = [F.normalize(branch_feat.float(), dim=1) for branch_feat in features[:3]]
+    mode = str(mode).lower()
+
+    if mode == 'pairwise':
+        pairs = ((0, 1), (0, 2), (1, 2))
+        losses = [
+            _cosine_distance(branch_feats[left_idx], branch_feats[right_idx]).mean()
+            for left_idx, right_idx in pairs
+        ]
+        return sum(losses) / len(losses)
+
+    if mode in ('base_anchor', 'ba_anchor'):
+        anchor = branch_feats[0].detach() if detach_base else branch_feats[0]
+        losses = [
+            _cosine_distance(branch_feats[1], anchor).mean(),
+            _cosine_distance(branch_feats[2], anchor).mean(),
+        ]
+        return sum(losses) / len(losses)
+
+    if mode == 'center':
+        center = F.normalize((branch_feats[0] + branch_feats[1] + branch_feats[2]) / 3.0, dim=1).detach()
+        losses = [_cosine_distance(branch_feat, center).mean() for branch_feat in branch_feats]
+        return sum(losses) / len(losses)
+
+    raise ValueError("SOLVER.PAM_CONSISTENCY_MODE must be one of: pairwise, base_anchor, center")
+
+
 def make_loss(cfg, num_classes):    # modified by gu
     sampler = cfg.DATALOADER.SAMPLER
     feat_dim = 2048
@@ -115,6 +147,21 @@ def make_loss(cfg, num_classes):    # modified by gu
                         total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
                                      cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
 
+                        consistency_enabled = bool(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_ENABLED', False))
+                        consistency_weight = float(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_WEIGHT', 0.0))
+                        if consistency_enabled and consistency_weight > 0:
+                            consistency_mode = str(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_MODE', 'pairwise')).lower()
+                            detach_base = bool(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_DETACH_BASE', True))
+                            consistency_loss = _pam_consistency_loss(
+                                feat[:3],
+                                mode=consistency_mode,
+                                detach_base=detach_base,
+                            )
+                            total_loss = total_loss + consistency_weight * consistency_loss
+                            loss_detail['pam_consistency'] = consistency_loss.item()
+                            loss_detail['pam_consistency_weight'] = consistency_weight
+                            loss_detail['pam_consistency_mode'] = consistency_mode
+
                         return total_loss, loss_detail
                     
                     if use_sfm and len(score) >= 2:
@@ -213,4 +260,3 @@ def make_loss(cfg, num_classes):    # modified by gu
         print('expected sampler should be softmax, triplet, softmax_triplet or softmax_triplet_center'
               'but got {}'.format(cfg.DATALOADER.SAMPLER))
     return loss_func, center_criterion
-

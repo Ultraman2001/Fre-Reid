@@ -196,6 +196,11 @@ _C.SOLVER.CLIP_GRAD_NORM = 1.0
 
 # PAM loss: normalized L_BA + weight * (L_CA + L_EA)
 _C.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT = 1.0
+# Optional feature-level consistency across PAM BA/CA/EA branches.
+_C.SOLVER.PAM_CONSISTENCY_ENABLED = False
+_C.SOLVER.PAM_CONSISTENCY_WEIGHT = 0.0
+_C.SOLVER.PAM_CONSISTENCY_MODE = 'pairwise'  # pairwise, base_anchor, center
+_C.SOLVER.PAM_CONSISTENCY_DETACH_BASE = True
 
 # decay rate of learning rate
 _C.SOLVER.GAMMA = 0.1

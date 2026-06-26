@@ -227,6 +227,12 @@ def do_train(cfg,
                                 loss_detail['id_local'],
                                 loss_detail['tri_local'],
                             )
+                        if 'pam_consistency' in loss_detail:
+                            log_msg += " | PAM-C[{} w={:.3f}, loss={:.4f}]".format(
+                                loss_detail.get('pam_consistency_mode', 'pairwise'),
+                                loss_detail['pam_consistency_weight'],
+                                loss_detail['pam_consistency'],
+                            )
                     else:
                         s_lambda = loss_detail.get('sfm_lambda', 0.0)
                         id_b = loss_detail.get('id_backbone', 0.0)

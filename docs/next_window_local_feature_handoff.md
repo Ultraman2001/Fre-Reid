@@ -46,6 +46,41 @@ Recommended next focus:
 - Prefer OSBBM-aware constraints or branch-consistency losses over new local descriptor branches.
 - A promising low-risk next idea is BA/CA/EA feature consistency or OSBBM mask/visible-token supervision, because these build on the augmentation that is already helping instead of adding another independent local branch.
 
+## Work Continued In This Window (2026-06-26)
+
+Implemented a first low-risk branch-consistency experiment, named PAM-C:
+
+- `SOLVER.PAM_CONSISTENCY_ENABLED`
+- `SOLVER.PAM_CONSISTENCY_WEIGHT`
+- `SOLVER.PAM_CONSISTENCY_MODE`: `pairwise`, `base_anchor`, or `center`
+- `SOLVER.PAM_CONSISTENCY_DETACH_BASE`
+
+Implementation:
+
+- `loss/make_loss.py`: adds cosine feature consistency over PAM BA/CA/EA features after the normal PADE-style ID/triplet loss.
+- `processor/processor.py`: logs `PAM-C[...]` when the consistency term is active.
+- `config/defaults.py`: adds default-off PAM-C config keys.
+- `configs/OCC_Duke/mambavision_tiny_transreid_pam_padeaug_osbbm_consistency_b64k4.yml`: candidate config using current best PAM(w=0.5)+scheduled OSBBM plus PAM-C weight 0.05.
+- `scripts/run_pam_consistency_ablation.sh`: runs baseline no-OSBBM, baseline OSBBM, and PAM-C weights 0.02/0.05/0.10; summary includes `final_minus_best_mAP`.
+
+Recommended run:
+
+```bash
+bash scripts/run_pam_consistency_ablation.sh 0,1 2
+```
+
+Summary-only:
+
+```bash
+bash scripts/run_pam_consistency_ablation.sh --summary-only
+```
+
+Interpretation to watch:
+
+- PAM-C should be judged against both `baseline_no_osbbm` and `baseline_osbbm`.
+- Prefer final epoch stability, not only best mAP.
+- If `pairwise` pulls CA/EA too close to OSBBM-corrupted BA during active epochs, try `center` before adding any new branch.
+
 ## Main Goal Going Forward
 
 Continue improving occluded person re-identification on OCC-Duke by strengthening local or fine-grained features on top of the current MambaVision tiny + PADE-style PAM baseline.
