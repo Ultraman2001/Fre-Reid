@@ -314,6 +314,39 @@ def do_train(cfg,
                     )
                 )
 
+            rpvtr_modules = [
+                module for module in _model.modules()
+                if getattr(module, 'is_rpvtr_module', False)
+            ]
+            if rpvtr_modules:
+                gammas = torch.stack([
+                    module.gamma.detach().float().view(-1)[0]
+                    for module in rpvtr_modules
+                ])
+                score_means = torch.stack([
+                    module.last_score_mean.detach().float().view(-1)[0]
+                    for module in rpvtr_modules
+                ])
+                score_stds = torch.stack([
+                    module.last_score_std.detach().float().view(-1)[0]
+                    for module in rpvtr_modules
+                ])
+                taus = torch.stack([
+                    module.last_tau.detach().float().view(-1)[0]
+                    for module in rpvtr_modules
+                ])
+                logger.info(
+                    "[R-PVTR Monitor] Epoch {}: modules={}, gamma_mean={:.6f}, gamma_max={:.6f}, score_mean={:.4f}, score_std={:.4f}, tau={:.4f}".format(
+                        epoch,
+                        len(rpvtr_modules),
+                        gammas.mean().item(),
+                        gammas.max().item(),
+                        score_means.mean().item(),
+                        score_stds.mean().item(),
+                        taus.mean().item(),
+                    )
+                )
+
         if epoch % checkpoint_period == 0:
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
