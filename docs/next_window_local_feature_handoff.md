@@ -2,6 +2,50 @@
 
 This document summarizes the current Fre-ReID experimental state before opening a new context window. The next window should use this as the starting point and should avoid repeating the failed local/fine-grained feature routes listed below.
 
+## Latest Update Before Next Window (2026-06-26)
+
+Current tracked direction is back to the reliable baseline family:
+
+- MambaVision tiny + PADE-style PAM.
+- `PAM_AUGMENTED_LOSS_WEIGHT = 0.5`, giving effective BA/CA/EA weights of 0.50/0.25/0.25.
+- Scheduled OSBBM on BA only: `prob=0.25`, `num_blocks=8`, `num_mix_blocks=2`, `cycle`, `start=21`, `end=120`, `period=20`, `on=10`.
+
+Recent experimental branches have been reverted from the code:
+
+- R-PVTR was implemented and then reverted by `4ba29d7`.
+- HULM was implemented in `6799b7e` and then reverted by `0240e4c`.
+- A checkpoint before HULM revert exists at `e17dd07`.
+- The current user-accepted `mamba_vision_reid.py` state removes FSLoRA spatial-context helper logic. Treat FSLoRA as out of scope for the next window unless explicitly requested. The current PAM + schedule-OSBBM configs do not enable FSLoRA.
+
+Important latest results:
+
+```text
+R-PVTR final:
+Epoch 160 mAP 59.3, Rank-1 67.7
+Monitor: gamma=-0.488043, score_mean=0.4177, score_std=0.1860, tau=0.0584
+
+HULM stage2_pre final:
+Epoch 160 mAP 58.4, Rank-1 67.0
+Monitor: beta=0.110954, global_norm=30.514, local_norm=36.693
+
+HULM stage4 final:
+Epoch 160 mAP 58.6, Rank-1 65.9
+Monitor: beta=0.104012, global_norm=30.287, local_norm=31.479
+```
+
+Interpretation:
+
+- R-PVTR learned a negative residual coefficient, effectively suppressing features instead of improving occlusion robustness.
+- HULM learned non-trivial beta around 0.10, and the local branch norm was comparable to or larger than the global branch norm. This injected a strong local perturbation that hurt validation performance.
+- Stage2 pre-downsample local features did not fix the issue. Higher spatial resolution alone did not produce better local identity cues.
+- Do not continue R-PVTR/HULM without a substantially different mechanism. If a final rescue is attempted, cap residual strength much lower (`beta_max <= 0.05`) and use it only as a sanity check, not as the main next direction.
+
+Recommended next focus:
+
+- Keep the code simple and return to the strong PAM + scheduled OSBBM baseline.
+- Prefer OSBBM-aware constraints or branch-consistency losses over new local descriptor branches.
+- A promising low-risk next idea is BA/CA/EA feature consistency or OSBBM mask/visible-token supervision, because these build on the augmentation that is already helping instead of adding another independent local branch.
+
 ## Main Goal Going Forward
 
 Continue improving occluded person re-identification on OCC-Duke by strengthening local or fine-grained features on top of the current MambaVision tiny + PADE-style PAM baseline.
@@ -286,6 +330,65 @@ Conclusion:
 - Keep `APPLY_TO: base`.
 - Avoid high probability or heavy mix blocks.
 
+### 6. R-PVTR / DPEFormer-Inspired Proxy-Variance Token Recalibration
+
+Idea:
+
+- Use a learnable proxy token plus variance gating to score final MambaVision tokens.
+- Apply a residual token recalibration before pooling.
+- This was inspired by DPEFormer/TSA-style token scoring.
+
+Result:
+
+```text
+Epoch 160:
+mAP 59.3
+Rank-1 67.7
+gamma_mean -0.488043
+score_mean 0.4177
+tau 0.0584
+```
+
+Conclusion:
+
+- Worse than the PAM + scheduled OSBBM baseline.
+- The learned residual coefficient became negative, so the module learned to suppress rather than enhance token features.
+- Do not repeat proxy+variance token scoring in this form.
+- If revisiting token scoring, tie it directly to OSBBM masks or visible-region supervision instead of unsupervised proxy learning.
+
+### 7. HULM: High-Resolution Upsampled Local Mamba Branch
+
+Idea:
+
+- Keep the stage4 global GeM descriptor as the main path.
+- Add a local branch from either stage4 upsampled to 32x8 or stage2 pre-downsample 32x16.
+- Split the local map into 2 parts and add it back through a small non-negative residual coefficient.
+
+Results:
+
+```text
+HULM stage2_pre:
+mAP 58.4
+Rank-1 67.0
+beta 0.110954
+global_norm 30.514
+local_norm 36.693
+
+HULM stage4:
+mAP 58.6
+Rank-1 65.9
+beta 0.104012
+global_norm 30.287
+local_norm 31.479
+```
+
+Conclusion:
+
+- Clearly worse than baseline.
+- Local branch features became strong enough to disturb the global descriptor but did not generalize.
+- Stage2 pre-downsample 32x16 features did not help.
+- Do not continue height-upsample local branch or stage2-pre local descriptor in this form.
+
 ## Current Code/Script Map
 
 Important implementation files:
@@ -329,6 +432,8 @@ Avoid spending more time on:
 - Simple local stripe classifier heads.
 - Stage3 shallow auxiliary stripe loss.
 - Stage4 local stripe auxiliary loss in its previous form.
+- R-PVTR / proxy-variance token recalibration in its previous form.
+- HULM stage4 or stage2-pre local residual branch.
 - Replacing EA with OSBBM.
 - Always-on OSBBM.
 - OSBBM applied to all PAM branches.
@@ -512,7 +617,9 @@ Key design insight: Gumbel-Softmax enables end-to-end trainable hard selection, 
 
 ---
 
-## Recommended Next Direction: DPEFormer-Inspired Token Scoring
+## Deprecated Direction: DPEFormer-Inspired Token Scoring
+
+Status update on 2026-06-26: this direction was effectively tested as R-PVTR and failed. Keep the notes below only as historical context. Do not prioritize the X1-X4 plan unless the token scorer is redesigned around explicit OSBBM mask/visible-token supervision.
 
 Combining insights from DPEFormer, TSA, and the failed stripe/prototype routes:
 
@@ -568,7 +675,7 @@ feat_s4 (B, 512, 16, 8) = 128 tokens
 - Config: 2 new keys (temperature τ, whether to use variance gate)
 - No changes to loss, optimizer, or dataloader
 
-### Experiment Plan
+### Historical Experiment Plan
 
 | # | Config | Parameters | Validates |
 |---|--------|-----------|-----------|
@@ -587,7 +694,9 @@ Baseline 2: PAM(w=0.5) + OSBBM(21-120)     → mAP 60.0, R1 69.3
 Success criterion: X3 > Baseline 2 by ≥0.3 mAP with stable epoch 160 performance.
 ---
 
-## New MDB Direction: NIReID-Style Dual Branch Descriptor
+## Historical MDB Direction: NIReID-Style Dual Branch Descriptor
+
+Status update on 2026-06-26: MDB code/configs are not present in the current tracked code after rollbacks. Treat this section as historical context only.
 
 After PLRM/PALC underperformed, the next implemented route is MDB
 (Mamba Dual Branch Descriptor), inspired by NIReID dual branch and PADE-DES
