@@ -16,20 +16,6 @@ try:
 except:
     DepthwiseFunction = None
 
-
-def _forward_with_spatial(module, x, H=None, W=None, batch_size=None, seq_len=None):
-    if hasattr(module, 'accepts_spatial_context') and module.accepts_spatial_context:
-        return module(x, H=H, W=W, batch_size=batch_size, seq_len=seq_len)
-    return module(x)
-
-
-def _set_spatial_context(module, H=None, W=None, batch_size=None, seq_len=None):
-    if hasattr(module, 'set_spatial_context'):
-        module.set_spatial_context(H=H, W=W, batch_size=batch_size, seq_len=seq_len)
-    for child in module.children():
-        _set_spatial_context(child, H=H, W=W, batch_size=batch_size, seq_len=seq_len)
-
-
 class StateFusion(nn.Module):
     """
     Ultra-simplified SASF: Pure multi-scale depthwise conv (DWConv).
@@ -611,15 +597,8 @@ class MambaVisionMixer(nn.Module):
         H, W: spatial dimensions for non-square feature maps
         Returns: same shape as hidden_states
         """
-        batch_size, seqlen, _ = hidden_states.shape
-        xz = _forward_with_spatial(
-            self.in_proj,
-            hidden_states,
-            H=H,
-            W=W,
-            batch_size=batch_size,
-            seq_len=seqlen,
-        )
+        _, seqlen, _ = hidden_states.shape
+        xz = self.in_proj(hidden_states)
         xz = rearrange(xz, "b l d -> b d l")
         x, z = xz.chunk(2, dim=1)
         A = -torch.exp(self.A_log.float())
@@ -631,24 +610,9 @@ class MambaVisionMixer(nn.Module):
         x = x[..., :seqlen].contiguous()
         z = z[..., :seqlen].contiguous()
         
-        x_dbl = _forward_with_spatial(
-            self.x_proj,
-            rearrange(x, "b d l -> (b l) d"),
-            H=H,
-            W=W,
-            batch_size=batch_size,
-            seq_len=seqlen,
-        )
+        x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = _forward_with_spatial(
-            self.dt_proj,
-            dt,
-            H=H,
-            W=W,
-            batch_size=batch_size,
-            seq_len=seqlen,
-        )
-        dt = rearrange(dt, "(b l) d -> b d l", l=seqlen).contiguous()
+        dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen).contiguous()
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         
@@ -685,14 +649,7 @@ class MambaVisionMixer(nn.Module):
                 y = rearrange(y, "b d h w -> b d (h w)").contiguous()
 
         y = rearrange(y, "b d l -> b l d")
-        out = _forward_with_spatial(
-            self.out_proj,
-            y,
-            H=H,
-            W=W,
-            batch_size=batch_size,
-            seq_len=seqlen,
-        )
+        out = self.out_proj(y)
         return out
 
 
@@ -721,17 +678,9 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, H=None, W=None):
+    def forward(self, x):
         B, N, C = x.shape
-        qkv = _forward_with_spatial(
-            self.qkv,
-            x,
-            H=H,
-            W=W,
-            batch_size=B,
-            seq_len=N,
-        )
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv.unbind(0)
         q, k = self.q_norm(q), self.k_norm(k)
 
@@ -745,14 +694,7 @@ class Attention(nn.Module):
             x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
-        x = _forward_with_spatial(
-            self.proj,
-            x,
-            H=H,
-            W=W,
-            batch_size=B,
-            seq_len=N,
-        )
+        x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
@@ -791,8 +733,7 @@ class Block(nn.Module):
         if hasattr(self.mixer, 'use_sasf'):
             x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x), H=H, W=W))
         else:
-            x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x), H=H, W=W))
-        _set_spatial_context(self.mlp, H=H, W=W, batch_size=x.shape[0], seq_len=x.shape[1])
+            x = x + self.drop_path(self.gamma_1 * self.mixer(self.norm1(x)))
         x = x + self.drop_path(self.gamma_2 * self.mlp(self.norm2(x)))
         return x
 
