@@ -51,17 +51,6 @@ _C.MODEL.COS_LAYER = False
 # Pooling type: 'gem', 'avg', 'max', 'avg_max' (消融实验用)
 _C.MODEL.POOLING_TYPE = 'gem'
 
-# Residual Proxy-Variance Token Recalibration on the final MambaVision feature map.
-_C.MODEL.RPVTR = CN()
-_C.MODEL.RPVTR.ENABLED = False
-_C.MODEL.RPVTR.MODE = 'all'  # all, base
-_C.MODEL.RPVTR.USE_PROXY = True
-_C.MODEL.RPVTR.USE_VARIANCE = True
-_C.MODEL.RPVTR.TAU = 0.2
-_C.MODEL.RPVTR.MIN_TAU = 0.05
-_C.MODEL.RPVTR.MAX_TAU = 1.0
-_C.MODEL.RPVTR.INIT_GAMMA = 0.0
-
 # Local stripe descriptors on the final feature map.
 _C.MODEL.LOCAL_STRIPE = CN()
 _C.MODEL.LOCAL_STRIPE.ENABLED = False
@@ -238,7 +227,6 @@ _C.SOLVER.LAYER_DECAY = 1.0
 
 # Multiplier for Stage 4 (levels.3) learning rate (default 3.0)
 _C.SOLVER.STAGE4_LR_FACTOR = 3.0
-_C.SOLVER.RPVTR_LR_FACTOR = 2.0
 
 # Multiplier for SASF (state_fusion) learning rate (default 3.0)
 _C.SOLVER.SASF_LR_FACTOR = 3.0

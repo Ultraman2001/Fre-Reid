@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
@@ -77,75 +76,6 @@ def create_pooling(pooling_type: str):
     else:
         print(f"[Warning] Unknown pooling type '{pooling_type}', using GeM")
         return GeM()
-
-
-class ResidualProxyVarianceTokenRecalibration(nn.Module):
-    """Post-stage feature-map token recalibration before global pooling."""
-
-    is_rpvtr_module = True
-
-    def __init__(
-        self,
-        dim,
-        tau=0.2,
-        min_tau=0.05,
-        max_tau=1.0,
-        use_proxy=True,
-        use_variance=True,
-        init_gamma=0.0,
-        eps=1e-6,
-    ):
-        super().__init__()
-        self.use_proxy = bool(use_proxy)
-        self.use_variance = bool(use_variance)
-        self.min_tau = float(min_tau)
-        self.max_tau = float(max_tau)
-        self.eps = float(eps)
-
-        if self.use_proxy:
-            self.proxy = nn.Parameter(torch.randn(dim))
-            self.log_tau = nn.Parameter(torch.log(torch.tensor(float(tau))))
-            self.log_tau._no_weight_decay = True
-
-        self.gamma = nn.Parameter(torch.ones(1) * float(init_gamma))
-        self.gamma._no_weight_decay = True
-        self.register_buffer('last_score_mean', torch.zeros(1), persistent=False)
-        self.register_buffer('last_score_std', torch.zeros(1), persistent=False)
-        self.register_buffer('last_tau', torch.ones(1) * float(tau), persistent=False)
-
-    def forward(self, feat_map):
-        if not self.use_proxy and not self.use_variance:
-            return feat_map, None
-
-        b, c, h, w = feat_map.shape
-        with torch.amp.autocast(feat_map.device.type, enabled=False):
-            tokens = feat_map.float().flatten(2).transpose(1, 2).contiguous()
-            score = None
-
-            if self.use_proxy:
-                proxy = F.normalize(self.proxy.float(), dim=0)
-                tokens_norm = F.normalize(tokens, dim=-1)
-                tau = self.log_tau.float().exp().clamp(min=self.min_tau, max=self.max_tau)
-                proxy_score = torch.sigmoid(torch.matmul(tokens_norm, proxy) / tau)
-                score = proxy_score
-                self.last_tau = tau.detach().view(1)
-            else:
-                self.last_tau = torch.zeros_like(self.last_tau)
-
-            if self.use_variance:
-                var_score = tokens.var(dim=-1, unbiased=False)
-                var_mean = var_score.mean(dim=1, keepdim=True)
-                var_std = var_score.std(dim=1, keepdim=True, unbiased=False).clamp_min(self.eps)
-                var_score = torch.sigmoid((var_score - var_mean) / var_std)
-                score = var_score if score is None else score * var_score
-
-            score_map = score.view(b, 1, h, w)
-            self.last_score_mean = score.detach().mean().view(1)
-            self.last_score_std = score.detach().std(unbiased=False).view(1)
-            scale = 1.0 + self.gamma.float().view(1, 1, 1, 1) * score_map
-            enhanced = feat_map.float() * scale
-
-        return enhanced.to(feat_map.dtype), score_map.to(feat_map.dtype)
 
 
 class StripeTokenInsertion(nn.Module):
@@ -735,16 +665,6 @@ class build_transformer(nn.Module):
         self.pooling = None
         local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
         token_cfg = getattr(local_cfg, 'TOKEN_INSERTION', None) if local_cfg is not None else None
-        rpvtr_cfg = getattr(cfg.MODEL, 'RPVTR', None)
-        self.rpvtr_enabled = bool(getattr(rpvtr_cfg, 'ENABLED', False))
-        self.rpvtr_mode = str(getattr(rpvtr_cfg, 'MODE', 'all')).lower()
-        self.rpvtr_use_proxy = bool(getattr(rpvtr_cfg, 'USE_PROXY', True))
-        self.rpvtr_use_variance = bool(getattr(rpvtr_cfg, 'USE_VARIANCE', True))
-        self.rpvtr_tau = float(getattr(rpvtr_cfg, 'TAU', 0.2))
-        self.rpvtr_min_tau = float(getattr(rpvtr_cfg, 'MIN_TAU', 0.05))
-        self.rpvtr_max_tau = float(getattr(rpvtr_cfg, 'MAX_TAU', 1.0))
-        self.rpvtr_init_gamma = float(getattr(rpvtr_cfg, 'INIT_GAMMA', 0.0))
-        self.rpvtr = None
         fslora_cfg = getattr(cfg.MODEL, 'FSLORA', None)
         self.fslora_enabled = bool(getattr(fslora_cfg, 'ENABLED', False))
         self.fslora_rank = int(getattr(fslora_cfg, 'RANK', 32))
@@ -807,30 +727,6 @@ class build_transformer(nn.Module):
             pooling_type = getattr(cfg.MODEL, 'POOLING_TYPE', 'gem')
             self.pooling = create_pooling(pooling_type)
             print(f'[Model] Using pooling type: {pooling_type}')
-
-            if self.rpvtr_enabled:
-                if self.rpvtr_mode not in ('all', 'base'):
-                    raise ValueError("MODEL.RPVTR.MODE must be 'all' or 'base'")
-                if self.use_sfm:
-                    raise ValueError('RPVTR and SFM must be evaluated separately')
-                self.rpvtr = ResidualProxyVarianceTokenRecalibration(
-                    dim=self.in_planes,
-                    tau=self.rpvtr_tau,
-                    min_tau=self.rpvtr_min_tau,
-                    max_tau=self.rpvtr_max_tau,
-                    use_proxy=self.rpvtr_use_proxy,
-                    use_variance=self.rpvtr_use_variance,
-                    init_gamma=self.rpvtr_init_gamma,
-                )
-                print(
-                    '[Model] R-PVTR enabled: mode={}, proxy={}, variance={}, tau={}, gamma_init={}'.format(
-                        self.rpvtr_mode,
-                        self.rpvtr_use_proxy,
-                        self.rpvtr_use_variance,
-                        self.rpvtr_tau,
-                        self.rpvtr_init_gamma,
-                    )
-                )
             
             # SFM 多级聚合 heads
             if self.use_sfm:
@@ -862,8 +758,6 @@ class build_transformer(nn.Module):
             if pretrain_choice == 'imagenet':
                 self.base.load_param(model_path)
                 print('Loading pretrained ImageNet model......from {}'.format(model_path))
-            if self.rpvtr_enabled:
-                raise ValueError('RPVTR currently supports the MambaVision backbone only')
 
         self.num_classes = num_classes
         self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
@@ -1045,14 +939,6 @@ class build_transformer(nn.Module):
             pooled = pool_layer(feature_map)
         return pooled.flatten(1)
 
-    def _apply_rpvtr(self, feature_map, branch='base'):
-        if self.rpvtr is None:
-            return feature_map
-        if self.rpvtr_mode == 'base' and branch != 'base':
-            return feature_map
-        feature_map, _ = self.rpvtr(feature_map)
-        return feature_map
-
     def _refine_local_tokens(self, feature_map):
         if self.stripe_token_insertion is not None:
             return self.stripe_token_insertion(feature_map)
@@ -1116,11 +1002,7 @@ class build_transformer(nn.Module):
             if 'fused_maps' in output:
                 raise ValueError('PAM and SFM must be evaluated separately')
             output = output['backbone_map']
-        if self.rpvtr is not None and self.rpvtr_mode == 'all':
-            output = self._apply_rpvtr(output, branch='all')
         map_base, map_crop, map_erase = output.chunk(3, dim=0)
-        if self.rpvtr is not None and self.rpvtr_mode == 'base':
-            map_base = self._apply_rpvtr(map_base, branch='base')
 
         if self.local_stripe_enabled:
             map_base = self._refine_local_tokens(map_base)
@@ -1209,7 +1091,6 @@ class build_transformer(nn.Module):
                 feature_map = output
                 if self.local_stripe_enabled:
                     feature_map = self._refine_local_tokens(feature_map)
-                feature_map = self._apply_rpvtr(feature_map, branch='base')
                 
                 # Apply pooling
                 global_feat = self._pool_feature_map(feature_map)

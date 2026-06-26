@@ -24,14 +24,7 @@ def make_optimizer(cfg, model, center_criterion):
         # 1. state_fusion / sasf_scale: StateFusion modules (uses SASF_LR_FACTOR)
         # 2. levels.3 (Stage 4 backbone): Random init due to structure change
         
-        if "rpvtr" in key:
-            rpvtr_lr_factor = getattr(cfg.SOLVER, 'RPVTR_LR_FACTOR', 2.0)
-            lr = cfg.SOLVER.BASE_LR * rpvtr_lr_factor
-            if "rpvtr" not in printed_high_lr_keys:
-                print(f"Using {rpvtr_lr_factor}x learning rate for R-PVTR: {key}")
-                printed_high_lr_keys.add("rpvtr")
-
-        elif "fslora" in key:
+        if "fslora" in key:
             fslora_lr_factor = getattr(cfg.SOLVER, 'FSLORA_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fslora_lr_factor
             if "fslora" not in printed_high_lr_keys:
