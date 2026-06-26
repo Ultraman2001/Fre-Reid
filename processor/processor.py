@@ -290,30 +290,6 @@ def do_train(cfg,
                     layer_name = f"Stage{s['lvl']+1}.Blk{s['blk']}"
                     logger.info(f"  {layer_name:<15} {s['sasf_scale']:>6.4f} {s['k3_norm']:>8.2f} {s['k5_norm']:>8.2f}")
 
-            fslora_adapters = [
-                module for module in _model.modules()
-                if getattr(module, 'is_fslora_adapter', False)
-            ]
-            if fslora_adapters:
-                gammas = torch.stack([
-                    module.fslora_gamma.detach().float().view(-1)[0]
-                    for module in fslora_adapters
-                ])
-                freq_weights = torch.stack([
-                    module.fslora_flm.last_freq_weight.detach().float()
-                    for module in fslora_adapters
-                ])
-                logger.info(
-                    "[FSLoRA Monitor] Epoch {}: adapters={}, gamma_mean={:.6f}, gamma_max={:.6f}, freq_w[low/high]=[{:.3f}, {:.3f}]".format(
-                        epoch,
-                        len(fslora_adapters),
-                        gammas.mean().item(),
-                        gammas.max().item(),
-                        freq_weights[:, 0].mean().item(),
-                        freq_weights[:, 1].mean().item(),
-                    )
-                )
-
         if epoch % checkpoint_period == 0:
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
