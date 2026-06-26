@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .backbones.resnet import ResNet, Bottleneck
 import copy
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
@@ -76,6 +77,126 @@ def create_pooling(pooling_type: str):
     else:
         print(f"[Warning] Unknown pooling type '{pooling_type}', using GeM")
         return GeM()
+
+
+class ECABlock(nn.Module):
+    """Efficient channel attention for lightweight local enhancement."""
+
+    def __init__(self, kernel_size=3):
+        super().__init__()
+        if kernel_size % 2 == 0:
+            raise ValueError("ECA kernel size must be odd")
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(
+            1,
+            1,
+            kernel_size=kernel_size,
+            padding=(kernel_size - 1) // 2,
+            bias=False,
+        )
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x).squeeze(-1).transpose(1, 2)
+        y = self.conv(y).transpose(1, 2).unsqueeze(-1)
+        return x * self.sigmoid(y).to(dtype=x.dtype)
+
+
+class HULMBranch(nn.Module):
+    """High-resolution upsampled local branch fused as a bounded residual."""
+
+    is_hulm_module = True
+
+    def __init__(
+        self,
+        global_dim,
+        local_in_dim,
+        hidden_dim=256,
+        num_parts=2,
+        beta_max=0.3,
+        beta_init=-6.0,
+        upsample=True,
+        upsample_factor=2,
+        use_eca=False,
+        eca_kernel=3,
+    ):
+        super().__init__()
+        self.global_dim = int(global_dim)
+        self.local_in_dim = int(local_in_dim)
+        self.hidden_dim = int(hidden_dim)
+        self.num_parts = int(num_parts)
+        self.beta_max = float(beta_max)
+        self.upsample = bool(upsample)
+        self.upsample_factor = int(upsample_factor)
+
+        if self.num_parts <= 0:
+            raise ValueError("MODEL.HULM.NUM_PARTS must be positive")
+        if self.upsample_factor <= 0:
+            raise ValueError("MODEL.HULM.UPSAMPLE_FACTOR must be positive")
+
+        self.reduce = nn.Sequential(
+            nn.Conv2d(self.local_in_dim, self.hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.local_enhance = nn.Sequential(
+            nn.Conv2d(
+                self.hidden_dim,
+                self.hidden_dim,
+                kernel_size=3,
+                padding=1,
+                groups=self.hidden_dim,
+                bias=False,
+            ),
+            nn.BatchNorm2d(self.hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(self.hidden_dim, self.hidden_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(self.hidden_dim),
+            nn.ReLU(inplace=True),
+        )
+        self.eca = ECABlock(eca_kernel) if use_eca else nn.Identity()
+        self.local_proj = nn.Sequential(
+            nn.Linear(self.hidden_dim * self.num_parts, self.global_dim, bias=False),
+            nn.BatchNorm1d(self.global_dim),
+        )
+        self.raw_beta = nn.Parameter(torch.tensor(float(beta_init)))
+        self.raw_beta._no_weight_decay = True
+        self.register_buffer('last_beta', torch.zeros(1), persistent=False)
+        self.register_buffer('last_local_norm', torch.zeros(1), persistent=False)
+        self.register_buffer('last_global_norm', torch.zeros(1), persistent=False)
+
+    def _pool(self, pool_layer, x):
+        if pool_layer is None:
+            pooled = F.adaptive_avg_pool2d(x.float(), 1).to(x.dtype)
+        else:
+            pooled = pool_layer(x)
+        return pooled.flatten(1)
+
+    def forward(self, global_map, local_map, pool_layer):
+        fg = self._pool(pool_layer, global_map)
+
+        x = self.reduce(local_map)
+        if self.upsample and self.upsample_factor != 1:
+            x = F.interpolate(
+                x,
+                size=(x.shape[2] * self.upsample_factor, x.shape[3]),
+                mode='bilinear',
+                align_corners=False,
+            )
+        x = self.local_enhance(x)
+        x = self.eca(x)
+
+        if x.shape[2] % self.num_parts != 0:
+            raise ValueError("HULM local feature height must be divisible by NUM_PARTS")
+        parts = torch.chunk(x, self.num_parts, dim=2)
+        local_feats = [self._pool(pool_layer, part) for part in parts]
+        fl = self.local_proj(torch.cat(local_feats, dim=1))
+
+        beta = self.beta_max * torch.sigmoid(self.raw_beta.float())
+        self.last_beta = beta.detach().view(1)
+        self.last_local_norm = fl.detach().float().norm(dim=1).mean().view(1)
+        self.last_global_norm = fg.detach().float().norm(dim=1).mean().view(1)
+        return fg + beta.to(dtype=fg.dtype) * fl.to(dtype=fg.dtype), fg, fl, beta
 
 
 class StripeTokenInsertion(nn.Module):
@@ -665,6 +786,18 @@ class build_transformer(nn.Module):
         self.pooling = None
         local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
         token_cfg = getattr(local_cfg, 'TOKEN_INSERTION', None) if local_cfg is not None else None
+        hulm_cfg = getattr(cfg.MODEL, 'HULM', None)
+        self.hulm_enabled = bool(getattr(hulm_cfg, 'ENABLED', False))
+        self.hulm_source = str(getattr(hulm_cfg, 'SOURCE', 'stage4')).lower()
+        self.hulm_hidden_dim = int(getattr(hulm_cfg, 'HIDDEN_DIM', 256))
+        self.hulm_num_parts = int(getattr(hulm_cfg, 'NUM_PARTS', 2))
+        self.hulm_beta_max = float(getattr(hulm_cfg, 'BETA_MAX', 0.3))
+        self.hulm_beta_init = float(getattr(hulm_cfg, 'BETA_INIT', -6.0))
+        self.hulm_upsample = bool(getattr(hulm_cfg, 'UPSAMPLE', True))
+        self.hulm_upsample_factor = int(getattr(hulm_cfg, 'UPSAMPLE_FACTOR', 2))
+        self.hulm_use_eca = bool(getattr(hulm_cfg, 'USE_ECA', False))
+        self.hulm_eca_kernel = int(getattr(hulm_cfg, 'ECA_KERNEL', 3))
+        self.hulm = None
         fslora_cfg = getattr(cfg.MODEL, 'FSLORA', None)
         self.fslora_enabled = bool(getattr(fslora_cfg, 'ENABLED', False))
         self.fslora_rank = int(getattr(fslora_cfg, 'RANK', 32))
@@ -727,6 +860,46 @@ class build_transformer(nn.Module):
             pooling_type = getattr(cfg.MODEL, 'POOLING_TYPE', 'gem')
             self.pooling = create_pooling(pooling_type)
             print(f'[Model] Using pooling type: {pooling_type}')
+
+            if self.hulm_enabled:
+                if self.use_sfm:
+                    raise ValueError('HULM and SFM must be evaluated separately')
+                if self.local_stripe_enabled:
+                    raise ValueError('HULM and LOCAL_STRIPE must be evaluated separately')
+                if self.hulm_source not in ('stage4', 'stage2_pre'):
+                    raise ValueError("MODEL.HULM.SOURCE must be 'stage4' or 'stage2_pre'")
+
+                if self.hulm_source == 'stage2_pre':
+                    source_dim = int(getattr(self.base, 'dim', 80)) * 2
+                    upsample = self.hulm_upsample
+                else:
+                    source_dim = self.in_planes
+                    upsample = self.hulm_upsample
+
+                self.hulm = HULMBranch(
+                    global_dim=self.in_planes,
+                    local_in_dim=source_dim,
+                    hidden_dim=self.hulm_hidden_dim,
+                    num_parts=self.hulm_num_parts,
+                    beta_max=self.hulm_beta_max,
+                    beta_init=self.hulm_beta_init,
+                    upsample=upsample,
+                    upsample_factor=self.hulm_upsample_factor,
+                    use_eca=self.hulm_use_eca,
+                    eca_kernel=self.hulm_eca_kernel,
+                )
+                print(
+                    '[Model] HULM enabled: source={}, hidden={}, parts={}, upsample={}, factor={}, beta_max={}, beta_init={}, eca={}'.format(
+                        self.hulm_source,
+                        self.hulm_hidden_dim,
+                        self.hulm_num_parts,
+                        upsample,
+                        self.hulm_upsample_factor,
+                        self.hulm_beta_max,
+                        self.hulm_beta_init,
+                        self.hulm_use_eca,
+                    )
+                )
             
             # SFM 多级聚合 heads
             if self.use_sfm:
@@ -758,6 +931,8 @@ class build_transformer(nn.Module):
             if pretrain_choice == 'imagenet':
                 self.base.load_param(model_path)
                 print('Loading pretrained ImageNet model......from {}'.format(model_path))
+            if self.hulm_enabled:
+                raise ValueError('HULM currently supports the MambaVision backbone only')
 
         self.num_classes = num_classes
         self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
@@ -939,6 +1114,18 @@ class build_transformer(nn.Module):
             pooled = pool_layer(feature_map)
         return pooled.flatten(1)
 
+    def _apply_hulm(self, global_map, stage2_pre_map=None):
+        if self.hulm is None:
+            return self._pool_feature_map(global_map)
+        if self.hulm_source == 'stage2_pre':
+            if stage2_pre_map is None:
+                raise ValueError('HULM SOURCE=stage2_pre requires hulm_stage2_pre from backbone')
+            local_map = stage2_pre_map
+        else:
+            local_map = global_map
+        feat, _, _, _ = self.hulm(global_map, local_map, self.pooling)
+        return feat
+
     def _refine_local_tokens(self, feature_map):
         if self.stripe_token_insertion is not None:
             return self.stripe_token_insertion(feature_map)
@@ -997,17 +1184,28 @@ class build_transformer(nn.Module):
         stacked_cam = torch.cat([cam_label] * 3, dim=0) if cam_label is not None else None
         stacked_view = torch.cat([view_label] * 3, dim=0) if view_label is not None else None
 
-        output = self.base(stacked_img, cam_label=stacked_cam, view_label=stacked_view)
+        output = self.base(
+            stacked_img,
+            cam_label=stacked_cam,
+            view_label=stacked_view,
+            return_hulm_maps=self.hulm is not None,
+        )
+        stage2_pre = None
         if isinstance(output, dict):
             if 'fused_maps' in output:
                 raise ValueError('PAM and SFM must be evaluated separately')
+            stage2_pre = output.get('hulm_stage2_pre', None)
             output = output['backbone_map']
         map_base, map_crop, map_erase = output.chunk(3, dim=0)
+        if stage2_pre is not None:
+            stage2_pre_base = stage2_pre.chunk(3, dim=0)[0]
+        else:
+            stage2_pre_base = None
 
         if self.local_stripe_enabled:
             map_base = self._refine_local_tokens(map_base)
 
-        feat_base = self._pool_feature_map(map_base)
+        feat_base = self._apply_hulm(map_base, stage2_pre_base)
         feat_crop = self._pool_feature_map(map_crop)
         feat_erase = self._pool_feature_map(map_erase)
 
@@ -1031,10 +1229,15 @@ class build_transformer(nn.Module):
 
         if self.is_mambavision or self.is_puzzle:
             # Get backbone output
-            output = self.base(x, cam_label=cam_label, view_label=view_label)
+            output = self.base(
+                x,
+                cam_label=cam_label,
+                view_label=view_label,
+                return_hulm_maps=self.hulm is not None,
+            )
             
             # Check if SFM mode (output is dict) or normal mode (output is tensor)
-            if isinstance(output, dict):
+            if isinstance(output, dict) and 'fused_maps' in output:
                 # SFM mode: hierarchical multi-branch processing
                 backbone_map = output['backbone_map']  # (B, 512, 16, 8)
                 fused_maps = output['fused_maps']     # List of intermediate fused maps
@@ -1088,12 +1291,17 @@ class build_transformer(nn.Module):
                     }
             else:
                 # Normal mode: single tensor output
-                feature_map = output
+                if isinstance(output, dict):
+                    feature_map = output['backbone_map']
+                    stage2_pre_map = output.get('hulm_stage2_pre', None)
+                else:
+                    feature_map = output
+                    stage2_pre_map = None
                 if self.local_stripe_enabled:
                     feature_map = self._refine_local_tokens(feature_map)
                 
                 # Apply pooling
-                global_feat = self._pool_feature_map(feature_map)
+                global_feat = self._apply_hulm(feature_map, stage2_pre_map)
                 
                 feat = self.bottleneck(global_feat)
 

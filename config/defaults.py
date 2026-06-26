@@ -51,6 +51,19 @@ _C.MODEL.COS_LAYER = False
 # Pooling type: 'gem', 'avg', 'max', 'avg_max' (消融实验用)
 _C.MODEL.POOLING_TYPE = 'gem'
 
+# High-resolution Upsampled Local Mamba branch. Disabled by default.
+_C.MODEL.HULM = CN()
+_C.MODEL.HULM.ENABLED = False
+_C.MODEL.HULM.SOURCE = 'stage4'  # stage4, stage2_pre
+_C.MODEL.HULM.HIDDEN_DIM = 256
+_C.MODEL.HULM.NUM_PARTS = 2
+_C.MODEL.HULM.BETA_MAX = 0.3
+_C.MODEL.HULM.BETA_INIT = -6.0
+_C.MODEL.HULM.UPSAMPLE = True
+_C.MODEL.HULM.UPSAMPLE_FACTOR = 2
+_C.MODEL.HULM.USE_ECA = False
+_C.MODEL.HULM.ECA_KERNEL = 3
+
 # Local stripe descriptors on the final feature map.
 _C.MODEL.LOCAL_STRIPE = CN()
 _C.MODEL.LOCAL_STRIPE.ENABLED = False
@@ -227,6 +240,7 @@ _C.SOLVER.LAYER_DECAY = 1.0
 
 # Multiplier for Stage 4 (levels.3) learning rate (default 3.0)
 _C.SOLVER.STAGE4_LR_FACTOR = 3.0
+_C.SOLVER.HULM_LR_FACTOR = 2.0
 
 # Multiplier for SASF (state_fusion) learning rate (default 3.0)
 _C.SOLVER.SASF_LR_FACTOR = 3.0

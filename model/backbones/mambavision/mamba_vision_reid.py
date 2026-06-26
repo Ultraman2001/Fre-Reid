@@ -829,7 +829,7 @@ class MambaVisionLayer(nn.Module):
         self.downsample = None if not downsample else Downsample(dim=dim)
         self.window_size = window_size
 
-    def forward(self, x):
+    def forward(self, x, return_pre_downsample=False):
         B, C, H, W = x.shape
 
         if self.transformer_block:
@@ -862,9 +862,15 @@ class MambaVisionLayer(nn.Module):
             for blk in self.blocks:
                 x = blk(x)
 
+        pre_downsample = x
         if self.downsample is None:
+            if return_pre_downsample:
+                return x, pre_downsample
             return x
-        return self.downsample(x)
+        x = self.downsample(x)
+        if return_pre_downsample:
+            return x, pre_downsample
+        return x
 
 
 class MambaVisionBackbone(nn.Module):
@@ -1042,7 +1048,7 @@ class MambaVisionBackbone(nn.Module):
             nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
 
-    def forward(self, x, cam_label=None, view_label=None, return_features=False):
+    def forward(self, x, cam_label=None, view_label=None, return_features=False, return_hulm_maps=False):
         x = self.patch_embed(x)
         
         # Apply SIE embedding (broadcast from 1x1 to HxW)
@@ -1073,7 +1079,12 @@ class MambaVisionBackbone(nn.Module):
         # Stage 1, 2
         x = self.levels[0](x)  # Stage 1 -> (B, 192, 32, 16)
         feat_s1 = x
-        x = self.levels[1](x)  # Stage 2 -> (B, 384, 16, 8)
+        if return_hulm_maps:
+            x, feat_s2_pre = self.levels[1](x, return_pre_downsample=True)
+        else:
+            x = self.levels[1](x)
+            feat_s2_pre = None
+        # Stage 2 -> (B, 384, 16, 8)
         feat_s2 = x
         
         # Stage 3
@@ -1113,6 +1124,11 @@ class MambaVisionBackbone(nn.Module):
             }
         else:
             # Return SPATIAL MAP (B, C, H, W)
+            if return_hulm_maps:
+                return {
+                    'backbone_map': feat_s4,
+                    'hulm_stage2_pre': feat_s2_pre,
+                }
             return feat_s4
 
     def load_param(self, model_path):
