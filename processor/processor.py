@@ -290,34 +290,6 @@ def do_train(cfg,
                     layer_name = f"Stage{s['lvl']+1}.Blk{s['blk']}"
                     logger.info(f"  {layer_name:<15} {s['sasf_scale']:>6.4f} {s['k3_norm']:>8.2f} {s['k5_norm']:>8.2f}")
 
-            hulm_modules = [
-                module for module in _model.modules()
-                if getattr(module, 'is_hulm_module', False)
-            ]
-            if hulm_modules:
-                betas = torch.stack([
-                    module.last_beta.detach().float().view(-1)[0]
-                    for module in hulm_modules
-                ])
-                global_norms = torch.stack([
-                    module.last_global_norm.detach().float().view(-1)[0]
-                    for module in hulm_modules
-                ])
-                local_norms = torch.stack([
-                    module.last_local_norm.detach().float().view(-1)[0]
-                    for module in hulm_modules
-                ])
-                logger.info(
-                    "[HULM Monitor] Epoch {}: modules={}, beta_mean={:.6f}, beta_max={:.6f}, global_norm={:.3f}, local_norm={:.3f}".format(
-                        epoch,
-                        len(hulm_modules),
-                        betas.mean().item(),
-                        betas.max().item(),
-                        global_norms.mean().item(),
-                        local_norms.mean().item(),
-                    )
-                )
-
         if epoch % checkpoint_period == 0:
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
