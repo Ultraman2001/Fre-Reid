@@ -31,6 +31,25 @@ def make_optimizer(cfg, model, center_criterion):
                 print(f"Using {fslora_lr_factor}x learning rate for FSLoRA adapter: {key}")
                 printed_high_lr_keys.add("fslora")
 
+        elif key.startswith("osnet."):
+            osnet_lr_factor = getattr(cfg.SOLVER, 'OSNET_LR_FACTOR', 1.0)
+            lr = cfg.SOLVER.BASE_LR * osnet_lr_factor
+            if "osnet" not in printed_high_lr_keys:
+                print(f"Using {osnet_lr_factor}x learning rate for OSNet branch: {key}")
+                printed_high_lr_keys.add("osnet")
+
+        elif (
+            key.startswith("osnet_bottleneck")
+            or key.startswith("osnet_classifier")
+            or key.startswith("fusion_bottleneck")
+            or key.startswith("fusion_classifier")
+        ):
+            fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
+            lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
+            if "osnet_fusion_heads" not in printed_high_lr_keys:
+                print(f"Using {fusion_lr_factor}x learning rate for OSNet fusion heads: {key}")
+                printed_high_lr_keys.add("osnet_fusion_heads")
+
         elif "state_fusion" in key or "sasf_scale" in key:
             lr = cfg.SOLVER.BASE_LR * cfg.SOLVER.SASF_LR_FACTOR
             if "state_fusion" not in printed_high_lr_keys:

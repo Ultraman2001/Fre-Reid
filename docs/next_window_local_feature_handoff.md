@@ -46,41 +46,6 @@ Recommended next focus:
 - Prefer OSBBM-aware constraints or branch-consistency losses over new local descriptor branches.
 - A promising low-risk next idea is BA/CA/EA feature consistency or OSBBM mask/visible-token supervision, because these build on the augmentation that is already helping instead of adding another independent local branch.
 
-## Work Continued In This Window (2026-06-26)
-
-Implemented a first low-risk branch-consistency experiment, named PAM-C:
-
-- `SOLVER.PAM_CONSISTENCY_ENABLED`
-- `SOLVER.PAM_CONSISTENCY_WEIGHT`
-- `SOLVER.PAM_CONSISTENCY_MODE`: `pairwise`, `base_anchor`, or `center`
-- `SOLVER.PAM_CONSISTENCY_DETACH_BASE`
-
-Implementation:
-
-- `loss/make_loss.py`: adds cosine feature consistency over PAM BA/CA/EA features after the normal PADE-style ID/triplet loss.
-- `processor/processor.py`: logs `PAM-C[...]` when the consistency term is active.
-- `config/defaults.py`: adds default-off PAM-C config keys.
-- `configs/OCC_Duke/mambavision_tiny_transreid_pam_padeaug_osbbm_consistency_b64k4.yml`: candidate config using current best PAM(w=0.5)+scheduled OSBBM plus PAM-C weight 0.05.
-- `scripts/run_pam_consistency_ablation.sh`: runs baseline no-OSBBM, baseline OSBBM, and PAM-C weights 0.02/0.05/0.10; summary includes `final_minus_best_mAP`.
-
-Recommended run:
-
-```bash
-bash scripts/run_pam_consistency_ablation.sh 0,1 2
-```
-
-Summary-only:
-
-```bash
-bash scripts/run_pam_consistency_ablation.sh --summary-only
-```
-
-Interpretation to watch:
-
-- PAM-C should be judged against both `baseline_no_osbbm` and `baseline_osbbm`.
-- Prefer final epoch stability, not only best mAP.
-- If `pairwise` pulls CA/EA too close to OSBBM-corrupted BA during active epochs, try `center` before adding any new branch.
-
 ## Main Goal Going Forward
 
 Continue improving occluded person re-identification on OCC-Duke by strengthening local or fine-grained features on top of the current MambaVision tiny + PADE-style PAM baseline.
@@ -797,4 +762,63 @@ Use multiple GPUs/jobs:
 
 ```bash
 bash scripts/run_mdb_10groups.sh 0,1 2
+```
+
+---
+
+## Current New Direction: MambaVision + OSNet Descriptor Fusion
+
+Decision on 2026-06-27: move away from more PAM-C style regularization and first test a lightweight feature-fusion route that is clearly different from SFM.
+
+First version scope:
+
+```text
+image
+  -> MambaVision-Tiny descriptor: 512-d
+  -> OSNet descriptor: 512-d
+  -> concat descriptor: 1024-d
+```
+
+Training supervision:
+
+```text
+loss = weighted_mean(
+  Mamba branch ID/triplet,
+  OSNet branch ID/triplet,
+  concat branch ID/triplet
+)
+```
+
+Implemented files:
+
+- `model/backbones/osnet.py`
+  - local OSNet implementation adapted from deep-person-reid, without auto-download
+- `model/make_model.py`
+  - `MambaOSNetFusion`
+  - `MODEL.OSNET_FUSION.ENABLED` wiring
+  - eval returns `backbone`, `osnet`, and `concat`
+- `loss/make_loss.py`
+  - `fusion_mode=osnet` three-branch loss
+- `processor/processor.py`
+  - OSNet fusion loss logging
+  - dynamic multi-branch inference feature collection
+- `solver/make_optimizer.py`
+  - OSNet branch LR factor
+  - OSNet fusion head LR factor
+- `configs/OCC_Duke/mambavision_tiny_osnet_concat_osbbm_b64k4.yml`
+  - first OCC-Duke config, PAM off, scheduled OSBBM on
+- `scripts/run_osnet_fusion_ablation.sh`
+  - runs `mamba_single_osbbm` and `mamba_osnet_concat_w05`
+
+Run:
+
+```bash
+bash scripts/run_osnet_fusion_ablation.sh 0 1
+```
+
+With a local OSNet ImageNet checkpoint:
+
+```bash
+OSNET_PRETRAIN=/workspace/pretrained/osnet_x1_0_imagenet.pth \
+  bash scripts/run_osnet_fusion_ablation.sh 0 1
 ```

@@ -90,6 +90,15 @@ _C.MODEL.MAMBAVISION.SFM_DEPTHS = [1, 1, 1]  # [S1+2, F12+3, F23+4] 各级融合
 _C.MODEL.MAMBAVISION.SFM_DROP_PATH = 0.1  # SFM 模块内部的 DropPath 概率
 _C.MODEL.MAMBAVISION.SFM_POOLING_TYPE = 'gem'  # SFM 分支池化类型 ('gem', 'avg', 'max', 'avg_max')
 
+# Descriptor-level OSNet + MambaVision fusion.
+_C.MODEL.OSNET_FUSION = CN()
+_C.MODEL.OSNET_FUSION.ENABLED = False
+_C.MODEL.OSNET_FUSION.OSNET_TYPE = 'osnet_x1_0'
+_C.MODEL.OSNET_FUSION.PRETRAIN_PATH = ''
+_C.MODEL.OSNET_FUSION.FREEZE_OSNET = False
+_C.MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT = 0.5
+_C.MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT = 1.0
+
 # EMA Setting
 _C.MODEL.EMA = CN()
 _C.MODEL.EMA.ENABLED = False
@@ -196,11 +205,6 @@ _C.SOLVER.CLIP_GRAD_NORM = 1.0
 
 # PAM loss: normalized L_BA + weight * (L_CA + L_EA)
 _C.SOLVER.PAM_AUGMENTED_LOSS_WEIGHT = 1.0
-# Optional feature-level consistency across PAM BA/CA/EA branches.
-_C.SOLVER.PAM_CONSISTENCY_ENABLED = False
-_C.SOLVER.PAM_CONSISTENCY_WEIGHT = 0.0
-_C.SOLVER.PAM_CONSISTENCY_MODE = 'pairwise'  # pairwise, base_anchor, center
-_C.SOLVER.PAM_CONSISTENCY_DETACH_BASE = True
 
 # decay rate of learning rate
 _C.SOLVER.GAMMA = 0.1
@@ -242,6 +246,10 @@ _C.SOLVER.SFM_LAMBDA_AUX = 0.2    # 中间聚合级 (F12, F23) 的损失权重
 
 # Multiplier for SFM module learning rate (SFM is new, use 1.0 by default)
 _C.SOLVER.SFM_LR_FACTOR = 1.0
+
+# Multipliers for descriptor-level OSNet fusion experiments.
+_C.SOLVER.OSNET_LR_FACTOR = 1.0
+_C.SOLVER.OSNET_FUSION_LR_FACTOR = 2.0
 
 # RATR (Ranking-aware Triplet Regularization) 损失配置
 _C.SOLVER.RATR_ENABLED = False    # 是否启用 RATR

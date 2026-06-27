@@ -11,38 +11,6 @@ from .center_loss import CenterLoss
 from .ratr_loss import RATRLoss
 
 
-def _cosine_distance(left, right):
-    return 1.0 - (left * right).sum(dim=1)
-
-
-def _pam_consistency_loss(features, mode='pairwise', detach_base=True):
-    branch_feats = [F.normalize(branch_feat.float(), dim=1) for branch_feat in features[:3]]
-    mode = str(mode).lower()
-
-    if mode == 'pairwise':
-        pairs = ((0, 1), (0, 2), (1, 2))
-        losses = [
-            _cosine_distance(branch_feats[left_idx], branch_feats[right_idx]).mean()
-            for left_idx, right_idx in pairs
-        ]
-        return sum(losses) / len(losses)
-
-    if mode in ('base_anchor', 'ba_anchor'):
-        anchor = branch_feats[0].detach() if detach_base else branch_feats[0]
-        losses = [
-            _cosine_distance(branch_feats[1], anchor).mean(),
-            _cosine_distance(branch_feats[2], anchor).mean(),
-        ]
-        return sum(losses) / len(losses)
-
-    if mode == 'center':
-        center = F.normalize((branch_feats[0] + branch_feats[1] + branch_feats[2]) / 3.0, dim=1).detach()
-        losses = [_cosine_distance(branch_feat, center).mean() for branch_feat in branch_feats]
-        return sum(losses) / len(losses)
-
-    raise ValueError("SOLVER.PAM_CONSISTENCY_MODE must be one of: pairwise, base_anchor, center")
-
-
 def make_loss(cfg, num_classes):    # modified by gu
     sampler = cfg.DATALOADER.SAMPLER
     feat_dim = 2048
@@ -81,6 +49,8 @@ def make_loss(cfg, num_classes):    # modified by gu
                 if isinstance(score, list):
                     use_pam = cfg.INPUT.PAM.ENABLED
                     use_sfm = getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False)
+                    osnet_fusion_cfg = getattr(cfg.MODEL, 'OSNET_FUSION', None)
+                    use_osnet_fusion = bool(getattr(osnet_fusion_cfg, 'ENABLED', False))
 
                     if use_pam:
                         local_cfg = getattr(cfg.MODEL, 'LOCAL_STRIPE', None)
@@ -147,23 +117,49 @@ def make_loss(cfg, num_classes):    # modified by gu
                         total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
                                      cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
 
-                        consistency_enabled = bool(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_ENABLED', False))
-                        consistency_weight = float(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_WEIGHT', 0.0))
-                        if consistency_enabled and consistency_weight > 0:
-                            consistency_mode = str(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_MODE', 'pairwise')).lower()
-                            detach_base = bool(getattr(cfg.SOLVER, 'PAM_CONSISTENCY_DETACH_BASE', True))
-                            consistency_loss = _pam_consistency_loss(
-                                feat[:3],
-                                mode=consistency_mode,
-                                detach_base=detach_base,
-                            )
-                            total_loss = total_loss + consistency_weight * consistency_loss
-                            loss_detail['pam_consistency'] = consistency_loss.item()
-                            loss_detail['pam_consistency_weight'] = consistency_weight
-                            loss_detail['pam_consistency_mode'] = consistency_mode
-
                         return total_loss, loss_detail
                     
+                    if use_osnet_fusion:
+                        if len(score) != 3 or len(feat) != 3:
+                            raise ValueError('OSNET_FUSION loss expects Mamba, OSNet and concat branches')
+
+                        branch_names = ('mamba', 'osnet', 'concat')
+                        branch_weights = (
+                            1.0,
+                            float(getattr(osnet_fusion_cfg, 'OSNET_LOSS_WEIGHT', 0.5)),
+                            float(getattr(osnet_fusion_cfg, 'FUSED_LOSS_WEIGHT', 1.0)),
+                        )
+                        weight_sum = sum(branch_weights)
+                        if weight_sum <= 0:
+                            raise ValueError('OSNET_FUSION branch weights must sum to a positive value')
+
+                        id_losses = []
+                        tri_losses = []
+                        for branch_score, branch_feat in zip(score, feat):
+                            if cfg.MODEL.IF_LABELSMOOTH == 'on':
+                                id_losses.append(xent(branch_score.float(), target))
+                            else:
+                                id_losses.append(F.cross_entropy(branch_score.float(), target))
+                            tri_losses.append(triplet(branch_feat.float(), target)[0])
+
+                        ID_LOSS = sum(w * l for w, l in zip(branch_weights, id_losses)) / weight_sum
+                        TRI_LOSS = sum(w * l for w, l in zip(branch_weights, tri_losses)) / weight_sum
+
+                        total_loss = cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
+                                     cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
+
+                        loss_detail = {
+                            'fusion_mode': 'osnet',
+                            'w_mamba': branch_weights[0],
+                            'w_osnet': branch_weights[1],
+                            'w_concat': branch_weights[2],
+                        }
+                        for name, id_loss, tri_loss in zip(branch_names, id_losses, tri_losses):
+                            loss_detail[f'id_{name}'] = id_loss.item()
+                            loss_detail[f'tri_{name}'] = tri_loss.item()
+
+                        return total_loss, loss_detail
+
                     if use_sfm and len(score) >= 2:
                         # SFM 模式：HAT风格多级聚合损失 (归一化版本)
                         sfm_lambda = getattr(cfg.SOLVER, 'SFM_LAMBDA', 1.0)
@@ -241,6 +237,8 @@ def make_loss(cfg, num_classes):    # modified by gu
                             loss_detail['ratr'] = ratr_loss.item()
                         
                         return total_loss, loss_detail
+
+                    raise ValueError('Unhandled multi-branch loss configuration')
                 else:
                     # 单分支逻辑
                     if cfg.MODEL.IF_LABELSMOOTH == 'on':

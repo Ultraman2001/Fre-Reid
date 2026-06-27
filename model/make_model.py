@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from .backbones.resnet import ResNet, Bottleneck
 import copy
+import os
 from .backbones.vit_pytorch import vit_base_patch16_224_TransReID, vit_small_patch16_224_TransReID, deit_small_patch16_224_TransReID
 from .backbones.mambavision.mamba_vision_reid import (
     MambaVisionMixer,
@@ -9,6 +10,7 @@ from .backbones.mambavision.mamba_vision_reid import (
     mambavision_small_reid,
     mambavision_base_reid,
 )
+from .backbones.osnet import osnet_x1_0, osnet_x0_75, osnet_x0_5, osnet_x0_25, osnet_ibn_x1_0
 from loss.metric_learning import Arcface, Cosface, AMSoftmax, CircleLoss
 
 
@@ -1140,6 +1142,150 @@ class build_transformer(nn.Module):
         print('Loading pretrained model for finetuning from {}'.format(model_path))
 
 
+__factory_osnet = {
+    'osnet_x1_0': osnet_x1_0,
+    'osnet_x0_75': osnet_x0_75,
+    'osnet_x0_5': osnet_x0_5,
+    'osnet_x0_25': osnet_x0_25,
+    'osnet_ibn_x1_0': osnet_ibn_x1_0,
+}
+
+
+class MambaOSNetFusion(nn.Module):
+    """Lightweight descriptor-level fusion of MambaVision and OSNet."""
+
+    def __init__(self, num_classes, camera_num, view_num, cfg, factory):
+        super().__init__()
+        if cfg.INPUT.PAM.ENABLED:
+            raise ValueError('OSNET_FUSION first version expects INPUT.PAM.ENABLED=False')
+        if getattr(cfg.MODEL.MAMBAVISION, 'USE_SFM', False):
+            raise ValueError('OSNET_FUSION and SFM must be evaluated separately')
+
+        fusion_cfg = cfg.MODEL.OSNET_FUSION
+        self.num_classes = num_classes
+        self.ID_LOSS_TYPE = cfg.MODEL.ID_LOSS_TYPE
+        self.neck_feat = cfg.TEST.NECK_FEAT
+        self.cosine_scale = cfg.SOLVER.COSINE_SCALE
+        self.cosine_margin = cfg.SOLVER.COSINE_MARGIN
+
+        self.mamba = build_transformer(num_classes, camera_num, view_num, cfg, factory)
+        self.mamba_dim = self.mamba.in_planes
+
+        osnet_type = str(getattr(fusion_cfg, 'OSNET_TYPE', 'osnet_x1_0'))
+        if osnet_type not in __factory_osnet:
+            raise ValueError('Unknown OSNet type: {}'.format(osnet_type))
+        self.osnet = __factory_osnet[osnet_type](
+            num_classes=num_classes,
+            pretrained=False,
+            loss='triplet',
+        )
+        self.osnet_dim = self.osnet.feature_dim
+
+        osnet_pretrain = str(getattr(fusion_cfg, 'PRETRAIN_PATH', '')).strip()
+        if osnet_pretrain:
+            if not os.path.exists(osnet_pretrain):
+                raise FileNotFoundError('OSNet pretrained weight not found: {}'.format(osnet_pretrain))
+            self.osnet.load_param(osnet_pretrain)
+        else:
+            print('[Model] OSNet fusion branch is randomly initialized; set MODEL.OSNET_FUSION.PRETRAIN_PATH for ImageNet weights')
+
+        if bool(getattr(fusion_cfg, 'FREEZE_OSNET', False)):
+            for param in self.osnet.parameters():
+                param.requires_grad = False
+            print('[Model] OSNet fusion branch frozen')
+
+        self.osnet_bottleneck = nn.BatchNorm1d(self.osnet_dim)
+        self.osnet_bottleneck.bias.requires_grad_(False)
+        self.osnet_bottleneck.apply(weights_init_kaiming)
+        self.osnet_classifier = self._make_classifier(self.osnet_dim)
+
+        self.fusion_dim = self.mamba_dim + self.osnet_dim
+        self.fusion_bottleneck = nn.BatchNorm1d(self.fusion_dim)
+        self.fusion_bottleneck.bias.requires_grad_(False)
+        self.fusion_bottleneck.apply(weights_init_kaiming)
+        self.fusion_classifier = self._make_classifier(self.fusion_dim)
+
+        print(
+            '[Model] Mamba-OSNet fusion enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, fusion=concat'.format(
+                self.mamba_dim,
+                osnet_type,
+                self.osnet_dim,
+            )
+        )
+
+    def _make_classifier(self, in_planes):
+        if self.ID_LOSS_TYPE == 'arcface':
+            return Arcface(in_planes, self.num_classes, s=self.cosine_scale, m=self.cosine_margin)
+        if self.ID_LOSS_TYPE == 'cosface':
+            return Cosface(in_planes, self.num_classes, s=self.cosine_scale, m=self.cosine_margin)
+        if self.ID_LOSS_TYPE == 'amsoftmax':
+            return AMSoftmax(in_planes, self.num_classes, s=self.cosine_scale, m=self.cosine_margin)
+        if self.ID_LOSS_TYPE == 'circle':
+            return CircleLoss(in_planes, self.num_classes, s=self.cosine_scale, m=self.cosine_margin)
+        classifier = nn.Linear(in_planes, self.num_classes, bias=False)
+        classifier.apply(weights_init_classifier)
+        return classifier
+
+    def _classify(self, classifier, feat, label):
+        if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
+            return classifier(feat, label)
+        return classifier(feat)
+
+    def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None):
+        output = self.mamba.base(x, cam_label=cam_label, view_label=view_label)
+        if isinstance(output, dict):
+            raise ValueError('OSNET_FUSION expects a single MambaVision feature map')
+        feature_map = output
+        global_feat = self.mamba._pool_feature_map(feature_map)
+        feat_bn = self.mamba.bottleneck(global_feat)
+        if self.training:
+            score = self.mamba._classify(self.mamba.classifier, feat_bn, label)
+            return score, global_feat, feat_bn
+        return global_feat, feat_bn
+
+    def _forward_osnet_branch(self, x, label=None):
+        global_feat = self.osnet.extract_features(x)
+        feat_bn = self.osnet_bottleneck(global_feat)
+        if self.training:
+            score = self._classify(self.osnet_classifier, feat_bn, label)
+            return score, global_feat, feat_bn
+        return global_feat, feat_bn
+
+    def forward(self, x, label=None, cam_label=None, view_label=None):
+        if self.training:
+            mamba_score, mamba_feat, mamba_bn = self._forward_mamba_branch(
+                x,
+                label=label,
+                cam_label=cam_label,
+                view_label=view_label,
+            )
+            osnet_score, osnet_feat, osnet_bn = self._forward_osnet_branch(x, label=label)
+            fused_feat = torch.cat([mamba_feat, osnet_feat], dim=1)
+            fused_bn = self.fusion_bottleneck(fused_feat)
+            fused_score = self._classify(self.fusion_classifier, fused_bn, label)
+            return [mamba_score, osnet_score, fused_score], [mamba_feat, osnet_feat, fused_feat]
+
+        mamba_feat, mamba_bn = self._forward_mamba_branch(x, cam_label=cam_label, view_label=view_label)
+        osnet_feat, osnet_bn = self._forward_osnet_branch(x)
+        fused_feat = torch.cat([mamba_feat, osnet_feat], dim=1)
+        fused_bn = self.fusion_bottleneck(fused_feat)
+
+        if self.neck_feat == 'after':
+            mamba_out = mamba_bn
+            osnet_out = osnet_bn
+            fused_out = fused_bn
+        else:
+            mamba_out = mamba_feat
+            osnet_out = osnet_feat
+            fused_out = fused_feat
+
+        return {
+            'backbone': mamba_out,
+            'osnet': osnet_out,
+            'concat': fused_out,
+        }
+
+
 __factory_T_type = {
     'vit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
     'deit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
@@ -1156,7 +1302,11 @@ __factory_T_type = {
 
 def make_model(cfg, num_class, camera_num, view_num):
     model = None
-    if cfg.MODEL.NAME == 'transformer':
+    osnet_fusion_enabled = bool(getattr(getattr(cfg.MODEL, 'OSNET_FUSION', None), 'ENABLED', False))
+    if osnet_fusion_enabled:
+        model = MambaOSNetFusion(num_class, camera_num, view_num, cfg, __factory_T_type)
+        print('===========building Mamba-OSNet fusion===========')
+    elif cfg.MODEL.NAME == 'transformer':
         model = build_transformer(num_class, camera_num, view_num, cfg, __factory_T_type)
         print('===========building transformer===========')
     else:

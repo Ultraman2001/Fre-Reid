@@ -23,6 +23,13 @@ MODEL:
     GLOBAL_STAGES: [2, 3]
     USE_SFM: False
     USE_FINE_BRANCH: False
+  OSNET_FUSION:
+    ENABLED: True
+    OSNET_TYPE: 'osnet_x1_0'
+    PRETRAIN_PATH: ''
+    FREEZE_OSNET: False
+    OSNET_LOSS_WEIGHT: 0.5
+    FUSED_LOSS_WEIGHT: 1.0
 
 INPUT:
   SIZE_TRAIN: [256, 128]
@@ -33,11 +40,7 @@ INPUT:
   PIXEL_MEAN: [0.485, 0.456, 0.406]
   PIXEL_STD: [0.229, 0.224, 0.225]
   PAM:
-    ENABLED: True
-    AUG_MODE: 'pade'
-    CROP_PADDING: 30
-    CROP_SCALE: [0.08, 1.0]
-    CROP_RATIO: [0.75, 1.3333]
+    ENABLED: False
   OSBBM:
     ENABLED: True
     PROB: 0.25
@@ -78,12 +81,9 @@ SOLVER:
   MARGIN: 0.3
   STAGE4_LR_FACTOR: 2.0
   SASF_LR_FACTOR: 1.0
+  OSNET_LR_FACTOR: 1.0
+  OSNET_FUSION_LR_FACTOR: 2.0
   CLIP_GRAD_NORM: 10.0
-  PAM_AUGMENTED_LOSS_WEIGHT: 0.5
-  PAM_CONSISTENCY_ENABLED: True
-  PAM_CONSISTENCY_WEIGHT: 0.05
-  PAM_CONSISTENCY_MODE: 'pairwise'
-  PAM_CONSISTENCY_DETACH_BASE: True
   RATR_ENABLED: False
 
 TEST:
@@ -94,4 +94,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_pam-padeaug-pamw05-osbbm-m2-c21-120-p20-on10-pamc-w005-b64k4'
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_osnet_concat_osbbm-b64k4'
