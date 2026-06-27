@@ -1142,7 +1142,7 @@ class build_transformer(nn.Module):
         print('Loading pretrained model for finetuning from {}'.format(model_path))
 
 
-__factory_osnet = {
+_factory_osnet = {
     'osnet_x1_0': osnet_x1_0,
     'osnet_x0_75': osnet_x0_75,
     'osnet_x0_5': osnet_x0_5,
@@ -1172,9 +1172,9 @@ class MambaOSNetFusion(nn.Module):
         self.mamba_dim = self.mamba.in_planes
 
         osnet_type = str(getattr(fusion_cfg, 'OSNET_TYPE', 'osnet_x1_0'))
-        if osnet_type not in __factory_osnet:
+        if osnet_type not in _factory_osnet:
             raise ValueError('Unknown OSNet type: {}'.format(osnet_type))
-        self.osnet = __factory_osnet[osnet_type](
+        self.osnet = _factory_osnet[osnet_type](
             num_classes=num_classes,
             pretrained=False,
             loss='triplet',
