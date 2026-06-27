@@ -1285,6 +1285,25 @@ class MambaOSNetFusion(nn.Module):
             'concat': fused_out,
         }
 
+    def load_param(self, trained_path):
+        param_dict = torch.load(trained_path, map_location='cpu')
+        if isinstance(param_dict, dict) and 'state_dict' in param_dict:
+            param_dict = param_dict['state_dict']
+        own_state = self.state_dict()
+        matched, skipped = 0, []
+        for key, value in param_dict.items():
+            key = key.replace('module.', '')
+            if key in own_state and own_state[key].shape == value.shape:
+                own_state[key].copy_(value)
+                matched += 1
+            else:
+                skipped.append(key)
+        print('Loading pretrained model from {} (matched={}, skipped={})'.format(
+            trained_path,
+            matched,
+            len(skipped),
+        ))
+
 
 __factory_T_type = {
     'vit_base_patch16_224_TransReID': vit_base_patch16_224_TransReID,
