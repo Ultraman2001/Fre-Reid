@@ -42,7 +42,7 @@ INPUT:
   PAM:
     ENABLED: False
   OSBBM:
-    ENABLED: True
+    ENABLED: False
     PROB: 0.25
     NUM_BLOCKS: 8
     NUM_MIX_BLOCKS: 2
@@ -94,4 +94,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_osnet_concat_osbbm-b64k4'
+OUTPUT_DIR: './logs/OCC-Duke/mambavision_tiny_osnet_concat-b64k4'

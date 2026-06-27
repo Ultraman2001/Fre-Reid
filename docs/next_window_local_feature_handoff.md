@@ -805,10 +805,10 @@ Implemented files:
 - `solver/make_optimizer.py`
   - OSNet branch LR factor
   - OSNet fusion head LR factor
-- `configs/OCC_Duke/mambavision_tiny_osnet_concat_osbbm_b64k4.yml`
-  - first OCC-Duke config, PAM off, scheduled OSBBM on
+- `configs/OCC_Duke/mambavision_tiny_osnet_concat_b64k4.yml`
+  - first OCC-Duke config, PAM off, OSBBM off
 - `scripts/run_osnet_fusion_ablation.sh`
-  - runs `mamba_single_osbbm` and `mamba_osnet_concat_w05`
+  - runs `mamba_single_clean` and `mamba_osnet_concat_w05`
 
 Run:
 

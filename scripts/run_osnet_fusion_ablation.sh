@@ -4,7 +4,7 @@ set -euo pipefail
 
 GPU_IDS="${1:-${CUDA_VISIBLE_DEVICES:-0}}"
 MAX_JOBS="${2:-2}"
-CONFIG="${CONFIG:-configs/OCC_Duke/mambavision_tiny_osnet_concat_osbbm_b64k4.yml}"
+CONFIG="${CONFIG:-configs/OCC_Duke/mambavision_tiny_osnet_concat_b64k4.yml}"
 OUTPUT_BASE="${OUTPUT_BASE:-./logs/OCC-Duke/osnet_fusion_ablation}"
 OSNET_PRETRAIN="${OSNET_PRETRAIN:-}"
 
@@ -16,7 +16,7 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "mamba_single_osbbm|False|0.0|0.0"
+  "mamba_single_clean|False|0.0|0.0"
   "mamba_osnet_concat_w05|True|0.5|1.0"
 )
 
