@@ -370,9 +370,14 @@ def do_inference(cfg,
 
     model.eval()
     img_path_list = []
+    branch_norm_betas = [
+        float(beta)
+        for beta in getattr(getattr(cfg, 'TEST', None), 'BRANCH_NORM_BETAS', [])
+    ]
     
     # Collect features for all reported branches.
     all_feats = {}
+    branch_norm_stats = {'mamba': [], 'osnet': []}
     all_pids = []
     all_camids = []
 
@@ -388,6 +393,31 @@ def do_inference(cfg,
                 for key in feat.keys():
                     all_feats.setdefault(key, [])
                     all_feats[key].append(feat[key].cpu())
+                if 'backbone' in feat and 'osnet' in feat:
+                    mamba_feat = feat['backbone']
+                    osnet_feat = feat['osnet']
+                    branch_norm_stats['mamba'].append(torch.norm(mamba_feat, p=2, dim=1).cpu())
+                    branch_norm_stats['osnet'].append(torch.norm(osnet_feat, p=2, dim=1).cpu())
+                    branch_norm_concat = torch.cat(
+                        [
+                            F.normalize(mamba_feat, p=2, dim=1),
+                            F.normalize(osnet_feat, p=2, dim=1),
+                        ],
+                        dim=1,
+                    )
+                    all_feats.setdefault('branch_norm_concat', [])
+                    all_feats['branch_norm_concat'].append(branch_norm_concat.cpu())
+                    for beta in branch_norm_betas:
+                        beta_key = 'weighted_branch_norm_concat_b{:03d}'.format(int(round(beta * 100)))
+                        weighted_branch_norm_concat = torch.cat(
+                            [
+                                F.normalize(mamba_feat, p=2, dim=1),
+                                beta * F.normalize(osnet_feat, p=2, dim=1),
+                            ],
+                            dim=1,
+                        )
+                        all_feats.setdefault(beta_key, [])
+                        all_feats[beta_key].append(weighted_branch_norm_concat.cpu())
             else:
                 # Normal mode: only concat available
                 all_feats.setdefault('concat', [])
@@ -401,6 +431,21 @@ def do_inference(cfg,
     import numpy as np
     all_pids = np.array(all_pids)
     all_camids = np.array(all_camids)
+
+    if branch_norm_stats['mamba'] and branch_norm_stats['osnet']:
+        mamba_norm = torch.cat(branch_norm_stats['mamba'], dim=0)
+        osnet_norm = torch.cat(branch_norm_stats['osnet'], dim=0)
+        norm_ratio = mamba_norm / osnet_norm.clamp_min(1e-12)
+        logger.info(
+            "Feature norm stats - Mamba: mean={:.4f}, std={:.4f}; OSNet: mean={:.4f}, std={:.4f}; M/O ratio: mean={:.4f}, std={:.4f}".format(
+                mamba_norm.mean().item(),
+                mamba_norm.std(unbiased=False).item(),
+                osnet_norm.mean().item(),
+                osnet_norm.std(unbiased=False).item(),
+                norm_ratio.mean().item(),
+                norm_ratio.std(unbiased=False).item(),
+            )
+        )
     
     # Evaluate each feature type
     results = {}

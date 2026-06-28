@@ -98,6 +98,19 @@ _C.MODEL.OSNET_FUSION.PRETRAIN_PATH = ''
 _C.MODEL.OSNET_FUSION.FREEZE_OSNET = False
 _C.MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT = 0.5
 _C.MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT = 1.0
+_C.MODEL.OSNET_FUSION.FUSION_TYPE = 'descriptor'  # descriptor / te_dual
+_C.MODEL.OSNET_FUSION.FUSION_NORM = 'none'  # none / branch / weighted_branch
+_C.MODEL.OSNET_FUSION.FUSION_BETA = 1.0     # OSNet branch scale for weighted_branch
+_C.MODEL.OSNET_FUSION.TOKEN_GATE_REDUCTION = 4
+_C.MODEL.OSNET_FUSION.MAP_GATE_REDUCTION = 8
+_C.MODEL.OSNET_FUSION.TOKEN_INIT_SCALE = 0.1
+_C.MODEL.OSNET_FUSION.MAP_INIT_SCALE = 0.1
+_C.MODEL.OSNET_FUSION.MSTFI_ENABLED = False
+_C.MODEL.OSNET_FUSION.MSTFI_NUM_STRIPES = 4
+_C.MODEL.OSNET_FUSION.MSTFI_DEPTH = 1
+_C.MODEL.OSNET_FUSION.MSTFI_NUM_HEADS = 8
+_C.MODEL.OSNET_FUSION.MSTFI_MLP_RATIO = 2.0
+_C.MODEL.OSNET_FUSION.MSTFI_REFINE_SCALE = 0.1
 
 # EMA Setting
 _C.MODEL.EMA = CN()
@@ -276,6 +289,8 @@ _C.TEST.FEAT_NORM = 'yes'
 _C.TEST.FEAT_CONCAT = False
 # Feature mode for testing: 'fused' (default), 'main', 'fine', or 'concat'
 _C.TEST.FEAT_MODE = 'fused'
+# Extra eval-only weighted branch-normalized concat betas for OSNet fusion.
+_C.TEST.BRANCH_NORM_BETAS = [0.25, 0.5, 0.63, 0.75]
 
 # Name for saving the distmat after testing.
 _C.TEST.DIST_MAT = "dist_mat.npy"

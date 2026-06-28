@@ -43,6 +43,13 @@ def make_optimizer(cfg, model, center_criterion):
             or key.startswith("osnet_classifier")
             or key.startswith("fusion_bottleneck")
             or key.startswith("fusion_classifier")
+            or key.startswith("osnet_token_proj")
+            or key.startswith("token_gate")
+            or key.startswith("token_scale")
+            or key.startswith("osnet_map_proj")
+            or key.startswith("map_gate")
+            or key.startswith("map_scale")
+            or key.startswith("mstfi_refiner")
         ):
             fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
