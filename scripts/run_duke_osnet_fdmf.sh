@@ -38,6 +38,11 @@ declare -a EXPERIMENTS=(
   "fdmf_raw_no_mamba|0.5|1.0|64|5|3|dynamic|raw_fdmf|0|0.1|True"
   "fdmf_raw_fixed_filter|0.5|1.0|64|5|3|fixed|raw_fdmf|1|0.1|True"
   "fdmf_only|0.5|1.0|64|5|3|dynamic|fdmf_only|1|0.1|True"
+  "fdmf_mamba_fdmf|0.5|1.0|64|5|3|dynamic|mamba_fdmf|1|0.1|True"
+  "fdmf_raw_unidir|0.5|1.0|64|5|3|dynamic|raw_fdmf|1|0.1|False"
+  "fdmf_raw_depth2|0.5|1.0|64|5|3|dynamic|raw_fdmf|2|0.1|True"
+  "fdmf_raw_c32|0.5|1.0|32|5|3|dynamic|raw_fdmf|1|0.1|True"
+  "fdmf_raw_c128|0.5|1.0|128|5|3|dynamic|raw_fdmf|1|0.1|True"
 )
 
 run_experiment() {
