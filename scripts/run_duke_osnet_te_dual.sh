@@ -33,7 +33,8 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "te_dual_osw1_fuw1|te_dual|1.0|1.0|0.1|0.1|True|4"
+  "te_dual_no_mstfi_osw1_fuw1|te_dual|1.0|1.0|0.1|0.1|False|4"
+  "te_dual_mstfi_osw1_fuw1|te_dual|1.0|1.0|0.1|0.1|True|4"
 )
 
 run_experiment() {
@@ -229,13 +230,13 @@ for path, dialect in ((summary_tsv, "excel-tab"), (summary_csv, "excel")):
 
 print()
 print(
-    f"{'name':<20} {'status':<12} {'type':<8} {'tok':<5} {'map':<5} {'mstfi':<6} "
+    f"{'name':<30} {'status':<12} {'type':<8} {'tok':<5} {'map':<5} {'mstfi':<6} "
     f"{'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
     f"{'best_ep':<8} {'best_mAP':<8} {'best_R1':<8}"
 )
 for row in rows:
     print(
-        f"{row['name']:<20} {row['status']:<12} {row['fusion_type']:<8} "
+        f"{row['name']:<30} {row['status']:<12} {row['fusion_type']:<8} "
         f"{row['token_scale']:<5} {row['map_scale']:<5} {row['mstfi_enabled']:<6} "
         f"{row['last_epoch']:<8} {row['last_mAP']:<8} {row['last_R1']:<8} "
         f"{row['best_epoch']:<8} {row['best_mAP']:<8} {row['best_R1']:<8}"
