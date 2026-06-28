@@ -33,16 +33,19 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "fdmf_osw05_fuw1|0.5|1.0|64|5|3|1|0.1"
-  "fdmf_osw1_fuw1|1.0|1.0|64|5|3|1|0.1"
+  "fdmf_raw_osw05_fuw1|0.5|1.0|64|5|3|dynamic|raw_fdmf|1|0.1|True"
+  "fdmf_raw_osw1_fuw1|1.0|1.0|64|5|3|dynamic|raw_fdmf|1|0.1|True"
+  "fdmf_raw_no_mamba|0.5|1.0|64|5|3|dynamic|raw_fdmf|0|0.1|True"
+  "fdmf_raw_fixed_filter|0.5|1.0|64|5|3|fixed|raw_fdmf|1|0.1|True"
+  "fdmf_only|0.5|1.0|64|5|3|dynamic|fdmf_only|1|0.1|True"
 )
 
 run_experiment() {
   local idx="$1"
   local spec="$2"
-  local name osnet_weight fused_weight compressed low_kernel high_kernel mamba_depth init_scale
+  local name osnet_weight fused_weight compressed low_kernel high_kernel filter_type fused_form mamba_depth init_scale bidirectional
 
-  IFS='|' read -r name osnet_weight fused_weight compressed low_kernel high_kernel mamba_depth init_scale <<< "${spec}"
+  IFS='|' read -r name osnet_weight fused_weight compressed low_kernel high_kernel filter_type fused_form mamba_depth init_scale bidirectional <<< "${spec}"
 
   local gpu="${GPUS[$((idx % ${#GPUS[@]}))]}"
   local output_dir="${OUTPUT_BASE}/${name}"
@@ -52,7 +55,7 @@ run_experiment() {
     osnet_pretrain_opts=(MODEL.OSNET_FUSION.PRETRAIN_PATH "'${OSNET_PRETRAIN}'")
   fi
 
-  echo "[DukeOSNetFDMF] GPU=${gpu} EXP=${name} output=${output_dir} osnet_w=${osnet_weight} fused_w=${fused_weight} comp=${compressed} low_k=${low_kernel} high_k=${high_kernel} depth=${mamba_depth} init=${init_scale}"
+  echo "[DukeOSNetFDMF] GPU=${gpu} EXP=${name} output=${output_dir} osnet_w=${osnet_weight} fused_w=${fused_weight} comp=${compressed} low_k=${low_kernel} high_k=${high_kernel} filter=${filter_type} form=${fused_form} depth=${mamba_depth} init=${init_scale} bidir=${bidirectional}"
 
   CUDA_VISIBLE_DEVICES="${gpu}" python train.py --config_file "${CONFIG}" \
     MODEL.DEVICE_ID "'${gpu}'" \
@@ -64,8 +67,12 @@ run_experiment() {
     MODEL.OSNET_FUSION.FDMF_COMPRESSED_CHANNELS "${compressed}" \
     MODEL.OSNET_FUSION.FDMF_LOWPASS_KERNEL "${low_kernel}" \
     MODEL.OSNET_FUSION.FDMF_HIGHPASS_KERNEL "${high_kernel}" \
+    MODEL.OSNET_FUSION.FDMF_FILTER_TYPE "'${filter_type}'" \
+    MODEL.OSNET_FUSION.FDMF_FUSED_FORM "'${fused_form}'" \
     MODEL.OSNET_FUSION.FDMF_MAMBA_DEPTH "${mamba_depth}" \
     MODEL.OSNET_FUSION.FDMF_MAMBA_INIT_SCALE "${init_scale}" \
+    MODEL.OSNET_FUSION.FDMF_MAMBA_BIDIRECTIONAL "${bidirectional}" \
+    TEST.FEAT_MODE "'fdmf'" \
     "${osnet_pretrain_opts[@]}" \
     OUTPUT_DIR "${output_dir}"
 }
@@ -89,7 +96,8 @@ specs = [line for line in os.environ.get("DUKE_OSNET_FDMF_SPECS", "").splitlines
 
 fields = [
     "name", "status", "osnet_weight", "fused_weight",
-    "compressed", "low_kernel", "high_kernel", "mamba_depth", "init_scale",
+    "compressed", "low_kernel", "high_kernel", "filter_type", "fused_form",
+    "mamba_depth", "init_scale", "bidirectional",
     "last_epoch", "last_mAP", "last_R1", "last_R5", "last_R10",
     "best_epoch", "best_mAP", "best_R1", "best_R5", "best_R10",
     "log_file",
@@ -163,8 +171,11 @@ for spec in specs:
         compressed,
         low_kernel,
         high_kernel,
+        filter_type,
+        fused_form,
         mamba_depth,
         init_scale,
+        bidirectional,
     ) = spec.split("|")
     output_dir = os.path.join(output_base, name)
     train_log = os.path.join(output_dir, "train_log.txt")
@@ -178,8 +189,11 @@ for spec in specs:
         "compressed": compressed,
         "low_kernel": low_kernel,
         "high_kernel": high_kernel,
+        "filter_type": filter_type,
+        "fused_form": fused_form,
         "mamba_depth": mamba_depth,
         "init_scale": init_scale,
+        "bidirectional": bidirectional,
     }
 
     if not os.path.exists(log_file):
@@ -217,15 +231,15 @@ for path, dialect in ((summary_tsv, "excel-tab"), (summary_csv, "excel")):
 
 print()
 print(
-    f"{'name':<18} {'status':<12} {'osw':<5} {'fuw':<5} {'comp':<5} "
-    f"{'lk':<3} {'hk':<3} {'dep':<4} {'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
+    f"{'name':<24} {'status':<12} {'osw':<5} {'fuw':<5} {'filter':<8} {'form':<9} "
+    f"{'dep':<4} {'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
     f"{'best_ep':<8} {'best_mAP':<8} {'best_R1':<8}"
 )
 for row in rows:
     print(
-        f"{row['name']:<18} {row['status']:<12} {row['osnet_weight']:<5} "
-        f"{row['fused_weight']:<5} {row['compressed']:<5} {row['low_kernel']:<3} "
-        f"{row['high_kernel']:<3} {row['mamba_depth']:<4} {row['last_epoch']:<8} "
+        f"{row['name']:<24} {row['status']:<12} {row['osnet_weight']:<5} "
+        f"{row['fused_weight']:<5} {row['filter_type']:<8} {row['fused_form']:<9} "
+        f"{row['mamba_depth']:<4} {row['last_epoch']:<8} "
         f"{row['last_mAP']:<8} {row['last_R1']:<8} {row['best_epoch']:<8} "
         f"{row['best_mAP']:<8} {row['best_R1']:<8}"
     )

@@ -1204,7 +1204,7 @@ class SameScaleFrequencyMambaFusion(nn.Module):
     """FreqFusion-style same-scale low/high decomposition followed by Mamba fusion.
 
     The first version intentionally fuses only Mamba low-frequency semantics and
-    OSNet high-frequency details:
+    OSNet residual high-pass details:
         F_init = Conv1x1(cat(low(Mamba), high(OSNet)))
         F_out  = SpatialMamba(F_init)
     """
@@ -1217,6 +1217,7 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         lowpass_kernel=5,
         highpass_kernel=3,
         use_hamming=True,
+        filter_type='dynamic',
         mamba_depth=1,
         mamba_d_state=8,
         mamba_d_conv=3,
@@ -1227,8 +1228,11 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         super().__init__()
         if lowpass_kernel % 2 == 0 or highpass_kernel % 2 == 0:
             raise ValueError('FDMF low/high pass kernels must be odd')
-        if mamba_depth < 1:
-            raise ValueError('FDMF_MAMBA_DEPTH must be >= 1')
+        if mamba_depth < 0:
+            raise ValueError('FDMF_MAMBA_DEPTH must be >= 0')
+        self.filter_type = str(filter_type).lower()
+        if self.filter_type not in ('dynamic', 'fixed'):
+            raise ValueError("FDMF_FILTER_TYPE must be 'dynamic' or 'fixed'")
 
         self.dim = dim
         self.lowpass_kernel = int(lowpass_kernel)
@@ -1321,6 +1325,12 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         )
         return (patches * mask.to(dtype=x.dtype)).sum(dim=2)
 
+    @staticmethod
+    def _fixed_lowpass(x, kernel_size):
+        pad = kernel_size // 2
+        x_pad = F.pad(x, (pad, pad, pad, pad), mode='replicate')
+        return F.avg_pool2d(x_pad, kernel_size=kernel_size, stride=1)
+
     def forward(self, mamba_map, osnet_map):
         if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
             osnet_map = F.interpolate(
@@ -1331,20 +1341,23 @@ class SameScaleFrequencyMambaFusion(nn.Module):
             )
         osnet_map = self.osnet_map_proj(osnet_map)
 
-        context = self.context_compress(torch.cat([mamba_map, osnet_map], dim=1))
-        low_mask = self._normalize_kernel(
-            self.lowpass_encoder(context),
-            self.lowpass_kernel,
-            self.lowpass_window,
-        )
-        high_mask = self._normalize_kernel(
-            self.highpass_encoder(context),
-            self.highpass_kernel,
-            self.highpass_window,
-        )
-
-        mamba_low = self._dynamic_filter(mamba_map, low_mask, self.lowpass_kernel)
-        osnet_smooth = self._dynamic_filter(osnet_map, high_mask, self.highpass_kernel)
+        if self.filter_type == 'fixed':
+            mamba_low = self._fixed_lowpass(mamba_map, self.lowpass_kernel)
+            osnet_smooth = self._fixed_lowpass(osnet_map, self.highpass_kernel)
+        else:
+            context = self.context_compress(torch.cat([mamba_map, osnet_map], dim=1))
+            low_mask = self._normalize_kernel(
+                self.lowpass_encoder(context),
+                self.lowpass_kernel,
+                self.lowpass_window,
+            )
+            high_mask = self._normalize_kernel(
+                self.highpass_encoder(context),
+                self.highpass_kernel,
+                self.highpass_window,
+            )
+            mamba_low = self._dynamic_filter(mamba_map, low_mask, self.lowpass_kernel)
+            osnet_smooth = self._dynamic_filter(osnet_map, high_mask, self.highpass_kernel)
         osnet_high = osnet_map - osnet_smooth
 
         fused_map = self.fuse_proj(torch.cat([mamba_low, osnet_high], dim=1))
@@ -1380,6 +1393,9 @@ class MambaOSNetFusion(nn.Module):
             raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be 'none' for fdmf")
         if self.fusion_beta < 0:
             raise ValueError('MODEL.OSNET_FUSION.FUSION_BETA must be non-negative')
+        self.fdmf_fused_form = str(getattr(fusion_cfg, 'FDMF_FUSED_FORM', 'raw_fdmf')).lower()
+        if self.fdmf_fused_form not in ('mamba_fdmf', 'raw_fdmf', 'fdmf_only'):
+            raise ValueError("MODEL.OSNET_FUSION.FDMF_FUSED_FORM must be 'mamba_fdmf', 'raw_fdmf', or 'fdmf_only'")
 
         self.mamba = build_transformer(num_classes, camera_num, view_num, cfg, factory)
         self.mamba_dim = self.mamba.in_planes
@@ -1422,6 +1438,7 @@ class MambaOSNetFusion(nn.Module):
                 lowpass_kernel=int(getattr(fusion_cfg, 'FDMF_LOWPASS_KERNEL', 5)),
                 highpass_kernel=int(getattr(fusion_cfg, 'FDMF_HIGHPASS_KERNEL', 3)),
                 use_hamming=bool(getattr(fusion_cfg, 'FDMF_HAMMING_WINDOW', True)),
+                filter_type=str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
                 mamba_depth=int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
                 mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
                 mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
@@ -1429,7 +1446,12 @@ class MambaOSNetFusion(nn.Module):
                 mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
                 mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
             )
-            self.fusion_dim = self.mamba_dim * 2
+            if self.fdmf_fused_form == 'raw_fdmf':
+                self.fusion_dim = self.mamba_dim + self.osnet_dim + self.mamba_dim
+            elif self.fdmf_fused_form == 'mamba_fdmf':
+                self.fusion_dim = self.mamba_dim * 2
+            else:
+                self.fusion_dim = self.mamba_dim
         else:
             self.fusion_dim = self.mamba_dim + self.osnet_dim
         self.fusion_bottleneck = nn.BatchNorm1d(self.fusion_dim)
@@ -1439,12 +1461,14 @@ class MambaOSNetFusion(nn.Module):
 
         if self.fusion_type == 'fdmf':
             print(
-                '[Model] Mamba-OSNet FDMF enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, osnet_map_dim={}, fusion_dim={}, bidirectional={}'.format(
+                '[Model] Mamba-OSNet FDMF enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, osnet_map_dim={}, fusion_dim={}, form={}, filter={}, bidirectional={}'.format(
                     self.mamba_dim,
                     osnet_type,
                     self.osnet_dim,
                     self.osnet_map_dim,
                     self.fusion_dim,
+                    self.fdmf_fused_form,
+                    str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
                     bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
                 )
             )
@@ -1490,10 +1514,14 @@ class MambaOSNetFusion(nn.Module):
             osnet_feat_n = self.fusion_beta * osnet_feat_n
         return torch.cat([mamba_feat_n, osnet_feat_n], dim=1)
 
-    def _make_fdmf_fused_feat(self, mamba_feat, mamba_map, osnet_map):
+    def _make_fdmf_fused_feat(self, mamba_feat, osnet_feat, mamba_map, osnet_map):
         fdmf_map = self.fdmf_refiner(mamba_map, osnet_map)
         fdmf_feat = self.mamba._pool_feature_map(fdmf_map)
-        return torch.cat([mamba_feat, fdmf_feat], dim=1)
+        if self.fdmf_fused_form == 'raw_fdmf':
+            return torch.cat([mamba_feat, osnet_feat, fdmf_feat], dim=1)
+        if self.fdmf_fused_form == 'mamba_fdmf':
+            return torch.cat([mamba_feat, fdmf_feat], dim=1)
+        return fdmf_feat
 
     def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None, return_map=False):
         output = self.mamba.base(x, cam_label=cam_label, view_label=view_label)
@@ -1541,7 +1569,7 @@ class MambaOSNetFusion(nn.Module):
             if use_fdmf:
                 mamba_score, mamba_feat, mamba_bn, mamba_map = mamba_out
                 osnet_score, osnet_feat, osnet_bn, osnet_map = osnet_out
-                fused_feat = self._make_fdmf_fused_feat(mamba_feat, mamba_map, osnet_map)
+                fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
             else:
                 mamba_score, mamba_feat, mamba_bn = mamba_out
                 osnet_score, osnet_feat, osnet_bn = osnet_out
@@ -1560,7 +1588,7 @@ class MambaOSNetFusion(nn.Module):
         if use_fdmf:
             mamba_feat, mamba_bn, mamba_map = mamba_out
             osnet_feat, osnet_bn, osnet_map = osnet_out
-            fused_feat = self._make_fdmf_fused_feat(mamba_feat, mamba_map, osnet_map)
+            fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
         else:
             mamba_feat, mamba_bn = mamba_out
             osnet_feat, osnet_bn = osnet_out
@@ -1576,11 +1604,16 @@ class MambaOSNetFusion(nn.Module):
             osnet_out = osnet_feat
             fused_out = fused_feat
 
-        return {
+        output = {
             'backbone': mamba_out,
             'osnet': osnet_out,
-            'concat': fused_out,
         }
+        if use_fdmf:
+            output['raw_concat'] = torch.cat([mamba_out, osnet_out], dim=1)
+            output['fdmf'] = fused_out
+        else:
+            output['concat'] = fused_out
+        return output
 
     def load_param(self, trained_path):
         param_dict = torch.load(trained_path, map_location='cpu')

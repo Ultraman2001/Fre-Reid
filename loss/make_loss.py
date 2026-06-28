@@ -121,9 +121,11 @@ def make_loss(cfg, num_classes):    # modified by gu
                     
                     if use_osnet_fusion:
                         if len(score) != 3 or len(feat) != 3:
-                            raise ValueError('OSNET_FUSION loss expects Mamba, OSNet and concat branches')
+                            raise ValueError('OSNET_FUSION loss expects Mamba, OSNet and fused branches')
 
-                        branch_names = ('mamba', 'osnet', 'concat')
+                        fusion_type = str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
+                        fused_branch_name = 'fdmf' if fusion_type == 'fdmf' else 'concat'
+                        branch_names = ('mamba', 'osnet', fused_branch_name)
                         branch_weights = (
                             1.0,
                             float(getattr(osnet_fusion_cfg, 'OSNET_LOSS_WEIGHT', 0.5)),
@@ -150,9 +152,11 @@ def make_loss(cfg, num_classes):    # modified by gu
 
                         loss_detail = {
                             'fusion_mode': 'osnet',
+                            'fusion_type': fusion_type,
                             'w_mamba': branch_weights[0],
                             'w_osnet': branch_weights[1],
                             'w_concat': branch_weights[2],
+                            'w_fdmf': branch_weights[2],
                         }
                         for name, id_loss, tri_loss in zip(branch_names, id_losses, tri_losses):
                             loss_detail[f'id_{name}'] = id_loss.item()

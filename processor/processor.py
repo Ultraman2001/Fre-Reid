@@ -33,6 +33,63 @@ def _osbbm_active_for_epoch(osbbm_cfg, epoch, max_epochs):
     raise ValueError("INPUT.OSBBM.SCHEDULE must be 'always', 'range', or 'cycle'")
 
 
+def _select_eval_feature(cfg, feat):
+    if not isinstance(feat, dict):
+        return feat
+
+    feat_mode = str(getattr(getattr(cfg, 'TEST', None), 'FEAT_MODE', 'concat')).lower()
+    if feat_mode in feat:
+        return feat[feat_mode]
+    for fallback in ('fdmf', 'concat', 'raw_concat', 'backbone'):
+        if fallback in feat:
+            return feat[fallback]
+    raise KeyError('No usable feature key found in model output: {}'.format(sorted(feat.keys())))
+
+
+def _cosine_with_padding(x, y):
+    if x.shape[1] < y.shape[1]:
+        x = F.pad(x, (0, y.shape[1] - x.shape[1]))
+    elif y.shape[1] < x.shape[1]:
+        y = F.pad(y, (0, x.shape[1] - y.shape[1]))
+    return F.cosine_similarity(x, y, dim=1).mean().item()
+
+
+def _fdmf_training_stats(cfg, feat):
+    osnet_fusion_cfg = getattr(getattr(cfg, 'MODEL', None), 'OSNET_FUSION', None)
+    if not bool(getattr(osnet_fusion_cfg, 'ENABLED', False)):
+        return None
+    if str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower() != 'fdmf':
+        return None
+    if not isinstance(feat, list) or len(feat) != 3:
+        return None
+
+    mamba_feat = feat[0].detach().float()
+    osnet_feat = feat[1].detach().float()
+    fused_feat = feat[2].detach().float()
+    mamba_dim = mamba_feat.shape[1]
+    osnet_dim = osnet_feat.shape[1]
+    fused_form = str(getattr(osnet_fusion_cfg, 'FDMF_FUSED_FORM', 'raw_fdmf')).lower()
+
+    if fused_form == 'fdmf_only':
+        fdmf_feat = fused_feat
+    elif fused_form == 'mamba_fdmf':
+        fdmf_feat = fused_feat[:, mamba_dim:]
+    elif fused_feat.shape[1] >= mamba_dim + osnet_dim:
+        fdmf_feat = fused_feat[:, mamba_dim + osnet_dim:]
+    else:
+        return None
+
+    raw_concat = torch.cat([mamba_feat, osnet_feat], dim=1)
+    stats = {
+        'mamba_norm': torch.norm(mamba_feat, p=2, dim=1).mean().item(),
+        'fdmf_norm': torch.norm(fdmf_feat, p=2, dim=1).mean().item(),
+        'cos_mamba_fdmf': F.cosine_similarity(mamba_feat, fdmf_feat, dim=1).mean().item()
+        if mamba_feat.shape[1] == fdmf_feat.shape[1] else 0.0,
+        'cos_fused_raw': _cosine_with_padding(fused_feat, raw_concat),
+    }
+    return stats
+
+
 def do_train(cfg,
              model,
              center_criterion,
@@ -174,7 +231,6 @@ def do_train(cfg,
                 loss, loss_detail = loss_result
             else:
                 loss, loss_detail = loss_result, None
-
             scaler.scale(loss).backward()
 
             # Add Gradient Clipping (Configurable)
@@ -206,6 +262,7 @@ def do_train(cfg,
 
             torch.cuda.synchronize()
             if (n_iter + 1) % log_period == 0:
+                fdmf_stats = _fdmf_training_stats(cfg, feat)
                 # 基础日志
                 log_msg = "Epoch[{}] Iteration[{}/{}] Loss: {:.3f}, Acc: {:.3f}, Base Lr: {:.2e}".format(
                     epoch, (n_iter + 1), len(train_loader),
@@ -228,16 +285,26 @@ def do_train(cfg,
                                 loss_detail['tri_local'],
                             )
                     elif loss_detail.get('fusion_mode') == 'osnet':
+                        fused_name = str(loss_detail.get('fusion_type', 'descriptor')).upper()
+                        if fused_name == 'DESCRIPTOR':
+                            fused_name = 'CONCAT'
                         log_msg += " | OSFusion[w={:.1f}/{:.1f}/{:.1f}]".format(
                             loss_detail.get('w_mamba', 1.0),
                             loss_detail.get('w_osnet', 0.5),
                             loss_detail.get('w_concat', 1.0),
                         )
-                        for name in ('mamba', 'osnet', 'concat'):
+                        for name in ('mamba', 'osnet', fused_name.lower()):
                             log_msg += " | {}[ID={:.2f}, Tri={:.4f}]".format(
                                 name.upper(),
                                 loss_detail.get(f'id_{name}', 0.0),
                                 loss_detail.get(f'tri_{name}', 0.0),
+                            )
+                        if fdmf_stats is not None:
+                            log_msg += " | FDMFStats[M_norm={:.3f}, F_norm={:.3f}, cos(M,F)={:.3f}, cos(Fused,RawCat)={:.3f}]".format(
+                                fdmf_stats['mamba_norm'],
+                                fdmf_stats['fdmf_norm'],
+                                fdmf_stats['cos_mamba_fdmf'],
+                                fdmf_stats['cos_fused_raw'],
                             )
                     else:
                         s_lambda = loss_detail.get('sfm_lambda', 0.0)
@@ -330,9 +397,7 @@ def do_train(cfg,
                         camids = camids.to(device)
                         target_view = target_view.to(device)
                         feat = eval_model(img, cam_label=camids, view_label=target_view)
-                        # Handle dict output (SFM mode) - use concat for training validation
-                        if isinstance(feat, dict):
-                            feat = feat['concat']
+                        feat = _select_eval_feature(cfg, feat)
                         evaluator.update((feat, vid, camid))
                 cmc, mAP, _, _, _, _, _ = evaluator.compute()
                 logger.info(f"{desc} Results - Epoch: {epoch}")
@@ -419,7 +484,7 @@ def do_inference(cfg,
                         all_feats.setdefault(beta_key, [])
                         all_feats[beta_key].append(weighted_branch_norm_concat.cpu())
             else:
-                # Normal mode: only concat available
+                # Normal mode: only one descriptor is available.
                 all_feats.setdefault('concat', [])
                 all_feats['concat'].append(feat.cpu())
             
@@ -469,10 +534,10 @@ def do_inference(cfg,
         for r in [1, 5, 10]:
             logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
     
-    # Return concat results for backward compatibility
-    if 'concat' in results:
-        return results['concat']['cmc'][0], results['concat']['cmc'][4]
-    else:
-        return 0.0, 0.0
+    preferred_feat = str(getattr(getattr(cfg, 'TEST', None), 'FEAT_MODE', 'concat')).lower()
+    for key in (preferred_feat, 'fdmf', 'concat', 'raw_concat', 'backbone'):
+        if key in results:
+            return results[key]['cmc'][0], results[key]['cmc'][4]
+    return 0.0, 0.0
 
 
