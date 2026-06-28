@@ -1152,47 +1152,8 @@ _factory_osnet = {
 }
 
 
-class MSTFILiteRefiner(nn.Module):
-    """Lightweight global/local residual refinement for fused feature maps."""
-
-    def __init__(self, dim, num_stripes=4, depth=1, num_heads=8, mlp_ratio=2.0, refine_scale=0.1):
-        super().__init__()
-        self.num_stripes = max(int(num_stripes), 1)
-        self.refine_scale = nn.Parameter(torch.ones(1) * float(refine_scale))
-        self.refine_scale._no_weight_decay = True
-        if dim % int(num_heads) != 0:
-            raise ValueError('MODEL.OSNET_FUSION.MSTFI_NUM_HEADS must divide fusion feature dim')
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim,
-            nhead=int(num_heads),
-            dim_feedforward=int(dim * float(mlp_ratio)),
-            dropout=0.0,
-            activation='gelu',
-            batch_first=True,
-            norm_first=True,
-        )
-        self.pre_norm = nn.LayerNorm(dim)
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=max(int(depth), 1))
-        self.out_norm = nn.LayerNorm(dim)
-
-    def forward(self, feature_map):
-        dtype = feature_map.dtype
-        global_token = F.adaptive_avg_pool2d(feature_map.float(), 1).flatten(1)
-        stripes = torch.chunk(feature_map.float(), self.num_stripes, dim=2)
-        local_tokens = [
-            F.adaptive_avg_pool2d(stripe, 1).flatten(1)
-            for stripe in stripes
-        ]
-        local_tokens = torch.stack(local_tokens, dim=1)
-        tokens = torch.cat([global_token.unsqueeze(1), local_tokens], dim=1)
-        context = self.encoder(self.pre_norm(tokens))
-        context = self.out_norm(context)
-        refined = context[:, 0] + context[:, 1:].mean(dim=1)
-        return (global_token + self.refine_scale.float() * refined).to(dtype)
-
-
 class MambaOSNetFusion(nn.Module):
-    """MambaVision + OSNet fusion with descriptor and TE-style dual fusion options."""
+    """MambaVision + OSNet descriptor-level fusion."""
 
     def __init__(self, num_classes, camera_num, view_num, cfg, factory):
         super().__init__()
@@ -1210,8 +1171,8 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_type = str(getattr(fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
         self.fusion_norm = str(getattr(fusion_cfg, 'FUSION_NORM', 'none')).lower()
         self.fusion_beta = float(getattr(fusion_cfg, 'FUSION_BETA', 1.0))
-        if self.fusion_type not in ('descriptor', 'te_dual'):
-            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be one of: descriptor, te_dual")
+        if self.fusion_type != 'descriptor':
+            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE now supports only 'descriptor'")
         if self.fusion_norm not in ('none', 'branch', 'weighted_branch'):
             raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be one of: none, branch, weighted_branch")
         if self.fusion_beta < 0:
@@ -1229,7 +1190,6 @@ class MambaOSNetFusion(nn.Module):
             loss='triplet',
         )
         self.osnet_dim = self.osnet.feature_dim
-        self.osnet_map_dim = self.osnet.conv5.conv.out_channels
 
         osnet_pretrain = str(getattr(fusion_cfg, 'PRETRAIN_PATH', '')).strip()
         if osnet_pretrain:
@@ -1249,80 +1209,19 @@ class MambaOSNetFusion(nn.Module):
         self.osnet_bottleneck.apply(weights_init_kaiming)
         self.osnet_classifier = self._make_classifier(self.osnet_dim)
 
-        self.fusion_dim = (
-            self.mamba_dim * 2
-            if self.fusion_type == 'te_dual'
-            else self.mamba_dim + self.osnet_dim
-        )
-        if self.fusion_type == 'te_dual':
-            token_reduction = int(getattr(fusion_cfg, 'TOKEN_GATE_REDUCTION', 4))
-            map_reduction = int(getattr(fusion_cfg, 'MAP_GATE_REDUCTION', 8))
-            token_hidden = max(self.mamba_dim * 4 // max(token_reduction, 1), 64)
-            map_hidden = max(self.mamba_dim // max(map_reduction, 1), 32)
-
-            self.osnet_token_proj = (
-                nn.Identity()
-                if self.osnet_dim == self.mamba_dim
-                else nn.Linear(self.osnet_dim, self.mamba_dim, bias=False)
-            )
-            self.token_gate = nn.Sequential(
-                nn.Linear(self.mamba_dim * 4, token_hidden, bias=False),
-                nn.ReLU(inplace=True),
-                nn.Linear(token_hidden, self.mamba_dim, bias=True),
-                nn.Sigmoid(),
-            )
-            nn.init.zeros_(self.token_gate[-2].weight)
-            nn.init.zeros_(self.token_gate[-2].bias)
-            self.token_scale = nn.Parameter(
-                torch.ones(1) * float(getattr(fusion_cfg, 'TOKEN_INIT_SCALE', 0.1))
-            )
-            self.token_scale._no_weight_decay = True
-
-            self.osnet_map_proj = nn.Sequential(
-                nn.Conv2d(self.osnet_map_dim, self.mamba_dim, 1, bias=False),
-                nn.BatchNorm2d(self.mamba_dim),
-            )
-            self.map_gate = nn.Sequential(
-                nn.Conv2d(self.mamba_dim * 3, map_hidden, 1, bias=False),
-                nn.BatchNorm2d(map_hidden),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(map_hidden, self.mamba_dim, 1, bias=True),
-                nn.Sigmoid(),
-            )
-            nn.init.zeros_(self.map_gate[-2].weight)
-            nn.init.zeros_(self.map_gate[-2].bias)
-            self.map_scale = nn.Parameter(
-                torch.ones(1) * float(getattr(fusion_cfg, 'MAP_INIT_SCALE', 0.1))
-            )
-            self.map_scale._no_weight_decay = True
-
-            self.mstfi_enabled = bool(getattr(fusion_cfg, 'MSTFI_ENABLED', False))
-            if self.mstfi_enabled:
-                self.mstfi_refiner = MSTFILiteRefiner(
-                    self.mamba_dim,
-                    num_stripes=int(getattr(fusion_cfg, 'MSTFI_NUM_STRIPES', 4)),
-                    depth=int(getattr(fusion_cfg, 'MSTFI_DEPTH', 1)),
-                    num_heads=int(getattr(fusion_cfg, 'MSTFI_NUM_HEADS', 8)),
-                    mlp_ratio=float(getattr(fusion_cfg, 'MSTFI_MLP_RATIO', 2.0)),
-                    refine_scale=float(getattr(fusion_cfg, 'MSTFI_REFINE_SCALE', 0.1)),
-                )
-            else:
-                self.mstfi_refiner = None
-
+        self.fusion_dim = self.mamba_dim + self.osnet_dim
         self.fusion_bottleneck = nn.BatchNorm1d(self.fusion_dim)
         self.fusion_bottleneck.bias.requires_grad_(False)
         self.fusion_bottleneck.apply(weights_init_kaiming)
         self.fusion_classifier = self._make_classifier(self.fusion_dim)
 
         print(
-            '[Model] Mamba-OSNet fusion enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_type={}, fusion_norm={}, beta={:.2f}, mstfi={}'.format(
+            '[Model] Mamba-OSNet descriptor fusion enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_norm={}, beta={:.2f}'.format(
                 self.mamba_dim,
                 osnet_type,
                 self.osnet_dim,
-                self.fusion_type,
                 self.fusion_norm,
                 self.fusion_beta,
-                getattr(self, 'mstfi_enabled', False),
             )
         )
 
@@ -1357,58 +1256,7 @@ class MambaOSNetFusion(nn.Module):
             osnet_feat_n = self.fusion_beta * osnet_feat_n
         return torch.cat([mamba_feat_n, osnet_feat_n], dim=1)
 
-    def _make_te_token_feat(self, mamba_feat, osnet_feat):
-        osnet_feat = self.osnet_token_proj(osnet_feat)
-        mamba_norm = self._normalize_feature(mamba_feat)
-        osnet_norm = self._normalize_feature(osnet_feat)
-        gate_input = torch.cat(
-            [
-                mamba_norm,
-                osnet_norm,
-                mamba_norm * osnet_norm,
-                (mamba_norm - osnet_norm).abs(),
-            ],
-            dim=1,
-        )
-        gate = self.token_gate(gate_input.float()).to(mamba_feat.dtype)
-        return mamba_feat + self.token_scale.to(mamba_feat.dtype) * gate * osnet_feat
-
-    def _make_te_map_feat(self, mamba_map, osnet_map):
-        if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
-            osnet_map = F.interpolate(
-                osnet_map,
-                size=mamba_map.shape[-2:],
-                mode='bilinear',
-                align_corners=False,
-            )
-        osnet_map = self.osnet_map_proj(osnet_map)
-        mamba_norm = self._normalize_feature(mamba_map)
-        osnet_norm = self._normalize_feature(osnet_map)
-        gate = self.map_gate(
-            torch.cat(
-                [
-                    mamba_norm,
-                    osnet_norm,
-                    (mamba_norm - osnet_norm).abs(),
-                ],
-                dim=1,
-            ).float()
-        ).to(mamba_map.dtype)
-        fused_map = mamba_map + self.map_scale.to(mamba_map.dtype).view(1, 1, 1, 1) * gate * osnet_map
-        if self.mstfi_refiner is not None:
-            return self.mstfi_refiner(fused_map)
-        return self.mamba._pool_feature_map(fused_map)
-
-    def _make_fused_feat(self, mamba_feat, osnet_feat, mamba_map=None, osnet_map=None):
-        if self.fusion_type == 'descriptor':
-            return self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
-        if mamba_map is None or osnet_map is None:
-            raise ValueError('TE dual fusion requires both MambaVision and OSNet feature maps')
-        token_feat = self._make_te_token_feat(mamba_feat, osnet_feat)
-        map_feat = self._make_te_map_feat(mamba_map, osnet_map)
-        return torch.cat([token_feat, map_feat], dim=1)
-
-    def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None, return_map=False):
+    def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None):
         output = self.mamba.base(x, cam_label=cam_label, view_label=view_label)
         if isinstance(output, dict):
             raise ValueError('OSNET_FUSION expects a single MambaVision feature map')
@@ -1417,14 +1265,10 @@ class MambaOSNetFusion(nn.Module):
         feat_bn = self.mamba.bottleneck(global_feat)
         if self.training:
             score = self.mamba._classify(self.mamba.classifier, feat_bn, label)
-            if return_map:
-                return score, global_feat, feat_bn, feature_map
             return score, global_feat, feat_bn
-        if return_map:
-            return global_feat, feat_bn, feature_map
         return global_feat, feat_bn
 
-    def _forward_osnet_branch(self, x, label=None, return_map=False):
+    def _forward_osnet_branch(self, x, label=None):
         feature_map = self.osnet.featuremaps(x)
         global_feat = self.osnet.global_avgpool(feature_map)
         global_feat = global_feat.view(global_feat.size(0), -1)
@@ -1433,52 +1277,34 @@ class MambaOSNetFusion(nn.Module):
         feat_bn = self.osnet_bottleneck(global_feat)
         if self.training:
             score = self._classify(self.osnet_classifier, feat_bn, label)
-            if return_map:
-                return score, global_feat, feat_bn, feature_map
             return score, global_feat, feat_bn
-        if return_map:
-            return global_feat, feat_bn, feature_map
         return global_feat, feat_bn
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.training:
-            need_maps = self.fusion_type == 'te_dual'
             mamba_out = self._forward_mamba_branch(
                 x,
                 label=label,
                 cam_label=cam_label,
                 view_label=view_label,
-                return_map=need_maps,
             )
-            osnet_out = self._forward_osnet_branch(x, label=label, return_map=need_maps)
-            if need_maps:
-                mamba_score, mamba_feat, mamba_bn, mamba_map = mamba_out
-                osnet_score, osnet_feat, osnet_bn, osnet_map = osnet_out
-            else:
-                mamba_score, mamba_feat, mamba_bn = mamba_out
-                osnet_score, osnet_feat, osnet_bn = osnet_out
-                mamba_map, osnet_map = None, None
-            fused_feat = self._make_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
+            osnet_out = self._forward_osnet_branch(x, label=label)
+            mamba_score, mamba_feat, mamba_bn = mamba_out
+            osnet_score, osnet_feat, osnet_bn = osnet_out
+            fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
             fused_bn = self.fusion_bottleneck(fused_feat)
             fused_score = self._classify(self.fusion_classifier, fused_bn, label)
             return [mamba_score, osnet_score, fused_score], [mamba_feat, osnet_feat, fused_feat]
 
-        need_maps = self.fusion_type == 'te_dual'
         mamba_out = self._forward_mamba_branch(
             x,
             cam_label=cam_label,
             view_label=view_label,
-            return_map=need_maps,
         )
-        osnet_out = self._forward_osnet_branch(x, return_map=need_maps)
-        if need_maps:
-            mamba_feat, mamba_bn, mamba_map = mamba_out
-            osnet_feat, osnet_bn, osnet_map = osnet_out
-        else:
-            mamba_feat, mamba_bn = mamba_out
-            osnet_feat, osnet_bn = osnet_out
-            mamba_map, osnet_map = None, None
-        fused_feat = self._make_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
+        osnet_out = self._forward_osnet_branch(x)
+        mamba_feat, mamba_bn = mamba_out
+        osnet_feat, osnet_bn = osnet_out
+        fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         fused_bn = self.fusion_bottleneck(fused_feat)
 
         if self.neck_feat == 'after':
