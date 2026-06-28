@@ -1162,9 +1162,11 @@ class SameScaleFrequencyMambaBlock(nn.Module):
         init_scale=0.1,
         d_state=8,
         d_conv=3,
+        bidirectional=True,
     ):
         super().__init__()
         hidden_dim = max(int(dim * mlp_ratio), dim)
+        self.bidirectional = bidirectional
         self.norm1 = nn.LayerNorm(dim)
         self.mixer = MambaVisionMixer(
             d_model=dim,
@@ -1187,7 +1189,13 @@ class SameScaleFrequencyMambaBlock(nn.Module):
     def forward(self, feature_map):
         b, c, h, w = feature_map.shape
         seq = feature_map.flatten(2).transpose(1, 2).contiguous()
-        seq = seq + self.gamma1 * self.mixer(self.norm1(seq), H=h, W=w)
+        seq_norm = self.norm1(seq)
+        mixed = self.mixer(seq_norm, H=h, W=w)
+        if self.bidirectional:
+            rev_norm = torch.flip(seq_norm, dims=(1,)).contiguous()
+            mixed_rev = self.mixer(rev_norm, H=h, W=w)
+            mixed = 0.5 * (mixed + torch.flip(mixed_rev, dims=(1,)))
+        seq = seq + self.gamma1 * mixed
         seq = seq + self.gamma2 * self.mlp(self.norm2(seq))
         return seq.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
@@ -1213,6 +1221,7 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         mamba_d_state=8,
         mamba_d_conv=3,
         mamba_init_scale=0.1,
+        mamba_bidirectional=True,
         mlp_ratio=2.0,
     ):
         super().__init__()
@@ -1261,6 +1270,7 @@ class SameScaleFrequencyMambaFusion(nn.Module):
                 init_scale=mamba_init_scale,
                 d_state=mamba_d_state,
                 d_conv=mamba_d_conv,
+                bidirectional=mamba_bidirectional,
             )
             for _ in range(mamba_depth)
         ])
@@ -1416,6 +1426,7 @@ class MambaOSNetFusion(nn.Module):
                 mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
                 mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
                 mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
+                mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
                 mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
             )
             self.fusion_dim = self.mamba_dim * 2
@@ -1428,12 +1439,13 @@ class MambaOSNetFusion(nn.Module):
 
         if self.fusion_type == 'fdmf':
             print(
-                '[Model] Mamba-OSNet FDMF enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, osnet_map_dim={}, fusion_dim={}'.format(
+                '[Model] Mamba-OSNet FDMF enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, osnet_map_dim={}, fusion_dim={}, bidirectional={}'.format(
                     self.mamba_dim,
                     osnet_type,
                     self.osnet_dim,
                     self.osnet_map_dim,
                     self.fusion_dim,
+                    bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
                 )
             )
         else:
