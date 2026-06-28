@@ -33,7 +33,7 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "te_dual_osw1_fuw1|te_dual|1.0|1.0|0.1|0.1|1|4"
+  "te_dual_osw1_fuw1|te_dual|1.0|1.0|0.1|0.1|True|4"
 )
 
 run_experiment() {
@@ -46,12 +46,26 @@ run_experiment() {
   local gpu="${GPUS[$((idx % ${#GPUS[@]}))]}"
   local output_dir="${OUTPUT_BASE}/${name}"
   local osnet_pretrain_opts=()
+  local mstfi_cfg
 
   if [ -n "${OSNET_PRETRAIN}" ]; then
     osnet_pretrain_opts=(MODEL.OSNET_FUSION.PRETRAIN_PATH "'${OSNET_PRETRAIN}'")
   fi
 
-  echo "[DukeOSNetTEDual] GPU=${gpu} EXP=${name} output=${output_dir} type=${fusion_type} osnet_w=${osnet_weight} fused_w=${fused_weight} token_s=${token_scale} map_s=${map_scale} mstfi=${mstfi_enabled}"
+  case "${mstfi_enabled}" in
+    1|true|True|TRUE|yes|Yes|YES)
+      mstfi_cfg="True"
+      ;;
+    0|false|False|FALSE|no|No|NO)
+      mstfi_cfg="False"
+      ;;
+    *)
+      echo "[DukeOSNetTEDual] Invalid mstfi flag: ${mstfi_enabled}. Use True/False or 1/0."
+      exit 1
+      ;;
+  esac
+
+  echo "[DukeOSNetTEDual] GPU=${gpu} EXP=${name} output=${output_dir} type=${fusion_type} osnet_w=${osnet_weight} fused_w=${fused_weight} token_s=${token_scale} map_s=${map_scale} mstfi=${mstfi_cfg}"
 
   CUDA_VISIBLE_DEVICES="${gpu}" python train.py --config_file "${CONFIG}" \
     MODEL.DEVICE_ID "'${gpu}'" \
@@ -62,7 +76,7 @@ run_experiment() {
     MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT "${fused_weight}" \
     MODEL.OSNET_FUSION.TOKEN_INIT_SCALE "${token_scale}" \
     MODEL.OSNET_FUSION.MAP_INIT_SCALE "${map_scale}" \
-    MODEL.OSNET_FUSION.MSTFI_ENABLED "${mstfi_enabled}" \
+    MODEL.OSNET_FUSION.MSTFI_ENABLED "${mstfi_cfg}" \
     MODEL.OSNET_FUSION.MSTFI_NUM_STRIPES "${stripes}" \
     "${osnet_pretrain_opts[@]}" \
     OUTPUT_DIR "${output_dir}"
