@@ -58,7 +58,7 @@ def _fdmf_training_stats(cfg, feat):
     osnet_fusion_cfg = getattr(getattr(cfg, 'MODEL', None), 'OSNET_FUSION', None)
     if not bool(getattr(osnet_fusion_cfg, 'ENABLED', False)):
         return None
-    if str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower() != 'fdmf':
+    if str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower() not in ('fdmf', 'dwt_fdmf'):
         return None
     if not isinstance(feat, list) or len(feat) != 3:
         return None

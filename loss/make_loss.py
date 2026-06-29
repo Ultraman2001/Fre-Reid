@@ -124,7 +124,7 @@ def make_loss(cfg, num_classes):    # modified by gu
                             raise ValueError('OSNET_FUSION loss expects Mamba, OSNet and fused branches')
 
                         fusion_type = str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
-                        fused_branch_name = 'fdmf' if fusion_type == 'fdmf' else 'concat'
+                        fused_branch_name = 'fdmf' if fusion_type in ('fdmf', 'dwt_fdmf') else 'concat'
                         branch_names = ('mamba', 'osnet', fused_branch_name)
                         branch_weights = (
                             1.0,

@@ -1366,6 +1366,141 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         return fused_map
 
 
+class HaarDWT2D(nn.Module):
+    """Parameter-free orthogonal Haar DWT/IDWT for feature maps."""
+
+    @staticmethod
+    def dwt(x):
+        h, w = x.shape[-2:]
+        pad_h = h % 2
+        pad_w = w % 2
+        if pad_h or pad_w:
+            x = F.pad(x, (0, pad_w, 0, pad_h), mode='replicate')
+        x00 = x[:, :, 0::2, 0::2]
+        x01 = x[:, :, 0::2, 1::2]
+        x10 = x[:, :, 1::2, 0::2]
+        x11 = x[:, :, 1::2, 1::2]
+        ll = (x00 + x01 + x10 + x11) * 0.5
+        lh = (x00 - x01 + x10 - x11) * 0.5
+        hl = (x00 + x01 - x10 - x11) * 0.5
+        hh = (x00 - x01 - x10 + x11) * 0.5
+        return ll, lh, hl, hh, (h, w)
+
+    @staticmethod
+    def idwt(ll, lh, hl, hh, out_size=None):
+        x00 = (ll + lh + hl + hh) * 0.5
+        x01 = (ll - lh + hl - hh) * 0.5
+        x10 = (ll + lh - hl - hh) * 0.5
+        x11 = (ll - lh - hl + hh) * 0.5
+        b, c, h, w = ll.shape
+        x = ll.new_zeros((b, c, h * 2, w * 2))
+        x[:, :, 0::2, 0::2] = x00
+        x[:, :, 0::2, 1::2] = x01
+        x[:, :, 1::2, 0::2] = x10
+        x[:, :, 1::2, 1::2] = x11
+        if out_size is not None:
+            x = x[:, :, :out_size[0], :out_size[1]]
+        return x.contiguous()
+
+
+class DWTFrequencyMambaFusion(nn.Module):
+    """Orthogonal wavelet high-frequency injection followed by Mamba fusion."""
+
+    def __init__(
+        self,
+        dim,
+        osnet_dim,
+        compressed_channels=64,
+        mamba_depth=1,
+        mamba_d_state=8,
+        mamba_d_conv=3,
+        mamba_init_scale=0.1,
+        mamba_bidirectional=True,
+        mlp_ratio=2.0,
+        residual_init=0.1,
+        high_gate=True,
+    ):
+        super().__init__()
+        if mamba_depth < 0:
+            raise ValueError('FDMF_MAMBA_DEPTH must be >= 0')
+        self.dim = dim
+        self.high_gate = bool(high_gate)
+        self.osnet_map_proj = (
+            nn.Identity()
+            if osnet_dim == dim
+            else nn.Sequential(
+                nn.Conv2d(osnet_dim, dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(dim),
+            )
+        )
+        self.high_proj = nn.Sequential(
+            nn.Conv2d(dim * 3, compressed_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(compressed_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(compressed_channels, dim * 3, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim * 3),
+        )
+        self.high_context = nn.Sequential(
+            nn.Conv2d(dim * 3, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU(inplace=True),
+        )
+        self.high_gate_proj = nn.Sequential(
+            nn.Conv2d(dim * 2, compressed_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(compressed_channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(compressed_channels, dim * 3, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.residual_scale = nn.Parameter(torch.ones(1) * float(residual_init))
+        self.residual_scale._no_weight_decay = True
+        self.mamba_blocks = nn.ModuleList([
+            SameScaleFrequencyMambaBlock(
+                dim,
+                mlp_ratio=mlp_ratio,
+                init_scale=mamba_init_scale,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                bidirectional=mamba_bidirectional,
+            )
+            for _ in range(mamba_depth)
+        ])
+
+        self.osnet_map_proj.apply(weights_init_kaiming)
+        self.high_proj.apply(weights_init_kaiming)
+        self.high_context.apply(weights_init_kaiming)
+        self.high_gate_proj.apply(weights_init_kaiming)
+        nn.init.zeros_(self.high_proj[-1].weight)
+        nn.init.zeros_(self.high_proj[-1].bias)
+        nn.init.zeros_(self.high_gate_proj[-2].weight)
+        nn.init.zeros_(self.high_gate_proj[-2].bias)
+
+    def forward(self, mamba_map, osnet_map):
+        if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
+            osnet_map = F.interpolate(
+                osnet_map,
+                size=mamba_map.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        osnet_map = self.osnet_map_proj(osnet_map)
+
+        m_ll, _, _, _, out_size = HaarDWT2D.dwt(mamba_map)
+        _, o_lh, o_hl, o_hh, _ = HaarDWT2D.dwt(osnet_map)
+        high = self.high_proj(torch.cat([o_lh, o_hl, o_hh], dim=1))
+        if self.high_gate:
+            high_summary = self.high_context(high)
+            high = high * self.high_gate_proj(torch.cat([m_ll, high_summary], dim=1))
+        high_lh, high_hl, high_hh = high.chunk(3, dim=1)
+
+        zero_ll = torch.zeros_like(m_ll)
+        high_residual = HaarDWT2D.idwt(zero_ll, high_lh, high_hl, high_hh, out_size)
+        fused_map = mamba_map + self.residual_scale.to(dtype=mamba_map.dtype) * high_residual
+        for block in self.mamba_blocks:
+            fused_map = block(fused_map)
+        return fused_map
+
+
 class MambaOSNetFusion(nn.Module):
     """MambaVision + OSNet fusion."""
 
@@ -1385,12 +1520,12 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_type = str(getattr(fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
         self.fusion_norm = str(getattr(fusion_cfg, 'FUSION_NORM', 'none')).lower()
         self.fusion_beta = float(getattr(fusion_cfg, 'FUSION_BETA', 1.0))
-        if self.fusion_type not in ('descriptor', 'fdmf'):
-            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be 'descriptor' or 'fdmf'")
+        if self.fusion_type not in ('descriptor', 'fdmf', 'dwt_fdmf'):
+            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be 'descriptor', 'fdmf', or 'dwt_fdmf'")
         if self.fusion_norm not in ('none', 'branch', 'weighted_branch'):
             raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be one of: none, branch, weighted_branch")
-        if self.fusion_type == 'fdmf' and self.fusion_norm != 'none':
-            raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be 'none' for fdmf")
+        if self.fusion_type in ('fdmf', 'dwt_fdmf') and self.fusion_norm != 'none':
+            raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be 'none' for fdmf/dwt_fdmf")
         if self.fusion_beta < 0:
             raise ValueError('MODEL.OSNET_FUSION.FUSION_BETA must be non-negative')
         self.fdmf_fused_form = str(getattr(fusion_cfg, 'FDMF_FUSED_FORM', 'raw_fdmf')).lower()
@@ -1430,22 +1565,37 @@ class MambaOSNetFusion(nn.Module):
         self.osnet_classifier = self._make_classifier(self.osnet_dim)
 
         self.fdmf_refiner = None
-        if self.fusion_type == 'fdmf':
-            self.fdmf_refiner = SameScaleFrequencyMambaFusion(
-                dim=self.mamba_dim,
-                osnet_dim=self.osnet_map_dim,
-                compressed_channels=int(getattr(fusion_cfg, 'FDMF_COMPRESSED_CHANNELS', 64)),
-                lowpass_kernel=int(getattr(fusion_cfg, 'FDMF_LOWPASS_KERNEL', 5)),
-                highpass_kernel=int(getattr(fusion_cfg, 'FDMF_HIGHPASS_KERNEL', 3)),
-                use_hamming=bool(getattr(fusion_cfg, 'FDMF_HAMMING_WINDOW', True)),
-                filter_type=str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
-                mamba_depth=int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
-                mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
-                mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
-                mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
-                mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
-                mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
-            )
+        if self.fusion_type in ('fdmf', 'dwt_fdmf'):
+            if self.fusion_type == 'dwt_fdmf':
+                self.fdmf_refiner = DWTFrequencyMambaFusion(
+                    dim=self.mamba_dim,
+                    osnet_dim=self.osnet_map_dim,
+                    compressed_channels=int(getattr(fusion_cfg, 'FDMF_COMPRESSED_CHANNELS', 64)),
+                    mamba_depth=int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
+                    mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
+                    mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
+                    mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
+                    mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                    mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
+                    residual_init=float(getattr(fusion_cfg, 'DWT_RESIDUAL_INIT', 0.1)),
+                    high_gate=bool(getattr(fusion_cfg, 'DWT_HIGH_GATE', True)),
+                )
+            else:
+                self.fdmf_refiner = SameScaleFrequencyMambaFusion(
+                    dim=self.mamba_dim,
+                    osnet_dim=self.osnet_map_dim,
+                    compressed_channels=int(getattr(fusion_cfg, 'FDMF_COMPRESSED_CHANNELS', 64)),
+                    lowpass_kernel=int(getattr(fusion_cfg, 'FDMF_LOWPASS_KERNEL', 5)),
+                    highpass_kernel=int(getattr(fusion_cfg, 'FDMF_HIGHPASS_KERNEL', 3)),
+                    use_hamming=bool(getattr(fusion_cfg, 'FDMF_HAMMING_WINDOW', True)),
+                    filter_type=str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
+                    mamba_depth=int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
+                    mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
+                    mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
+                    mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
+                    mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                    mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
+                )
             if self.fdmf_fused_form == 'raw_fdmf':
                 self.fusion_dim = self.mamba_dim + self.osnet_dim + self.mamba_dim
             elif self.fdmf_fused_form == 'mamba_fdmf':
@@ -1459,9 +1609,10 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_bottleneck.apply(weights_init_kaiming)
         self.fusion_classifier = self._make_classifier(self.fusion_dim)
 
-        if self.fusion_type == 'fdmf':
+        if self.fusion_type in ('fdmf', 'dwt_fdmf'):
             print(
-                '[Model] Mamba-OSNet FDMF enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, osnet_map_dim={}, fusion_dim={}, form={}, filter={}, bidirectional={}'.format(
+                '[Model] Mamba-OSNet {} enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, osnet_map_dim={}, fusion_dim={}, form={}, filter={}, bidirectional={}, dwt_gate={}'.format(
+                    self.fusion_type.upper(),
                     self.mamba_dim,
                     osnet_type,
                     self.osnet_dim,
@@ -1470,6 +1621,7 @@ class MambaOSNetFusion(nn.Module):
                     self.fdmf_fused_form,
                     str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
                     bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                    bool(getattr(fusion_cfg, 'DWT_HIGH_GATE', True)),
                 )
             )
         else:
@@ -1556,7 +1708,7 @@ class MambaOSNetFusion(nn.Module):
         return global_feat, feat_bn
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
-        use_fdmf = self.fusion_type == 'fdmf'
+        use_fdmf = self.fusion_type in ('fdmf', 'dwt_fdmf')
         if self.training:
             mamba_out = self._forward_mamba_branch(
                 x,
@@ -1611,6 +1763,8 @@ class MambaOSNetFusion(nn.Module):
         if use_fdmf:
             output['raw_concat'] = torch.cat([mamba_out, osnet_out], dim=1)
             output['fdmf'] = fused_out
+            if self.fusion_type == 'dwt_fdmf':
+                output['dwt_fdmf'] = fused_out
         else:
             output['concat'] = fused_out
         return output
