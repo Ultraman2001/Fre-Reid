@@ -32,15 +32,20 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "stage_fcu_s010_osw05_fuw1|0.1|0.5|1.0"
+  "stage_fcu_s2_osw05_fuw1|[2]|0.1|0.5|1.0"
+  "stage_fcu_s2_osw1_fuw1|[2]|0.1|1.0|1.0"
+  "stage_fcu_s3_osw05_fuw1|[3]|0.1|0.5|1.0"
+  "stage_fcu_s3_osw1_fuw1|[3]|0.1|1.0|1.0"
+  "stage_fcu_s23_osw05_fuw1|[2,3]|0.1|0.5|1.0"
+  "stage_fcu_s23_osw1_fuw1|[2,3]|0.1|1.0|1.0"
 )
 
 run_experiment() {
   local idx="$1"
   local spec="$2"
-  local name init_scale osnet_weight fused_weight
+  local name stages init_scale osnet_weight fused_weight
 
-  IFS='|' read -r name init_scale osnet_weight fused_weight <<< "${spec}"
+  IFS='|' read -r name stages init_scale osnet_weight fused_weight <<< "${spec}"
 
   local gpu="${GPUS[$((idx % ${#GPUS[@]}))]}"
   local output_dir="${OUTPUT_BASE}/${name}"
@@ -50,13 +55,14 @@ run_experiment() {
     osnet_pretrain_opts=(MODEL.OSNET_FUSION.PRETRAIN_PATH "'${OSNET_PRETRAIN}'")
   fi
 
-  echo "[DukeOSNetStageFCU] GPU=${gpu} EXP=${name} output=${output_dir} init=${init_scale} osnet_w=${osnet_weight} fused_w=${fused_weight}"
+  echo "[DukeOSNetStageFCU] GPU=${gpu} EXP=${name} output=${output_dir} stages=${stages} init=${init_scale} osnet_w=${osnet_weight} fused_w=${fused_weight}"
 
   CUDA_VISIBLE_DEVICES="${gpu}" python train.py --config_file "${CONFIG}" \
     MODEL.DEVICE_ID "'${gpu}'" \
     MODEL.OSNET_FUSION.ENABLED True \
     MODEL.OSNET_FUSION.FUSION_TYPE "'stage_fcu'" \
     MODEL.OSNET_FUSION.FUSION_NORM "'none'" \
+    MODEL.OSNET_FUSION.FCU_STAGES "${stages}" \
     MODEL.OSNET_FUSION.FCU_INIT_SCALE "${init_scale}" \
     MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT "${osnet_weight}" \
     MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT "${fused_weight}" \
@@ -79,7 +85,7 @@ output_base, summary_tsv, summary_csv = sys.argv[1:4]
 specs = [line for line in os.environ.get("DUKE_OSNET_STAGE_FCU_SPECS", "").splitlines() if line.strip()]
 
 fields = [
-    "name", "status", "init_scale", "osnet_weight", "fused_weight",
+    "name", "status", "stages", "init_scale", "osnet_weight", "fused_weight",
     "last_epoch", "last_mAP", "last_R1", "last_R5", "last_R10",
     "best_epoch", "best_mAP", "best_R1", "best_R5", "best_R10",
     "log_file",
@@ -146,7 +152,7 @@ def empty_metrics(status, log_file):
 
 rows = []
 for spec in specs:
-    name, init_scale, osnet_weight, fused_weight = spec.split("|")
+    name, stages, init_scale, osnet_weight, fused_weight = spec.split("|")
     output_dir = os.path.join(output_base, name)
     train_log = os.path.join(output_dir, "train_log.txt")
     test_log = os.path.join(output_dir, "test_log.txt")
@@ -154,6 +160,7 @@ for spec in specs:
 
     base = {
         "name": name,
+        "stages": stages,
         "init_scale": init_scale,
         "osnet_weight": osnet_weight,
         "fused_weight": fused_weight,
@@ -194,13 +201,13 @@ for path, dialect in ((summary_tsv, "excel-tab"), (summary_csv, "excel")):
 
 print()
 print(
-    f"{'name':<28} {'status':<12} {'init':<6} {'osw':<5} {'fuw':<5} "
+    f"{'name':<28} {'status':<12} {'stages':<7} {'init':<6} {'osw':<5} {'fuw':<5} "
     f"{'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
     f"{'best_ep':<8} {'best_mAP':<8} {'best_R1':<8}"
 )
 for row in rows:
     print(
-        f"{row['name']:<28} {row['status']:<12} {row['init_scale']:<6} "
+        f"{row['name']:<28} {row['status']:<12} {row['stages']:<7} {row['init_scale']:<6} "
         f"{row['osnet_weight']:<5} {row['fused_weight']:<5} "
         f"{row['last_epoch']:<8} {row['last_mAP']:<8} {row['last_R1']:<8} "
         f"{row['best_epoch']:<8} {row['best_mAP']:<8} {row['best_R1']:<8}"

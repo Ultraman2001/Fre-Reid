@@ -102,6 +102,7 @@ _C.MODEL.OSNET_FUSION.FUSION_TYPE = 'descriptor'  # descriptor / stage_fcu
 _C.MODEL.OSNET_FUSION.FUSION_NORM = 'none'  # none / branch / weighted_branch
 _C.MODEL.OSNET_FUSION.FUSION_BETA = 1.0     # OSNet branch scale for weighted_branch
 _C.MODEL.OSNET_FUSION.FCU_INIT_SCALE = 0.1  # residual scale for stage_fcu exchange
+_C.MODEL.OSNET_FUSION.FCU_STAGES = [2, 3]   # stage_fcu exchange stages: any subset of [2, 3]
 
 # EMA Setting
 _C.MODEL.EMA = CN()

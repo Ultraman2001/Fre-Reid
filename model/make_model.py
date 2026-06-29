@@ -1263,11 +1263,19 @@ class MambaOSNetFusion(nn.Module):
         if self.fusion_type == 'stage_fcu':
             if not hasattr(self.mamba.base, 'levels') or len(self.mamba.base.levels) < 4:
                 raise ValueError('stage_fcu requires a MambaVision backbone with four stages')
+            self.fcu_stages = [int(stage) for stage in getattr(fusion_cfg, 'FCU_STAGES', [2, 3])]
+            invalid_fcu_stages = sorted(set(self.fcu_stages) - {2, 3})
+            if invalid_fcu_stages:
+                raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES only supports stages 2 and 3')
+            if not self.fcu_stages:
+                raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES must contain at least one stage for stage_fcu')
             mamba_stage2_dim = self.mamba.base.levels[1].blocks[0].conv1.out_channels
             mamba_stage3_dim = self.mamba.base.levels[2].blocks[0].norm1.normalized_shape[0]
             fcu_init_scale = float(getattr(fusion_cfg, 'FCU_INIT_SCALE', 0.1))
-            self.stage2_fcu = StageFCU(mamba_stage2_dim, self.osnet_stage2_dim, init_scale=fcu_init_scale)
-            self.stage3_fcu = StageFCU(mamba_stage3_dim, self.osnet_stage3_dim, init_scale=fcu_init_scale)
+            if 2 in self.fcu_stages:
+                self.stage2_fcu = StageFCU(mamba_stage2_dim, self.osnet_stage2_dim, init_scale=fcu_init_scale)
+            if 3 in self.fcu_stages:
+                self.stage3_fcu = StageFCU(mamba_stage3_dim, self.osnet_stage3_dim, init_scale=fcu_init_scale)
 
         print(
             '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_norm={}, beta={:.2f}'.format(
@@ -1281,7 +1289,8 @@ class MambaOSNetFusion(nn.Module):
         )
         if self.fusion_type == 'stage_fcu':
             print(
-                '[Model] Stage-FCU exchange enabled at Mamba Stage2/3 with OSNet conv3/4, init_scale={:.3f}'.format(
+                '[Model] Stage-FCU exchange enabled at stages={}, init_scale={:.3f}'.format(
+                    self.fcu_stages,
                     fcu_init_scale,
                 )
             )
@@ -1381,11 +1390,13 @@ class MambaOSNetFusion(nn.Module):
         mamba_map = base.levels[0](mamba_map)
         mamba_map = base.levels[1](mamba_map)
         osnet_map = self.osnet.conv3(osnet_map)
-        mamba_map, osnet_map = self.stage2_fcu(mamba_map, osnet_map)
+        if 2 in self.fcu_stages:
+            mamba_map, osnet_map = self.stage2_fcu(mamba_map, osnet_map)
 
         mamba_map = base.levels[2](mamba_map)
         osnet_map = self.osnet.conv4(osnet_map)
-        mamba_map, osnet_map = self.stage3_fcu(mamba_map, osnet_map)
+        if 3 in self.fcu_stages:
+            mamba_map, osnet_map = self.stage3_fcu(mamba_map, osnet_map)
 
         mamba_map = base.main_proj(mamba_map)
         mamba_map = base.levels[3](mamba_map)
