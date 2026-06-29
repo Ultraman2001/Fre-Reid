@@ -1269,8 +1269,8 @@ class MambaOSNetFusion(nn.Module):
                 raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES only supports stages 2 and 3')
             if not self.fcu_stages:
                 raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES must contain at least one stage for stage_fcu')
-            mamba_stage2_dim = self.mamba.base.levels[1].blocks[0].conv1.out_channels
-            mamba_stage3_dim = self.mamba.base.levels[2].blocks[0].norm1.normalized_shape[0]
+            mamba_stage2_dim = self._mamba_stage_out_dim(self.mamba.base.levels[1])
+            mamba_stage3_dim = self._mamba_stage_out_dim(self.mamba.base.levels[2])
             fcu_init_scale = float(getattr(fusion_cfg, 'FCU_INIT_SCALE', 0.1))
             if 2 in self.fcu_stages:
                 self.stage2_fcu = StageFCU(mamba_stage2_dim, self.osnet_stage2_dim, init_scale=fcu_init_scale)
@@ -1289,9 +1289,13 @@ class MambaOSNetFusion(nn.Module):
         )
         if self.fusion_type == 'stage_fcu':
             print(
-                '[Model] Stage-FCU exchange enabled at stages={}, init_scale={:.3f}'.format(
+                '[Model] Stage-FCU exchange enabled at stages={}, init_scale={:.3f}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
                     self.fcu_stages,
                     fcu_init_scale,
+                    mamba_stage2_dim,
+                    self.osnet_stage2_dim,
+                    mamba_stage3_dim,
+                    self.osnet_stage3_dim,
                 )
             )
 
@@ -1307,6 +1311,17 @@ class MambaOSNetFusion(nn.Module):
         classifier = nn.Linear(in_planes, self.num_classes, bias=False)
         classifier.apply(weights_init_classifier)
         return classifier
+
+    @staticmethod
+    def _mamba_stage_out_dim(level):
+        if getattr(level, 'downsample', None) is not None:
+            return level.downsample.reduction[0].out_channels
+        block = level.blocks[0]
+        if hasattr(block, 'norm1') and hasattr(block.norm1, 'normalized_shape'):
+            return block.norm1.normalized_shape[0]
+        if hasattr(block, 'conv1'):
+            return block.conv1.out_channels
+        raise ValueError('Unable to infer MambaVision stage output channels')
 
     def _classify(self, classifier, feat, label):
         if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
