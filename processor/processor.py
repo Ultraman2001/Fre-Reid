@@ -306,6 +306,11 @@ def do_train(cfg,
                                 fdmf_stats['cos_mamba_fdmf'],
                                 fdmf_stats['cos_fused_raw'],
                             )
+                        if 'ratr' in loss_detail:
+                            log_msg += " | RATR[{}]={:.4f}".format(
+                                loss_detail.get('ratr_pair', 'pair'),
+                                loss_detail['ratr'],
+                            )
                     else:
                         s_lambda = loss_detail.get('sfm_lambda', 0.0)
                         id_b = loss_detail.get('id_backbone', 0.0)

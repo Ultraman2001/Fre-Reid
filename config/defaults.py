@@ -272,6 +272,7 @@ _C.SOLVER.OSNET_FUSION_LR_FACTOR = 2.0
 _C.SOLVER.RATR_ENABLED = False    # 是否启用 RATR
 _C.SOLVER.RATR_LAMBDA = 1.0       # RATR 损失权重
 _C.SOLVER.RATR_TAU = 0.1          # Kendall-tau 温度参数
+_C.SOLVER.RATR_BRANCH_PAIR = 'mamba_osnet'  # mamba_osnet / mamba_fused / osnet_fused for OSNet fusion
 
 
 # ---------------------------------------------------------------------------- #

@@ -44,6 +44,7 @@ def make_loss(cfg, num_classes):    # modified by gu
 
     elif cfg.DATALOADER.SAMPLER == 'softmax_triplet':
         def loss_func(score, feat, target, target_cam):
+            nonlocal ratr_fn
             if cfg.MODEL.METRIC_LOSS_TYPE == 'triplet':
                 # 支持多分支模式 (PMS 或 SFM)
                 if isinstance(score, list):
@@ -162,6 +163,29 @@ def make_loss(cfg, num_classes):    # modified by gu
                             loss_detail[f'id_{name}'] = id_loss.item()
                             loss_detail[f'tri_{name}'] = tri_loss.item()
 
+                        if ratr_fn is not None:
+                            ratr_pair = str(getattr(cfg.SOLVER, 'RATR_BRANCH_PAIR', 'mamba_osnet')).lower()
+                            pair_to_indices = {
+                                'mamba_osnet': (0, 1),
+                                'mamba_fused': (0, 2),
+                                'osnet_fused': (1, 2),
+                            }
+                            if ratr_pair not in pair_to_indices:
+                                raise ValueError(
+                                    "SOLVER.RATR_BRANCH_PAIR must be one of: mamba_osnet, mamba_fused, osnet_fused"
+                                )
+                            idx_a, idx_b = pair_to_indices[ratr_pair]
+                            ratr_lambda = float(getattr(cfg.SOLVER, 'RATR_LAMBDA', 1.0))
+                            ratr_fn = ratr_fn.to(target.device)
+                            ratr_loss = ratr_fn([
+                                F.normalize(feat[idx_a].float(), dim=1),
+                                F.normalize(feat[idx_b].float(), dim=1),
+                            ], target)
+                            total_loss = total_loss + ratr_lambda * ratr_loss
+                            loss_detail['ratr'] = ratr_loss.item()
+                            loss_detail['ratr_pair'] = ratr_pair
+                            loss_detail['ratr_lambda'] = ratr_lambda
+
                         return total_loss, loss_detail
 
                     if use_sfm and len(score) >= 2:
@@ -224,7 +248,6 @@ def make_loss(cfg, num_classes):    # modified by gu
                                      cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
                         
                         # ===== RATR 损失 =====
-                        nonlocal ratr_fn
                         if ratr_fn is not None:
                             ratr_lambda = getattr(cfg.SOLVER, 'RATR_LAMBDA', 1.0)
                             

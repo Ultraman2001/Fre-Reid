@@ -32,20 +32,22 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "dwt_mamba_fdmf_osw025|0.25|1.0|64|mamba_fdmf|1|0.1|True|True|0.1"
-  "dwt_mamba_fdmf_osw05|0.5|1.0|64|mamba_fdmf|1|0.1|True|True|0.1"
-  "dwt_mamba_fdmf_osw1|1.0|1.0|64|mamba_fdmf|1|0.1|True|True|0.1"
-  "dwt_mamba_fdmf_nogate|0.5|1.0|64|mamba_fdmf|1|0.1|True|False|0.1"
-  "dwt_mamba_fdmf_unidir|0.5|1.0|64|mamba_fdmf|1|0.1|False|True|0.1"
-  "dwt_fdmf_only|0.5|1.0|64|fdmf_only|1|0.1|True|True|0.1"
+  "dwt_mamba_fdmf_osw025|0.25|1.0|64|mamba_fdmf|1|0.1|True|True|0.1|False|0.0"
+  "dwt_mamba_fdmf_osw05|0.5|1.0|64|mamba_fdmf|1|0.1|True|True|0.1|False|0.0"
+  "dwt_mamba_fdmf_osw1|1.0|1.0|64|mamba_fdmf|1|0.1|True|True|0.1|False|0.0"
+  "dwt_mamba_fdmf_nogate|0.5|1.0|64|mamba_fdmf|1|0.1|True|False|0.1|False|0.0"
+  "dwt_mamba_fdmf_unidir|0.5|1.0|64|mamba_fdmf|1|0.1|False|True|0.1|False|0.0"
+  "dwt_fdmf_only|0.5|1.0|64|fdmf_only|1|0.1|True|True|0.1|False|0.0"
+  "dwt_mamba_fdmf_ratr02|0.5|1.0|64|mamba_fdmf|1|0.1|True|True|0.1|True|0.2"
+  "dwt_mamba_fdmf_ratr05|0.5|1.0|64|mamba_fdmf|1|0.1|True|True|0.1|True|0.5"
 )
 
 run_experiment() {
   local idx="$1"
   local spec="$2"
-  local name osnet_weight fused_weight compressed fused_form mamba_depth init_scale bidirectional high_gate residual_init
+  local name osnet_weight fused_weight compressed fused_form mamba_depth init_scale bidirectional high_gate residual_init ratr_enabled ratr_lambda
 
-  IFS='|' read -r name osnet_weight fused_weight compressed fused_form mamba_depth init_scale bidirectional high_gate residual_init <<< "${spec}"
+  IFS='|' read -r name osnet_weight fused_weight compressed fused_form mamba_depth init_scale bidirectional high_gate residual_init ratr_enabled ratr_lambda <<< "${spec}"
 
   local gpu="${GPUS[$((idx % ${#GPUS[@]}))]}"
   local output_dir="${OUTPUT_BASE}/${name}"
@@ -55,7 +57,7 @@ run_experiment() {
     osnet_pretrain_opts=(MODEL.OSNET_FUSION.PRETRAIN_PATH "'${OSNET_PRETRAIN}'")
   fi
 
-  echo "[DukeOSNetDWTFDMF] GPU=${gpu} EXP=${name} output=${output_dir} osnet_w=${osnet_weight} fused_w=${fused_weight} comp=${compressed} form=${fused_form} depth=${mamba_depth} init=${init_scale} bidir=${bidirectional} gate=${high_gate} residual=${residual_init}"
+  echo "[DukeOSNetDWTFDMF] GPU=${gpu} EXP=${name} output=${output_dir} osnet_w=${osnet_weight} fused_w=${fused_weight} comp=${compressed} form=${fused_form} depth=${mamba_depth} init=${init_scale} bidir=${bidirectional} gate=${high_gate} residual=${residual_init} ratr=${ratr_enabled} ratr_l=${ratr_lambda}"
 
   CUDA_VISIBLE_DEVICES="${gpu}" python train.py --config_file "${CONFIG}" \
     MODEL.DEVICE_ID "'${gpu}'" \
@@ -71,6 +73,9 @@ run_experiment() {
     MODEL.OSNET_FUSION.FDMF_MAMBA_BIDIRECTIONAL "${bidirectional}" \
     MODEL.OSNET_FUSION.DWT_HIGH_GATE "${high_gate}" \
     MODEL.OSNET_FUSION.DWT_RESIDUAL_INIT "${residual_init}" \
+    SOLVER.RATR_ENABLED "${ratr_enabled}" \
+    SOLVER.RATR_LAMBDA "${ratr_lambda}" \
+    SOLVER.RATR_BRANCH_PAIR "'mamba_osnet'" \
     TEST.FEAT_MODE "'fdmf'" \
     "${osnet_pretrain_opts[@]}" \
     OUTPUT_DIR "${output_dir}"
@@ -96,6 +101,7 @@ specs = [line for line in os.environ.get("DUKE_OSNET_DWT_FDMF_SPECS", "").splitl
 fields = [
     "name", "status", "osnet_weight", "fused_weight", "compressed",
     "fused_form", "mamba_depth", "init_scale", "bidirectional", "high_gate", "residual_init",
+    "ratr_enabled", "ratr_lambda",
     "last_epoch", "last_mAP", "last_R1", "last_R5", "last_R10",
     "best_epoch", "best_mAP", "best_R1", "best_R5", "best_R10",
     "log_file",
@@ -173,6 +179,8 @@ for spec in specs:
         bidirectional,
         high_gate,
         residual_init,
+        ratr_enabled,
+        ratr_lambda,
     ) = spec.split("|")
     output_dir = os.path.join(output_base, name)
     train_log = os.path.join(output_dir, "train_log.txt")
@@ -190,6 +198,8 @@ for spec in specs:
         "bidirectional": bidirectional,
         "high_gate": high_gate,
         "residual_init": residual_init,
+        "ratr_enabled": ratr_enabled,
+        "ratr_lambda": ratr_lambda,
     }
 
     if not os.path.exists(log_file):
@@ -228,13 +238,14 @@ for path, dialect in ((summary_tsv, "excel-tab"), (summary_csv, "excel")):
 print()
 print(
     f"{'name':<28} {'status':<12} {'osw':<5} {'fuw':<5} {'form':<12} "
-    f"{'dep':<4} {'gate':<6} {'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
+    f"{'dep':<4} {'gate':<6} {'ratr':<6} {'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
     f"{'best_ep':<8} {'best_mAP':<8} {'best_R1':<8}"
 )
 for row in rows:
     print(
         f"{row['name']:<28} {row['status']:<12} {row['osnet_weight']:<5} {row['fused_weight']:<5} "
         f"{row['fused_form']:<12} {row['mamba_depth']:<4} {row['high_gate']:<6} "
+        f"{row['ratr_lambda']:<6} "
         f"{row['last_epoch']:<8} {row['last_mAP']:<8} {row['last_R1']:<8} "
         f"{row['best_epoch']:<8} {row['best_mAP']:<8} {row['best_R1']:<8}"
     )
