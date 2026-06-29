@@ -154,6 +154,7 @@ def make_loss(cfg, num_classes):    # modified by gu
                         loss_detail = {
                             'fusion_mode': 'osnet',
                             'fusion_type': fusion_type,
+                            'fused_branch_key': fused_branch_name,
                             'w_mamba': branch_weights[0],
                             'w_osnet': branch_weights[1],
                             'w_concat': branch_weights[2],

@@ -1152,6 +1152,48 @@ _factory_osnet = {
 }
 
 
+class StageFCU(nn.Module):
+    """Bidirectional stage-level coupling inspired by Conformer FCU."""
+
+    def __init__(self, mamba_dim, osnet_dim, init_scale=0.1):
+        super().__init__()
+        self.mamba_from_osnet = nn.Sequential(
+            nn.Conv2d(osnet_dim, mamba_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(mamba_dim),
+            nn.GELU(),
+        )
+        self.osnet_from_mamba = nn.Sequential(
+            nn.Conv2d(mamba_dim, osnet_dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(osnet_dim),
+            nn.GELU(),
+        )
+        self.fusion_scale_mamba = nn.Parameter(torch.ones(1) * float(init_scale))
+        self.fusion_scale_osnet = nn.Parameter(torch.ones(1) * float(init_scale))
+
+    def forward(self, mamba_map, osnet_map):
+        osnet_to_mamba = self.mamba_from_osnet(osnet_map)
+        if osnet_to_mamba.shape[-2:] != mamba_map.shape[-2:]:
+            osnet_to_mamba = F.interpolate(
+                osnet_to_mamba,
+                size=mamba_map.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        mamba_to_osnet = self.osnet_from_mamba(mamba_map)
+        if mamba_to_osnet.shape[-2:] != osnet_map.shape[-2:]:
+            mamba_to_osnet = F.interpolate(
+                mamba_to_osnet,
+                size=osnet_map.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+
+        mamba_map = mamba_map + self.fusion_scale_mamba.to(mamba_map.dtype) * osnet_to_mamba
+        osnet_map = osnet_map + self.fusion_scale_osnet.to(osnet_map.dtype) * mamba_to_osnet
+        return mamba_map, osnet_map
+
+
 class MambaOSNetFusion(nn.Module):
     """MambaVision + OSNet fusion."""
 
@@ -1171,8 +1213,8 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_type = str(getattr(fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
         self.fusion_norm = str(getattr(fusion_cfg, 'FUSION_NORM', 'none')).lower()
         self.fusion_beta = float(getattr(fusion_cfg, 'FUSION_BETA', 1.0))
-        if self.fusion_type != 'descriptor':
-            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE has been rolled back to descriptor-only concat")
+        if self.fusion_type not in ('descriptor', 'stage_fcu'):
+            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be 'descriptor' or 'stage_fcu'")
         if self.fusion_norm not in ('none', 'branch', 'weighted_branch'):
             raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be one of: none, branch, weighted_branch")
         if self.fusion_beta < 0:
@@ -1191,6 +1233,8 @@ class MambaOSNetFusion(nn.Module):
         )
         self.osnet_dim = self.osnet.feature_dim
         self.osnet_map_dim = self.osnet.conv5.conv.out_channels
+        self.osnet_stage2_dim = self.osnet.conv3[0].conv3.conv.out_channels
+        self.osnet_stage3_dim = self.osnet.conv4[0].conv3.conv.out_channels
 
         osnet_pretrain = str(getattr(fusion_cfg, 'PRETRAIN_PATH', '')).strip()
         if osnet_pretrain:
@@ -1216,8 +1260,18 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_bottleneck.apply(weights_init_kaiming)
         self.fusion_classifier = self._make_classifier(self.fusion_dim)
 
+        if self.fusion_type == 'stage_fcu':
+            if not hasattr(self.mamba.base, 'levels') or len(self.mamba.base.levels) < 4:
+                raise ValueError('stage_fcu requires a MambaVision backbone with four stages')
+            mamba_stage2_dim = self.mamba.base.levels[1].blocks[0].conv1.out_channels
+            mamba_stage3_dim = self.mamba.base.levels[2].blocks[0].norm1.normalized_shape[0]
+            fcu_init_scale = float(getattr(fusion_cfg, 'FCU_INIT_SCALE', 0.1))
+            self.stage2_fcu = StageFCU(mamba_stage2_dim, self.osnet_stage2_dim, init_scale=fcu_init_scale)
+            self.stage3_fcu = StageFCU(mamba_stage3_dim, self.osnet_stage3_dim, init_scale=fcu_init_scale)
+
         print(
-            '[Model] Mamba-OSNet descriptor fusion enabled: mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_norm={}, beta={:.2f}'.format(
+            '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_norm={}, beta={:.2f}'.format(
+                self.fusion_type,
                 self.mamba_dim,
                 osnet_type,
                 self.osnet_dim,
@@ -1225,6 +1279,12 @@ class MambaOSNetFusion(nn.Module):
                 self.fusion_beta,
             )
         )
+        if self.fusion_type == 'stage_fcu':
+            print(
+                '[Model] Stage-FCU exchange enabled at Mamba Stage2/3 with OSNet conv3/4, init_scale={:.3f}'.format(
+                    fcu_init_scale,
+                )
+            )
 
     def _make_classifier(self, in_planes):
         if self.ID_LOSS_TYPE == 'arcface':
@@ -1289,30 +1349,117 @@ class MambaOSNetFusion(nn.Module):
             return global_feat, feat_bn, feature_map
         return global_feat, feat_bn
 
+    def _mamba_patch_embed_with_sie(self, x, cam_label=None, view_label=None):
+        base = self.mamba.base
+        x = base.patch_embed(x)
+        if base.sie_embed is None or cam_label is None:
+            return x
+
+        max_idx = base.sie_embed.shape[0] - 1
+        if base.cam_num > 1 and base.view_num > 1 and view_label is not None:
+            idx = cam_label * base.view_num + view_label
+            idx = idx.clamp(0, max_idx)
+            sie = base.sie_xishu * base.sie_embed[idx]
+        elif base.cam_num > 1:
+            idx = cam_label.clamp(0, max_idx)
+            sie = base.sie_xishu * base.sie_embed[idx]
+        elif base.view_num > 1 and view_label is not None:
+            idx = view_label.clamp(0, max_idx)
+            sie = base.sie_xishu * base.sie_embed[idx]
+        else:
+            sie = 0
+        return x + sie
+
+    def _forward_stage_fcu_maps(self, x, cam_label=None, view_label=None):
+        base = self.mamba.base
+
+        mamba_map = self._mamba_patch_embed_with_sie(x, cam_label=cam_label, view_label=view_label)
+        osnet_map = self.osnet.conv1(x)
+        osnet_map = self.osnet.maxpool(osnet_map)
+        osnet_map = self.osnet.conv2(osnet_map)
+
+        mamba_map = base.levels[0](mamba_map)
+        mamba_map = base.levels[1](mamba_map)
+        osnet_map = self.osnet.conv3(osnet_map)
+        mamba_map, osnet_map = self.stage2_fcu(mamba_map, osnet_map)
+
+        mamba_map = base.levels[2](mamba_map)
+        osnet_map = self.osnet.conv4(osnet_map)
+        mamba_map, osnet_map = self.stage3_fcu(mamba_map, osnet_map)
+
+        mamba_map = base.main_proj(mamba_map)
+        mamba_map = base.levels[3](mamba_map)
+        osnet_map = self.osnet.conv5(osnet_map)
+        return mamba_map, osnet_map
+
+    def _forward_stage_fcu_branches(self, x, label=None, cam_label=None, view_label=None):
+        mamba_map, osnet_map = self._forward_stage_fcu_maps(
+            x,
+            cam_label=cam_label,
+            view_label=view_label,
+        )
+
+        mamba_feat = self.mamba._pool_feature_map(mamba_map)
+        mamba_bn = self.mamba.bottleneck(mamba_feat)
+
+        osnet_feat = self.osnet.global_avgpool(osnet_map)
+        osnet_feat = osnet_feat.view(osnet_feat.size(0), -1)
+        if self.osnet.fc is not None:
+            osnet_feat = self.osnet.fc(osnet_feat)
+        osnet_bn = self.osnet_bottleneck(osnet_feat)
+
+        if self.training:
+            mamba_score = self.mamba._classify(self.mamba.classifier, mamba_bn, label)
+            osnet_score = self._classify(self.osnet_classifier, osnet_bn, label)
+            return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn
+        return mamba_feat, mamba_bn, osnet_feat, osnet_bn
+
     def forward(self, x, label=None, cam_label=None, view_label=None):
         if self.training:
-            mamba_out = self._forward_mamba_branch(
-                x,
-                label=label,
-                cam_label=cam_label,
-                view_label=view_label,
-            )
-            osnet_out = self._forward_osnet_branch(x, label=label)
-            mamba_score, mamba_feat, mamba_bn = mamba_out
-            osnet_score, osnet_feat, osnet_bn = osnet_out
+            if self.fusion_type == 'stage_fcu':
+                (
+                    mamba_score,
+                    mamba_feat,
+                    mamba_bn,
+                    osnet_score,
+                    osnet_feat,
+                    osnet_bn,
+                ) = self._forward_stage_fcu_branches(
+                    x,
+                    label=label,
+                    cam_label=cam_label,
+                    view_label=view_label,
+                )
+            else:
+                mamba_out = self._forward_mamba_branch(
+                    x,
+                    label=label,
+                    cam_label=cam_label,
+                    view_label=view_label,
+                )
+                osnet_out = self._forward_osnet_branch(x, label=label)
+                mamba_score, mamba_feat, mamba_bn = mamba_out
+                osnet_score, osnet_feat, osnet_bn = osnet_out
             fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
             fused_bn = self.fusion_bottleneck(fused_feat)
             fused_score = self._classify(self.fusion_classifier, fused_bn, label)
             return [mamba_score, osnet_score, fused_score], [mamba_feat, osnet_feat, fused_feat]
 
-        mamba_out = self._forward_mamba_branch(
-            x,
-            cam_label=cam_label,
-            view_label=view_label,
-        )
-        osnet_out = self._forward_osnet_branch(x)
-        mamba_feat, mamba_bn = mamba_out
-        osnet_feat, osnet_bn = osnet_out
+        if self.fusion_type == 'stage_fcu':
+            mamba_feat, mamba_bn, osnet_feat, osnet_bn = self._forward_stage_fcu_branches(
+                x,
+                cam_label=cam_label,
+                view_label=view_label,
+            )
+        else:
+            mamba_out = self._forward_mamba_branch(
+                x,
+                cam_label=cam_label,
+                view_label=view_label,
+            )
+            osnet_out = self._forward_osnet_branch(x)
+            mamba_feat, mamba_bn = mamba_out
+            osnet_feat, osnet_bn = osnet_out
         fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         fused_bn = self.fusion_bottleneck(fused_feat)
 

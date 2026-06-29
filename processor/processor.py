@@ -251,16 +251,17 @@ def do_train(cfg,
                         fused_name = str(loss_detail.get('fusion_type', 'descriptor')).upper()
                         if fused_name == 'DESCRIPTOR':
                             fused_name = 'CONCAT'
+                        fused_key = str(loss_detail.get('fused_branch_key', 'concat')).lower()
                         log_msg += " | OSFusion[w={:.1f}/{:.1f}/{:.1f}]".format(
                             loss_detail.get('w_mamba', 1.0),
                             loss_detail.get('w_osnet', 0.5),
                             loss_detail.get('w_concat', 1.0),
                         )
-                        for name in ('mamba', 'osnet', fused_name.lower()):
+                        for name, key in (('MAMBA', 'mamba'), ('OSNET', 'osnet'), (fused_name, fused_key)):
                             log_msg += " | {}[ID={:.2f}, Tri={:.4f}]".format(
-                                name.upper(),
-                                loss_detail.get(f'id_{name}', 0.0),
-                                loss_detail.get(f'tri_{name}', 0.0),
+                                name,
+                                loss_detail.get(f'id_{key}', 0.0),
+                                loss_detail.get(f'tri_{key}', 0.0),
                             )
                         if 'ratr' in loss_detail:
                             log_msg += " | RATR[{}]={:.4f}".format(

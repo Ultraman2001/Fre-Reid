@@ -98,9 +98,10 @@ _C.MODEL.OSNET_FUSION.PRETRAIN_PATH = ''
 _C.MODEL.OSNET_FUSION.FREEZE_OSNET = False
 _C.MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT = 0.5
 _C.MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT = 1.0
-_C.MODEL.OSNET_FUSION.FUSION_TYPE = 'descriptor'
+_C.MODEL.OSNET_FUSION.FUSION_TYPE = 'descriptor'  # descriptor / stage_fcu
 _C.MODEL.OSNET_FUSION.FUSION_NORM = 'none'  # none / branch / weighted_branch
 _C.MODEL.OSNET_FUSION.FUSION_BETA = 1.0     # OSNet branch scale for weighted_branch
+_C.MODEL.OSNET_FUSION.FCU_INIT_SCALE = 0.1  # residual scale for stage_fcu exchange
 
 # EMA Setting
 _C.MODEL.EMA = CN()
