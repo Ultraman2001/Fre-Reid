@@ -43,7 +43,6 @@ def make_optimizer(cfg, model, center_criterion):
             or key.startswith("osnet_classifier")
             or key.startswith("fusion_bottleneck")
             or key.startswith("fusion_classifier")
-            or key.startswith("fdmf_refiner")
         ):
             fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
