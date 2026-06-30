@@ -20,7 +20,7 @@ fi
 
 CONFIG="${CONFIG:-configs/DukeMTMC/mambavision_tiny_osnet_stage_fcu_b64k4.yml}"
 OUTPUT_BASE="${OUTPUT_BASE:-${OUTPUT_BASE_ARG:-./logs/Duke/osnet_stage_fcu_directional}}"
-OSNET_PRETRAIN="${OSNET_PRETRAIN:-}"
+OSNET_PRETRAIN="${OSNET_PRETRAIN:-/workspace/pretrained/osnet_x1_0_imagenet.pth}"
 SUMMARY_TSV="${OUTPUT_BASE}/summary.tsv"
 SUMMARY_CSV="${OUTPUT_BASE}/summary.csv"
 

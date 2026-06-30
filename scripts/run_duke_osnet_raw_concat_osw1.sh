@@ -21,7 +21,7 @@ fi
 
 CONFIG="${CONFIG:-configs/DukeMTMC/mambavision_tiny_osnet_raw_concat_osw1_b64k4.yml}"
 OUTPUT_BASE="${OUTPUT_BASE:-${OUTPUT_BASE_ARG:-./logs/Duke/osnet_raw_concat}}"
-OSNET_PRETRAIN="${OSNET_PRETRAIN:-}"
+OSNET_PRETRAIN="${OSNET_PRETRAIN:-/workspace/pretrained/osnet_x1_0_imagenet.pth}"
 SUMMARY_TSV="${OUTPUT_BASE}/summary.tsv"
 SUMMARY_CSV="${OUTPUT_BASE}/summary.csv"
 
