@@ -32,12 +32,6 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
 fi
 
 declare -a EXPERIMENTS=(
-  "stage_fcu_s2_osw05_fuw1|[2]|bidirectional|0.1|0.5|1.0"
-  "stage_fcu_s2_osw1_fuw1|[2]|bidirectional|0.1|1.0|1.0"
-  "stage_fcu_s3_osw05_fuw1|[3]|bidirectional|0.1|0.5|1.0"
-  "stage_fcu_s3_osw1_fuw1|[3]|bidirectional|0.1|1.0|1.0"
-  "stage_fcu_s23_osw05_fuw1|[2,3]|bidirectional|0.1|0.5|1.0"
-  "stage_fcu_s23_osw1_fuw1|[2,3]|bidirectional|0.1|1.0|1.0"
   "stage_fcu_s2_o2m_osw1_fuw1|[2]|osnet_to_mamba|0.1|1.0|1.0"
   "stage_fcu_s2_m2o_osw1_fuw1|[2]|mamba_to_osnet|0.1|1.0|1.0"
   "stage_fcu_s3_o2m_osw1_fuw1|[3]|osnet_to_mamba|0.1|1.0|1.0"
