@@ -36,6 +36,7 @@ MODEL:
     FUSION_BETA: 1.0
     FCU_INIT_SCALE: 0.1
     FCU_STAGES: [2, 3]
+    FCU_DIRECTION: 'bidirectional'
 
 INPUT:
   SIZE_TRAIN: [256, 128]

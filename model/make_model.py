@@ -1155,8 +1155,11 @@ _factory_osnet = {
 class StageFCU(nn.Module):
     """Bidirectional stage-level coupling inspired by Conformer FCU."""
 
-    def __init__(self, mamba_dim, osnet_dim, init_scale=0.1):
+    def __init__(self, mamba_dim, osnet_dim, init_scale=0.1, direction='bidirectional'):
         super().__init__()
+        self.direction = str(direction).lower()
+        if self.direction not in ('bidirectional', 'osnet_to_mamba', 'mamba_to_osnet'):
+            raise ValueError("FCU direction must be 'bidirectional', 'osnet_to_mamba', or 'mamba_to_osnet'")
         self.mamba_from_osnet = nn.Sequential(
             nn.Conv2d(osnet_dim, mamba_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(mamba_dim),
@@ -1171,27 +1174,32 @@ class StageFCU(nn.Module):
         self.fusion_scale_osnet = nn.Parameter(torch.ones(1) * float(init_scale))
 
     def forward(self, mamba_map, osnet_map):
-        osnet_to_mamba = self.mamba_from_osnet(osnet_map)
-        if osnet_to_mamba.shape[-2:] != mamba_map.shape[-2:]:
-            osnet_to_mamba = F.interpolate(
-                osnet_to_mamba,
-                size=mamba_map.shape[-2:],
-                mode='bilinear',
-                align_corners=False,
-            )
+        new_mamba_map = mamba_map
+        new_osnet_map = osnet_map
 
-        mamba_to_osnet = self.osnet_from_mamba(mamba_map)
-        if mamba_to_osnet.shape[-2:] != osnet_map.shape[-2:]:
-            mamba_to_osnet = F.interpolate(
-                mamba_to_osnet,
-                size=osnet_map.shape[-2:],
-                mode='bilinear',
-                align_corners=False,
-            )
+        if self.direction in ('bidirectional', 'osnet_to_mamba'):
+            osnet_to_mamba = self.mamba_from_osnet(osnet_map)
+            if osnet_to_mamba.shape[-2:] != mamba_map.shape[-2:]:
+                osnet_to_mamba = F.interpolate(
+                    osnet_to_mamba,
+                    size=mamba_map.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            new_mamba_map = mamba_map + self.fusion_scale_mamba.to(mamba_map.dtype) * osnet_to_mamba
 
-        mamba_map = mamba_map + self.fusion_scale_mamba.to(mamba_map.dtype) * osnet_to_mamba
-        osnet_map = osnet_map + self.fusion_scale_osnet.to(osnet_map.dtype) * mamba_to_osnet
-        return mamba_map, osnet_map
+        if self.direction in ('bidirectional', 'mamba_to_osnet'):
+            mamba_to_osnet = self.osnet_from_mamba(mamba_map)
+            if mamba_to_osnet.shape[-2:] != osnet_map.shape[-2:]:
+                mamba_to_osnet = F.interpolate(
+                    mamba_to_osnet,
+                    size=osnet_map.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            new_osnet_map = osnet_map + self.fusion_scale_osnet.to(osnet_map.dtype) * mamba_to_osnet
+
+        return new_mamba_map, new_osnet_map
 
 
 class MambaOSNetFusion(nn.Module):
@@ -1272,10 +1280,21 @@ class MambaOSNetFusion(nn.Module):
             mamba_stage2_dim = self._mamba_stage_out_dim(self.mamba.base.levels[1])
             mamba_stage3_dim = self._mamba_stage_out_dim(self.mamba.base.levels[2])
             fcu_init_scale = float(getattr(fusion_cfg, 'FCU_INIT_SCALE', 0.1))
+            self.fcu_direction = str(getattr(fusion_cfg, 'FCU_DIRECTION', 'bidirectional')).lower()
             if 2 in self.fcu_stages:
-                self.stage2_fcu = StageFCU(mamba_stage2_dim, self.osnet_stage2_dim, init_scale=fcu_init_scale)
+                self.stage2_fcu = StageFCU(
+                    mamba_stage2_dim,
+                    self.osnet_stage2_dim,
+                    init_scale=fcu_init_scale,
+                    direction=self.fcu_direction,
+                )
             if 3 in self.fcu_stages:
-                self.stage3_fcu = StageFCU(mamba_stage3_dim, self.osnet_stage3_dim, init_scale=fcu_init_scale)
+                self.stage3_fcu = StageFCU(
+                    mamba_stage3_dim,
+                    self.osnet_stage3_dim,
+                    init_scale=fcu_init_scale,
+                    direction=self.fcu_direction,
+                )
 
         print(
             '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_norm={}, beta={:.2f}'.format(
@@ -1289,8 +1308,9 @@ class MambaOSNetFusion(nn.Module):
         )
         if self.fusion_type == 'stage_fcu':
             print(
-                '[Model] Stage-FCU exchange enabled at stages={}, init_scale={:.3f}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
+                '[Model] Stage-FCU exchange enabled at stages={}, direction={}, init_scale={:.3f}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
                     self.fcu_stages,
+                    self.fcu_direction,
                     fcu_init_scale,
                     mamba_stage2_dim,
                     self.osnet_stage2_dim,
