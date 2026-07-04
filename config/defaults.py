@@ -98,12 +98,34 @@ _C.MODEL.OSNET_FUSION.PRETRAIN_PATH = ''
 _C.MODEL.OSNET_FUSION.FREEZE_OSNET = False
 _C.MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT = 0.5
 _C.MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT = 1.0
-_C.MODEL.OSNET_FUSION.FUSION_TYPE = 'descriptor'  # descriptor / stage_fcu
-_C.MODEL.OSNET_FUSION.FUSION_NORM = 'none'  # none / branch / weighted_branch
+_C.MODEL.OSNET_FUSION.FUSION_TYPE = 'descriptor'  # descriptor / stage_fcu / fdmf
+_C.MODEL.OSNET_FUSION.FUSION_NORM = 'none'  # none / branch / weighted_branch; fdmf use none
 _C.MODEL.OSNET_FUSION.FUSION_BETA = 1.0     # OSNet branch scale for weighted_branch
+_C.MODEL.OSNET_FUSION.FDMF_COMPRESSED_CHANNELS = 64  # deprecated; kept for old configs/scripts
+_C.MODEL.OSNET_FUSION.FDMF_LOWPASS_KERNEL = 5        # deprecated; kept for old configs/scripts
+_C.MODEL.OSNET_FUSION.FDMF_HIGHPASS_KERNEL = 3       # deprecated; kept for old configs/scripts
+_C.MODEL.OSNET_FUSION.FDMF_HAMMING_WINDOW = True     # deprecated; kept for old configs/scripts
+_C.MODEL.OSNET_FUSION.FDMF_FILTER_TYPE = 'none'      # deprecated; frequency filtering has been removed
+_C.MODEL.OSNET_FUSION.FDMF_FUSED_FORM = 'raw_fdmf'  # raw_fdmf / mamba_fdmf / fdmf_only
+_C.MODEL.OSNET_FUSION.FDMF_MAMBA_DEPTH = 1
+_C.MODEL.OSNET_FUSION.FDMF_MAMBA_D_STATE = 8
+_C.MODEL.OSNET_FUSION.FDMF_MAMBA_D_CONV = 3
+_C.MODEL.OSNET_FUSION.FDMF_MAMBA_INIT_SCALE = 0.1
+_C.MODEL.OSNET_FUSION.FDMF_MAMBA_BIDIRECTIONAL = True
+_C.MODEL.OSNET_FUSION.FDMF_MLP_RATIO = 2.0
+_C.MODEL.OSNET_FUSION.FDMF_MSEF_ENABLED = True
+_C.MODEL.OSNET_FUSION.FDMF_MSEF_REDUCTION_RATIO = 16
+_C.MODEL.OSNET_FUSION.FDMF_MSEF_RES_SCALE_ENABLED = False
+_C.MODEL.OSNET_FUSION.FDMF_MSEF_RES_SCALE_INIT = 0.1
+_C.MODEL.OSNET_FUSION.FCU_ENABLED = False   # optionally combine stage_fcu exchange with fdmf
 _C.MODEL.OSNET_FUSION.FCU_INIT_SCALE = 0.1  # residual scale for stage_fcu exchange
 _C.MODEL.OSNET_FUSION.FCU_STAGES = [2, 3]   # stage_fcu exchange stages: any subset of [2, 3]
 _C.MODEL.OSNET_FUSION.FCU_DIRECTION = 'bidirectional'  # bidirectional / osnet_to_mamba / mamba_to_osnet
+_C.MODEL.OSNET_FUSION.FCU_STAGE2_DIRECTION = ''  # optional override; empty uses FCU_DIRECTION
+_C.MODEL.OSNET_FUSION.FCU_STAGE3_DIRECTION = ''  # optional override; empty uses FCU_DIRECTION
+_C.MODEL.OSNET_FUSION.FCU_GATE_TYPE = 'none'  # none / channel
+_C.MODEL.OSNET_FUSION.FCU_GATE_REDUCTION = 16
+_C.MODEL.OSNET_FUSION.FCU_GATE_INIT_BIAS = 0.0
 
 # EMA Setting
 _C.MODEL.EMA = CN()
@@ -144,6 +166,7 @@ _C.INPUT.OSBBM.NUM_BLOCKS = 8
 _C.INPUT.OSBBM.NUM_MIX_BLOCKS = 4
 _C.INPUT.OSBBM.GRAY_PROB = 0.5
 _C.INPUT.OSBBM.APPLY_TO = 'base'  # base, all
+_C.INPUT.OSBBM.MIXED_LABEL = True
 _C.INPUT.OSBBM.SCHEDULE = 'always'  # always, range, cycle
 _C.INPUT.OSBBM.START_EPOCH = 1
 _C.INPUT.OSBBM.END_EPOCH = 0  # 0 means SOLVER.MAX_EPOCHS
@@ -283,6 +306,8 @@ _C.TEST.FEAT_NORM = 'yes'
 _C.TEST.FEAT_CONCAT = False
 # Feature mode for testing: 'fused' (default), 'main', 'fine', or 'concat'
 _C.TEST.FEAT_MODE = 'fused'
+# If False, do_inference evaluates only TEST.FEAT_MODE instead of every returned branch.
+_C.TEST.EVAL_ALL_FEATS = True
 # Extra eval-only weighted branch-normalized concat betas for OSNet fusion.
 _C.TEST.BRANCH_NORM_BETAS = [0.25, 0.5, 0.63, 0.75]
 

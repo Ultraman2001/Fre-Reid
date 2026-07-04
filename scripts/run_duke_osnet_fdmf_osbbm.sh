@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-# Train DukeMTMC-reID MambaVision + OSNet stage-level FCU fusion.
+# Train DukeMTMC-reID OSBBM ablations on the current best fusion backbone:
+# Direction-aware Stage-FCU + map-Mamba/MSEF + triple descriptor inference.
 # Usage:
-#   bash scripts/run_duke_osnet_stage_fcu.sh 0,1 2
-#   bash scripts/run_duke_osnet_stage_fcu.sh 0,1 2 ./logs/Duke/my_output
-#   bash scripts/run_duke_osnet_stage_fcu.sh summary ./logs/Duke/my_output
+#   bash scripts/run_duke_osnet_fdmf_osbbm.sh 0,1 2
+#   bash scripts/run_duke_osnet_fdmf_osbbm.sh 0,1 2 ./logs/Duke/my_output
+#   bash scripts/run_duke_osnet_fdmf_osbbm.sh summary ./logs/Duke/my_output
+# The script writes summary.tsv and summary.csv under OUTPUT_BASE by default.
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
 
 if [ "${1:-}" = "--summary-only" ] || [ "${1:-}" = "summary" ]; then
   SUMMARY_ONLY=1
@@ -18,9 +24,12 @@ else
   OUTPUT_BASE_ARG="${3:-}"
 fi
 
-CONFIG="${CONFIG:-configs/DukeMTMC/mambavision_tiny_osnet_stage_fcu_b64k4.yml}"
-OUTPUT_BASE="${OUTPUT_BASE:-${OUTPUT_BASE_ARG:-./logs/Duke/osnet_stage_fcu_directional}}"
+CONFIG="${CONFIG:-configs/DukeMTMC/mambavision_tiny_osnet_fdmf_msef_stage_fcu_b64k4.yml}"
+OUTPUT_BASE="${OUTPUT_BASE:-${OUTPUT_BASE_ARG:-./logs/Duke/osnet_fdmf_osbbm}}"
 OSNET_PRETRAIN="${OSNET_PRETRAIN:-/workspace/pretrained/osnet_x1_0_imagenet.pth}"
+SKIP_COMPLETED="${SKIP_COMPLETED:-1}"
+COMPLETE_EPOCH="${COMPLETE_EPOCH:-160}"
+TEST_BATCH="${TEST_BATCH:-128}"
 SUMMARY_TSV="${OUTPUT_BASE}/summary.tsv"
 SUMMARY_CSV="${OUTPUT_BASE}/summary.csv"
 
@@ -31,61 +40,82 @@ if [ "${#GPUS[@]}" -eq 0 ]; then
   GPUS=("0")
 fi
 
+# name|enabled|prob|num_blocks|num_mix_blocks|gray_prob
 declare -a EXPERIMENTS=(
-  "stage_fcu_s2_o2m_osw1_fuw1|[2]|osnet_to_mamba|0.1|1.0|1.0"
-  "stage_fcu_s2_m2o_osw1_fuw1|[2]|mamba_to_osnet|0.1|1.0|1.0"
-  "stage_fcu_s3_o2m_osw1_fuw1|[3]|osnet_to_mamba|0.1|1.0|1.0"
-  "stage_fcu_s3_m2o_osw1_fuw1|[3]|mamba_to_osnet|0.1|1.0|1.0"
-  "stage_fcu_s2o2m_s3m2o_osw1_fuw1|[2,3]|s2_o2m_s3_m2o|0.1|1.0|1.0"
+  "no_osbbm|False|0.00|8|2|0.50"
+  "osbbm_p025_b8_m2_g05|True|0.25|8|2|0.50"
+  "osbbm_p050_b8_m2_g05|True|0.50|8|2|0.50"
+  "osbbm_p075_b8_m2_g05|True|0.75|8|2|0.50"
+  "osbbm_p050_b8_m1_g05|True|0.50|8|1|0.50"
+  "osbbm_p050_b8_m3_g05|True|0.50|8|3|0.50"
+  "osbbm_p050_b8_m4_g05|True|0.50|8|4|0.50"
+  "osbbm_p050_b6_m2_g05|True|0.50|6|2|0.50"
+  "osbbm_p050_b10_m2_g05|True|0.50|10|2|0.50"
+  "osbbm_p050_b12_m3_g05|True|0.50|12|3|0.50"
+  "osbbm_p050_b8_m2_g00|True|0.50|8|2|0.00"
+  "osbbm_p050_b8_m2_g025|True|0.50|8|2|0.25"
+  "osbbm_p050_b8_m2_g075|True|0.50|8|2|0.75"
+  "osbbm_p050_b8_m2_g10|True|0.50|8|2|1.00"
+  "osbbm_p025_b8_m4_g05|True|0.25|8|4|0.50"
+  "osbbm_p075_b8_m4_g05|True|0.75|8|4|0.50"
 )
 
 run_experiment() {
   local idx="$1"
   local spec="$2"
-  local name stages direction init_scale osnet_weight fused_weight
+  local name enabled prob blocks mix_blocks gray_prob
 
-  IFS='|' read -r name stages direction init_scale osnet_weight fused_weight <<< "${spec}"
+  IFS='|' read -r name enabled prob blocks mix_blocks gray_prob <<< "${spec}"
 
   local gpu="${GPUS[$((idx % ${#GPUS[@]}))]}"
   local output_dir="${OUTPUT_BASE}/${name}"
-  local fcu_direction="${direction}"
-  local stage2_direction=""
-  local stage3_direction=""
+  local train_log="${output_dir}/train_log.txt"
   local osnet_pretrain_opts=()
-  local fcu_stage_direction_opts=()
+
+  if [ "${SKIP_COMPLETED}" = "1" ] && [ -f "${train_log}" ] && grep -q "Validation (Regular) Results - Epoch:[[:space:]]*${COMPLETE_EPOCH}" "${train_log}"; then
+    echo "[DukeFDMFOSBBM] SKIP completed EXP=${name} output=${output_dir} epoch=${COMPLETE_EPOCH}"
+    return 0
+  fi
 
   if [ -n "${OSNET_PRETRAIN}" ]; then
     osnet_pretrain_opts=(MODEL.OSNET_FUSION.PRETRAIN_PATH "'${OSNET_PRETRAIN}'")
   fi
 
-  if [ "${direction}" = "s2_o2m_s3_m2o" ]; then
-    fcu_direction="bidirectional"
-    stage2_direction="osnet_to_mamba"
-    stage3_direction="mamba_to_osnet"
-    fcu_stage_direction_opts=(
-      MODEL.OSNET_FUSION.FCU_STAGE2_DIRECTION "'${stage2_direction}'"
-      MODEL.OSNET_FUSION.FCU_STAGE3_DIRECTION "'${stage3_direction}'"
-    )
-  fi
-
-  if [ "${FORCE_RUN:-0}" != "1" ] && [ -s "${output_dir}/train_log.txt" ]; then
-    echo "[DukeOSNetStageFCU] Skip existing EXP=${name}; set FORCE_RUN=1 to rerun."
-    return 0
-  fi
-
-  echo "[DukeOSNetStageFCU] GPU=${gpu} EXP=${name} output=${output_dir} stages=${stages} direction=${direction} stage2_dir=${stage2_direction:-${fcu_direction}} stage3_dir=${stage3_direction:-${fcu_direction}} init=${init_scale} osnet_w=${osnet_weight} fused_w=${fused_weight}"
+  echo "[DukeFDMFOSBBM] GPU=${gpu} EXP=${name} output=${output_dir} enabled=${enabled} prob=${prob} blocks=${blocks} mix=${mix_blocks} gray=${gray_prob}"
 
   CUDA_VISIBLE_DEVICES="${gpu}" python train.py --config_file "${CONFIG}" \
     MODEL.DEVICE_ID "'${gpu}'" \
     MODEL.OSNET_FUSION.ENABLED True \
-    MODEL.OSNET_FUSION.FUSION_TYPE "'stage_fcu'" \
+    MODEL.OSNET_FUSION.FUSION_TYPE "'fdmf'" \
     MODEL.OSNET_FUSION.FUSION_NORM "'none'" \
-    MODEL.OSNET_FUSION.FCU_STAGES "${stages}" \
-    MODEL.OSNET_FUSION.FCU_DIRECTION "'${fcu_direction}'" \
-    "${fcu_stage_direction_opts[@]}" \
-    MODEL.OSNET_FUSION.FCU_INIT_SCALE "${init_scale}" \
-    MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT "${osnet_weight}" \
-    MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT "${fused_weight}" \
+    MODEL.OSNET_FUSION.OSNET_LOSS_WEIGHT 0.5 \
+    MODEL.OSNET_FUSION.FUSED_LOSS_WEIGHT 1.0 \
+    MODEL.OSNET_FUSION.FCU_ENABLED True \
+    MODEL.OSNET_FUSION.FCU_STAGES "[2,3]" \
+    MODEL.OSNET_FUSION.FCU_DIRECTION "'bidirectional'" \
+    MODEL.OSNET_FUSION.FCU_STAGE2_DIRECTION "'osnet_to_mamba'" \
+    MODEL.OSNET_FUSION.FCU_STAGE3_DIRECTION "'mamba_to_osnet'" \
+    MODEL.OSNET_FUSION.FCU_INIT_SCALE 0.1 \
+    MODEL.OSNET_FUSION.FDMF_FILTER_TYPE "'none'" \
+    MODEL.OSNET_FUSION.FDMF_FUSED_FORM "'mamba_fdmf'" \
+    MODEL.OSNET_FUSION.FDMF_MAMBA_DEPTH 1 \
+    MODEL.OSNET_FUSION.FDMF_MAMBA_INIT_SCALE 0.1 \
+    MODEL.OSNET_FUSION.FDMF_MAMBA_BIDIRECTIONAL True \
+    MODEL.OSNET_FUSION.FDMF_MSEF_ENABLED True \
+    MODEL.OSNET_FUSION.FDMF_MSEF_REDUCTION_RATIO 16 \
+    MODEL.OSNET_FUSION.FDMF_MSEF_RES_SCALE_ENABLED False \
+    INPUT.OSBBM.ENABLED "${enabled}" \
+    INPUT.OSBBM.PROB "${prob}" \
+    INPUT.OSBBM.NUM_BLOCKS "${blocks}" \
+    INPUT.OSBBM.NUM_MIX_BLOCKS "${mix_blocks}" \
+    INPUT.OSBBM.GRAY_PROB "${gray_prob}" \
+    INPUT.OSBBM.APPLY_TO "'base'" \
+    INPUT.OSBBM.SCHEDULE "'always'" \
+    INPUT.OSBBM.START_EPOCH 1 \
+    INPUT.OSBBM.END_EPOCH 0 \
+    TEST.FEAT_MODE "'mamba_fdmf_osnet'" \
+    TEST.EVAL_ALL_FEATS False \
+    TEST.IMS_PER_BATCH "${TEST_BATCH}" \
     "${osnet_pretrain_opts[@]}" \
     OUTPUT_DIR "${output_dir}"
 }
@@ -93,19 +123,19 @@ run_experiment() {
 summarize_results() {
   local specs
   specs="$(printf "%s\n" "${EXPERIMENTS[@]}")"
-  echo "[DukeOSNetStageFCU] Summarizing results -> ${SUMMARY_TSV} and ${SUMMARY_CSV}"
+  echo "[DukeFDMFOSBBM] Summarizing results -> ${SUMMARY_TSV} and ${SUMMARY_CSV}"
 
-  DUKE_OSNET_STAGE_FCU_SPECS="${specs}" python - "${OUTPUT_BASE}" "${SUMMARY_TSV}" "${SUMMARY_CSV}" <<'PY'
+  DUKE_FDMF_OSBBM_SPECS="${specs}" python - "${OUTPUT_BASE}" "${SUMMARY_TSV}" "${SUMMARY_CSV}" <<'PY'
 import csv
 import os
 import re
 import sys
 
 output_base, summary_tsv, summary_csv = sys.argv[1:4]
-specs = [line for line in os.environ.get("DUKE_OSNET_STAGE_FCU_SPECS", "").splitlines() if line.strip()]
+specs = [line for line in os.environ.get("DUKE_FDMF_OSBBM_SPECS", "").splitlines() if line.strip()]
 
 fields = [
-    "name", "status", "stages", "direction", "init_scale", "osnet_weight", "fused_weight",
+    "name", "status", "enabled", "prob", "blocks", "mix_blocks", "gray_prob",
     "last_epoch", "last_mAP", "last_R1", "last_R5", "last_R10",
     "best_epoch", "best_mAP", "best_R1", "best_R5", "best_R10",
     "log_file",
@@ -114,7 +144,7 @@ fields = [
 epoch_re = re.compile(r"Validation \(Regular\) Results - Epoch:\s*(\d+)")
 map_re = re.compile(r"\bmAP:\s*([0-9.]+)%")
 rank_re = re.compile(r"Rank-(1|5|10)\s*:?\s*([0-9.]+)%")
-block_re = re.compile(r"(Validation .*Results|=== .*Results ===)")
+block_re = re.compile(r"(Validation .*Results|=== .*Results ===|MAMBA_FDMF_OSNET Results)")
 
 def complete(record):
     return all(record.get(k) for k in ("mAP", "R1", "R5", "R10"))
@@ -172,7 +202,7 @@ def empty_metrics(status, log_file):
 
 rows = []
 for spec in specs:
-    name, stages, direction, init_scale, osnet_weight, fused_weight = spec.split("|")
+    name, enabled, prob, blocks, mix_blocks, gray_prob = spec.split("|")
     output_dir = os.path.join(output_base, name)
     train_log = os.path.join(output_dir, "train_log.txt")
     test_log = os.path.join(output_dir, "test_log.txt")
@@ -180,11 +210,11 @@ for spec in specs:
 
     base = {
         "name": name,
-        "stages": stages,
-        "direction": direction,
-        "init_scale": init_scale,
-        "osnet_weight": osnet_weight,
-        "fused_weight": fused_weight,
+        "enabled": enabled,
+        "prob": prob,
+        "blocks": blocks,
+        "mix_blocks": mix_blocks,
+        "gray_prob": gray_prob,
     }
 
     if not os.path.exists(log_file):
@@ -222,14 +252,14 @@ for path, dialect in ((summary_tsv, "excel-tab"), (summary_csv, "excel")):
 
 print()
 print(
-    f"{'name':<31} {'status':<12} {'stages':<7} {'dir':<15} {'init':<6} {'osw':<5} {'fuw':<5} "
+    f"{'name':<27} {'status':<12} {'en':<5} {'prob':<5} {'blk':<4} {'mix':<4} {'gray':<5} "
     f"{'last_ep':<8} {'last_mAP':<8} {'last_R1':<8} "
     f"{'best_ep':<8} {'best_mAP':<8} {'best_R1':<8}"
 )
 for row in rows:
     print(
-        f"{row['name']:<31} {row['status']:<12} {row['stages']:<7} {row['direction']:<15} {row['init_scale']:<6} "
-        f"{row['osnet_weight']:<5} {row['fused_weight']:<5} "
+        f"{row['name']:<27} {row['status']:<12} {row['enabled']:<5} {row['prob']:<5} "
+        f"{row['blocks']:<4} {row['mix_blocks']:<4} {row['gray_prob']:<5} "
         f"{row['last_epoch']:<8} {row['last_mAP']:<8} {row['last_R1']:<8} "
         f"{row['best_epoch']:<8} {row['best_mAP']:<8} {row['best_R1']:<8}"
     )
@@ -237,13 +267,14 @@ PY
 }
 
 if [ "${SUMMARY_ONLY}" -eq 1 ]; then
-  echo "[DukeOSNetStageFCU] OUTPUT_BASE=${OUTPUT_BASE}"
+  echo "[DukeFDMFOSBBM] OUTPUT_BASE=${OUTPUT_BASE}"
   summarize_results
   exit 0
 fi
 
-echo "[DukeOSNetStageFCU] OUTPUT_BASE=${OUTPUT_BASE}"
-echo "[DukeOSNetStageFCU] Summary files: ${SUMMARY_TSV}, ${SUMMARY_CSV}"
+echo "[DukeFDMFOSBBM] OUTPUT_BASE=${OUTPUT_BASE}"
+echo "[DukeFDMFOSBBM] Summary files: ${SUMMARY_TSV}, ${SUMMARY_CSV}"
+echo "[DukeFDMFOSBBM] SKIP_COMPLETED=${SKIP_COMPLETED} COMPLETE_EPOCH=${COMPLETE_EPOCH} TEST_BATCH=${TEST_BATCH}"
 
 running=0
 failures=0
@@ -267,9 +298,9 @@ while [ "${running}" -gt 0 ]; do
 done
 
 summarize_results
-echo "[DukeOSNetStageFCU] All experiments finished."
+echo "[DukeFDMFOSBBM] All experiments finished."
 
 if [ "${failures}" -ne 0 ]; then
-  echo "[DukeOSNetStageFCU] One or more experiments failed. Check the logs above and ${OUTPUT_BASE}."
+  echo "[DukeFDMFOSBBM] One or more experiments failed. Check the logs above and ${OUTPUT_BASE}."
   exit 1
 fi

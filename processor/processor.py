@@ -40,7 +40,7 @@ def _select_eval_feature(cfg, feat):
     feat_mode = str(getattr(getattr(cfg, 'TEST', None), 'FEAT_MODE', 'concat')).lower()
     if feat_mode in feat:
         return feat[feat_mode]
-    for fallback in ('concat', 'backbone'):
+    for fallback in ('fdmf', 'concat', 'raw_concat', 'backbone'):
         if fallback in feat:
             return feat[fallback]
     raise KeyError('No usable feature key found in model output: {}'.format(sorted(feat.keys())))
@@ -52,6 +52,42 @@ def _cosine_with_padding(x, y):
     elif y.shape[1] < x.shape[1]:
         y = F.pad(y, (0, x.shape[1] - y.shape[1]))
     return F.cosine_similarity(x, y, dim=1).mean().item()
+
+
+def _fdmf_training_stats(cfg, feat):
+    osnet_fusion_cfg = getattr(getattr(cfg, 'MODEL', None), 'OSNET_FUSION', None)
+    if not bool(getattr(osnet_fusion_cfg, 'ENABLED', False)):
+        return None
+    if str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower() != 'fdmf':
+        return None
+    if not isinstance(feat, list) or len(feat) != 3:
+        return None
+
+    mamba_feat = feat[0].detach().float()
+    osnet_feat = feat[1].detach().float()
+    fused_feat = feat[2].detach().float()
+    mamba_dim = mamba_feat.shape[1]
+    osnet_dim = osnet_feat.shape[1]
+    fused_form = str(getattr(osnet_fusion_cfg, 'FDMF_FUSED_FORM', 'raw_fdmf')).lower()
+
+    if fused_form == 'fdmf_only':
+        fdmf_feat = fused_feat
+    elif fused_form == 'mamba_fdmf':
+        fdmf_feat = fused_feat[:, mamba_dim:]
+    elif fused_feat.shape[1] >= mamba_dim + osnet_dim:
+        fdmf_feat = fused_feat[:, mamba_dim + osnet_dim:]
+    else:
+        return None
+
+    raw_concat = torch.cat([mamba_feat, osnet_feat], dim=1)
+    stats = {
+        'mamba_norm': torch.norm(mamba_feat, p=2, dim=1).mean().item(),
+        'fdmf_norm': torch.norm(fdmf_feat, p=2, dim=1).mean().item(),
+        'cos_mamba_fdmf': F.cosine_similarity(mamba_feat, fdmf_feat, dim=1).mean().item()
+        if mamba_feat.shape[1] == fdmf_feat.shape[1] else 0.0,
+        'cos_fused_raw': _cosine_with_padding(fused_feat, raw_concat),
+    }
+    return stats
 
 
 def do_train(cfg,
@@ -77,17 +113,19 @@ def do_train(cfg,
     logger.info('start training')
     osbbm_cfg = getattr(cfg.INPUT, 'OSBBM', None)
     osbbm_enabled = bool(getattr(osbbm_cfg, 'ENABLED', False))
+    osbbm_mixed_label = bool(getattr(osbbm_cfg, 'MIXED_LABEL', True))
     if osbbm_enabled:
         osbbm_end_epoch = int(getattr(osbbm_cfg, 'END_EPOCH', 0))
         if osbbm_end_epoch <= 0:
             osbbm_end_epoch = epochs
         logger.info(
-            "[OSBBM] enabled: prob={:.2f}, blocks={}, mix_blocks={}, gray_prob={:.2f}, apply_to={}, schedule={}, start={}, end={}, period={}, on={}".format(
+            "[OSBBM] enabled: prob={:.2f}, blocks={}, mix_blocks={}, gray_prob={:.2f}, apply_to={}, mixed_label={}, schedule={}, start={}, end={}, period={}, on={}".format(
                 float(getattr(osbbm_cfg, 'PROB', 0.5)),
                 int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
                 int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
                 float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
                 str(getattr(osbbm_cfg, 'APPLY_TO', 'base')).lower(),
+                osbbm_mixed_label,
                 str(getattr(osbbm_cfg, 'SCHEDULE', 'always')).lower(),
                 int(getattr(osbbm_cfg, 'START_EPOCH', 1)),
                 osbbm_end_epoch,
@@ -121,6 +159,8 @@ def do_train(cfg,
         for n_iter, batch in enumerate(train_loader):
             optimizer.zero_grad()
             optimizer_center.zero_grad()
+            osbbm_target_b = None
+            osbbm_lambda = None
             if pam_enabled:
                 img_base, img_crop, img_erase, vid, target_cam, target_view = batch
                 target = vid.to(device)
@@ -131,7 +171,7 @@ def do_train(cfg,
                     apply_to = str(getattr(osbbm_cfg, 'APPLY_TO', 'base')).lower()
                     if apply_to not in ('base', 'all'):
                         raise ValueError("INPUT.OSBBM.APPLY_TO must be 'base' or 'all'")
-                    img_base = apply_osbbm_batch(
+                    img_base, osbbm_target_b, osbbm_lambda, osbbm_info = apply_osbbm_batch(
                         img_base,
                         target,
                         cfg.INPUT.PIXEL_MEAN,
@@ -140,6 +180,7 @@ def do_train(cfg,
                         num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
                         num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
                         gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                        return_info=True,
                     )
                     if apply_to == 'all':
                         img_crop = apply_osbbm_batch(
@@ -151,6 +192,7 @@ def do_train(cfg,
                             num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
                             num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
                             gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                            mix_info=osbbm_info,
                         )
                         img_erase = apply_osbbm_batch(
                             img_erase,
@@ -161,19 +203,23 @@ def do_train(cfg,
                             num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
                             num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
                             gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                            mix_info=osbbm_info,
                         )
                 img = (
                     img_base,
                     img_crop,
                     img_erase,
                 )
+                if not osbbm_mixed_label:
+                    osbbm_target_b = None
+                    osbbm_lambda = None
                 batch_size = img_base.shape[0]
             else:
                 img, vid, target_cam, target_view = batch
                 img = img.to(device)
                 target = vid.to(device)
                 if osbbm_active:
-                    img = apply_osbbm_batch(
+                    img, osbbm_target_b, osbbm_lambda, _ = apply_osbbm_batch(
                         img,
                         target,
                         cfg.INPUT.PIXEL_MEAN,
@@ -182,7 +228,11 @@ def do_train(cfg,
                         num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
                         num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
                         gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                        return_info=True,
                     )
+                    if not osbbm_mixed_label:
+                        osbbm_target_b = None
+                        osbbm_lambda = None
                 batch_size = img.shape[0]
             target_cam = target_cam.to(device)
             target_view = target_view.to(device)
@@ -190,11 +240,12 @@ def do_train(cfg,
                 score, feat = model(img, target, cam_label=target_cam, view_label=target_view)
             
             # Loss 计算在 FP32 下进行，避免 FP16 溢出导致 NaN
-            loss_result = loss_fn(score, feat, target, target_cam)
+            loss_result = loss_fn(score, feat, target, target_cam, osbbm_target_b, osbbm_lambda)
             if isinstance(loss_result, tuple):
                 loss, loss_detail = loss_result
             else:
                 loss, loss_detail = loss_result, None
+            fdmf_stats = _fdmf_training_stats(cfg, feat)
             scaler.scale(loss).backward()
 
             # Add Gradient Clipping (Configurable)
@@ -267,6 +318,13 @@ def do_train(cfg,
                             log_msg += " | RATR[{}]={:.4f}".format(
                                 loss_detail.get('ratr_pair', 'pair'),
                                 loss_detail['ratr'],
+                            )
+                        if fdmf_stats is not None:
+                            log_msg += " | FDMFStats[M_norm={:.3f}, F_norm={:.3f}, cos(M,F)={:.3f}, cos(Fused,RawCat)={:.3f}]".format(
+                                fdmf_stats['mamba_norm'],
+                                fdmf_stats['fdmf_norm'],
+                                fdmf_stats['cos_mamba_fdmf'],
+                                fdmf_stats['cos_fused_raw'],
                             )
                     else:
                         s_lambda = loss_detail.get('sfm_lambda', 0.0)
@@ -401,6 +459,8 @@ def do_inference(cfg,
         float(beta)
         for beta in getattr(getattr(cfg, 'TEST', None), 'BRANCH_NORM_BETAS', [])
     ]
+    eval_all_feats = bool(getattr(getattr(cfg, 'TEST', None), 'EVAL_ALL_FEATS', True))
+    preferred_feat = str(getattr(getattr(cfg, 'TEST', None), 'FEAT_MODE', 'concat')).lower()
     
     # Collect features for all reported branches.
     all_feats = {}
@@ -417,10 +477,16 @@ def do_inference(cfg,
             
             # Handle dict output (multi-branch modes) or tensor output (normal mode)
             if isinstance(feat, dict):
-                for key in feat.keys():
-                    all_feats.setdefault(key, [])
-                    all_feats[key].append(feat[key].cpu())
-                if 'backbone' in feat and 'osnet' in feat:
+                if eval_all_feats:
+                    for key in feat.keys():
+                        all_feats.setdefault(key, [])
+                        all_feats[key].append(feat[key].cpu())
+                else:
+                    selected_feat = _select_eval_feature(cfg, feat)
+                    all_feats.setdefault(preferred_feat, [])
+                    all_feats[preferred_feat].append(selected_feat.cpu())
+
+                if eval_all_feats and 'backbone' in feat and 'osnet' in feat:
                     mamba_feat = feat['backbone']
                     osnet_feat = feat['osnet']
                     branch_norm_stats['mamba'].append(torch.norm(mamba_feat, p=2, dim=1).cpu())
@@ -496,8 +562,7 @@ def do_inference(cfg,
         for r in [1, 5, 10]:
             logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
     
-    preferred_feat = str(getattr(getattr(cfg, 'TEST', None), 'FEAT_MODE', 'concat')).lower()
-    for key in (preferred_feat, 'concat', 'backbone'):
+    for key in (preferred_feat, 'fdmf', 'concat', 'raw_concat', 'backbone'):
         if key in results:
             return results[key]['cmc'][0], results[key]['cmc'][4]
     return 0.0, 0.0

@@ -1152,14 +1152,195 @@ _factory_osnet = {
 }
 
 
+class SameScaleFrequencyMambaBlock(nn.Module):
+    """Spatial Mamba block for a same-scale feature map."""
+
+    def __init__(
+        self,
+        dim,
+        mlp_ratio=2.0,
+        init_scale=0.1,
+        d_state=8,
+        d_conv=3,
+        bidirectional=True,
+    ):
+        super().__init__()
+        hidden_dim = max(int(dim * mlp_ratio), dim)
+        self.bidirectional = bidirectional
+        self.norm1 = nn.LayerNorm(dim)
+        self.mixer = MambaVisionMixer(
+            d_model=dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=1,
+            use_sasf=False,
+        )
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+        )
+        self.gamma1 = nn.Parameter(init_scale * torch.ones(dim))
+        self.gamma2 = nn.Parameter(init_scale * torch.ones(dim))
+        self.gamma1._no_weight_decay = True
+        self.gamma2._no_weight_decay = True
+
+    def forward(self, feature_map):
+        b, c, h, w = feature_map.shape
+        seq = feature_map.flatten(2).transpose(1, 2).contiguous()
+        seq_norm = self.norm1(seq)
+        mixed = self.mixer(seq_norm, H=h, W=w)
+        if self.bidirectional:
+            rev_norm = torch.flip(seq_norm, dims=(1,)).contiguous()
+            mixed_rev = self.mixer(rev_norm, H=h, W=w)
+            mixed = 0.5 * (mixed + torch.flip(mixed_rev, dims=(1,)))
+        seq = seq + self.gamma1 * mixed
+        seq = seq + self.gamma2 * self.mlp(self.norm2(seq))
+        return seq.transpose(1, 2).reshape(b, c, h, w).contiguous()
+
+
+class MSEFBlock(nn.Module):
+    """Multi-Scale Enhancement Fusion block from Multinex.
+
+    Spatial-channel product interaction with tanh-gated channel recalibration.
+    DWConv_3x3(LN(x)) * tanh_SE(LN(x)) + x
+    """
+
+    def __init__(self, ch, reduction_ratio=16, use_res_scale=False, res_scale_init=0.1):
+        super().__init__()
+        hidden = max(ch // int(reduction_ratio), 1)
+        self.layer_norm = nn.LayerNorm(ch)
+        self.depthwise_conv = nn.Conv2d(ch, ch, kernel_size=3, padding=1, groups=ch)
+        self.se_pool = nn.AdaptiveAvgPool2d(1)
+        self.se_fc1 = nn.Linear(ch, hidden)
+        self.se_fc2 = nn.Linear(hidden, ch)
+        self.res_scale = nn.Parameter(torch.ones(1) * float(res_scale_init)) if use_res_scale else None
+        if self.res_scale is not None:
+            self.res_scale._no_weight_decay = True
+
+    def forward(self, x):
+        identity = x
+        x_norm = self.layer_norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2).contiguous()
+        x1 = self.depthwise_conv(x_norm)
+        x2 = self.se_pool(x_norm).flatten(1)
+        x2 = F.relu(self.se_fc1(x2))
+        x2 = torch.tanh(self.se_fc2(x2)).view(x.shape[0], x.shape[1], 1, 1)
+        delta = x1 * x2
+        if self.res_scale is not None:
+            delta = self.res_scale.to(dtype=delta.dtype) * delta
+        return identity + delta
+
+
+class SameScaleFrequencyMambaFusion(nn.Module):
+    """Same-scale OSNet/Mamba map fusion followed by SpatialMamba refinement.
+
+    The FDMF interface is kept for config/checkpoint compatibility, but the
+    frequency low/high decomposition path has been removed. The module now uses:
+        F_init = Conv1x1(cat(MambaMap, OSNetMap))
+        F_out  = SpatialMamba(F_init)
+    """
+
+    def __init__(
+        self,
+        dim,
+        osnet_dim,
+        compressed_channels=64,
+        lowpass_kernel=5,
+        highpass_kernel=3,
+        use_hamming=True,
+        filter_type='none',
+        mamba_depth=1,
+        mamba_d_state=8,
+        mamba_d_conv=3,
+        mamba_init_scale=0.1,
+        mamba_bidirectional=True,
+        mlp_ratio=2.0,
+        msef_enabled=True,
+        msef_reduction_ratio=16,
+        msef_res_scale_enabled=False,
+        msef_res_scale_init=0.1,
+    ):
+        super().__init__()
+        if mamba_depth < 0:
+            raise ValueError('FDMF_MAMBA_DEPTH must be >= 0')
+        self.dim = dim
+        self.filter_type = 'none'
+        self.osnet_map_proj = (
+            nn.Identity()
+            if osnet_dim == dim
+            else nn.Sequential(
+                nn.Conv2d(osnet_dim, dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(dim),
+            )
+        )
+        self.fuse_proj = nn.Sequential(
+            nn.Conv2d(dim * 2, dim, kernel_size=1, bias=False),
+            nn.BatchNorm2d(dim),
+            nn.SiLU(inplace=True),
+        )
+        self.mamba_blocks = nn.ModuleList([
+            SameScaleFrequencyMambaBlock(
+                dim,
+                mlp_ratio=mlp_ratio,
+                init_scale=mamba_init_scale,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                bidirectional=mamba_bidirectional,
+            )
+            for _ in range(mamba_depth)
+        ])
+        self.msef = (
+            MSEFBlock(
+                dim,
+                reduction_ratio=msef_reduction_ratio,
+                use_res_scale=msef_res_scale_enabled,
+                res_scale_init=msef_res_scale_init,
+            )
+            if msef_enabled
+            else nn.Identity()
+        )
+
+        self.osnet_map_proj.apply(weights_init_kaiming)
+        self.fuse_proj.apply(weights_init_kaiming)
+
+    def forward(self, mamba_map, osnet_map):
+        if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
+            osnet_map = F.interpolate(
+                osnet_map,
+                size=mamba_map.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        osnet_map = self.osnet_map_proj(osnet_map)
+
+        fused_map = self.fuse_proj(torch.cat([mamba_map, osnet_map], dim=1))
+        for block in self.mamba_blocks:
+            fused_map = block(fused_map)
+        fused_map = self.msef(fused_map)
+        return fused_map
+
+
 class StageFCU(nn.Module):
     """Bidirectional stage-level coupling inspired by Conformer FCU."""
 
-    def __init__(self, mamba_dim, osnet_dim, init_scale=0.1, direction='bidirectional'):
+    def __init__(
+        self,
+        mamba_dim,
+        osnet_dim,
+        init_scale=0.1,
+        direction='bidirectional',
+        gate_type='none',
+        gate_reduction=16,
+        gate_init_bias=0.0,
+    ):
         super().__init__()
         self.direction = str(direction).lower()
         if self.direction not in ('bidirectional', 'osnet_to_mamba', 'mamba_to_osnet'):
             raise ValueError("FCU direction must be 'bidirectional', 'osnet_to_mamba', or 'mamba_to_osnet'")
+        self.gate_type = str(gate_type).lower()
+        if self.gate_type not in ('none', 'channel'):
+            raise ValueError("FCU gate_type must be 'none' or 'channel'")
         self.mamba_from_osnet = nn.Sequential(
             nn.Conv2d(osnet_dim, mamba_dim, kernel_size=1, bias=False),
             nn.BatchNorm2d(mamba_dim),
@@ -1172,6 +1353,32 @@ class StageFCU(nn.Module):
         )
         self.fusion_scale_mamba = nn.Parameter(torch.ones(1) * float(init_scale))
         self.fusion_scale_osnet = nn.Parameter(torch.ones(1) * float(init_scale))
+        if self.gate_type == 'channel':
+            self.mamba_gate = self._make_channel_gate(mamba_dim, gate_reduction, gate_init_bias)
+            self.osnet_gate = self._make_channel_gate(osnet_dim, gate_reduction, gate_init_bias)
+        else:
+            self.mamba_gate = None
+            self.osnet_gate = None
+
+    @staticmethod
+    def _make_channel_gate(dim, reduction, init_bias):
+        hidden_dim = max(int(dim) // max(int(reduction), 1), 4)
+        gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(dim * 2, hidden_dim, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_dim, dim, kernel_size=1, bias=True),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(gate[3].weight)
+        nn.init.constant_(gate[3].bias, float(init_bias))
+        return gate
+
+    def _gate_delta(self, target_map, delta_map, gate):
+        if gate is None:
+            return delta_map
+        gate_input = torch.cat([target_map, delta_map], dim=1).float()
+        return delta_map * gate(gate_input).to(delta_map.dtype)
 
     def forward(self, mamba_map, osnet_map):
         new_mamba_map = mamba_map
@@ -1186,6 +1393,7 @@ class StageFCU(nn.Module):
                     mode='bilinear',
                     align_corners=False,
                 )
+            osnet_to_mamba = self._gate_delta(mamba_map, osnet_to_mamba, self.mamba_gate)
             new_mamba_map = mamba_map + self.fusion_scale_mamba.to(mamba_map.dtype) * osnet_to_mamba
 
         if self.direction in ('bidirectional', 'mamba_to_osnet'):
@@ -1197,6 +1405,7 @@ class StageFCU(nn.Module):
                     mode='bilinear',
                     align_corners=False,
                 )
+            mamba_to_osnet = self._gate_delta(osnet_map, mamba_to_osnet, self.osnet_gate)
             new_osnet_map = osnet_map + self.fusion_scale_osnet.to(osnet_map.dtype) * mamba_to_osnet
 
         return new_mamba_map, new_osnet_map
@@ -1221,12 +1430,17 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_type = str(getattr(fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
         self.fusion_norm = str(getattr(fusion_cfg, 'FUSION_NORM', 'none')).lower()
         self.fusion_beta = float(getattr(fusion_cfg, 'FUSION_BETA', 1.0))
-        if self.fusion_type not in ('descriptor', 'stage_fcu'):
-            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be 'descriptor' or 'stage_fcu'")
+        if self.fusion_type not in ('descriptor', 'stage_fcu', 'fdmf'):
+            raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be 'descriptor', 'stage_fcu', or 'fdmf'")
         if self.fusion_norm not in ('none', 'branch', 'weighted_branch'):
             raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be one of: none, branch, weighted_branch")
+        if self.fusion_type == 'fdmf' and self.fusion_norm != 'none':
+            raise ValueError("MODEL.OSNET_FUSION.FUSION_NORM must be 'none' for fdmf")
         if self.fusion_beta < 0:
             raise ValueError('MODEL.OSNET_FUSION.FUSION_BETA must be non-negative')
+        self.fdmf_fused_form = str(getattr(fusion_cfg, 'FDMF_FUSED_FORM', 'raw_fdmf')).lower()
+        if self.fdmf_fused_form not in ('mamba_fdmf', 'raw_fdmf', 'fdmf_only'):
+            raise ValueError("MODEL.OSNET_FUSION.FDMF_FUSED_FORM must be 'mamba_fdmf', 'raw_fdmf', or 'fdmf_only'")
 
         self.mamba = build_transformer(num_classes, camera_num, view_num, cfg, factory)
         self.mamba_dim = self.mamba.in_planes
@@ -1262,13 +1476,42 @@ class MambaOSNetFusion(nn.Module):
         self.osnet_bottleneck.apply(weights_init_kaiming)
         self.osnet_classifier = self._make_classifier(self.osnet_dim)
 
-        self.fusion_dim = self.mamba_dim + self.osnet_dim
+        self.fdmf_refiner = None
+        if self.fusion_type == 'fdmf':
+            self.fdmf_refiner = SameScaleFrequencyMambaFusion(
+                dim=self.mamba_dim,
+                osnet_dim=self.osnet_map_dim,
+                compressed_channels=int(getattr(fusion_cfg, 'FDMF_COMPRESSED_CHANNELS', 64)),
+                lowpass_kernel=int(getattr(fusion_cfg, 'FDMF_LOWPASS_KERNEL', 5)),
+                highpass_kernel=int(getattr(fusion_cfg, 'FDMF_HIGHPASS_KERNEL', 3)),
+                use_hamming=bool(getattr(fusion_cfg, 'FDMF_HAMMING_WINDOW', True)),
+                filter_type=str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
+                mamba_depth=int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
+                mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
+                mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
+                mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
+                mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
+                msef_enabled=bool(getattr(fusion_cfg, 'FDMF_MSEF_ENABLED', True)),
+                msef_reduction_ratio=int(getattr(fusion_cfg, 'FDMF_MSEF_REDUCTION_RATIO', 16)),
+                msef_res_scale_enabled=bool(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_ENABLED', False)),
+                msef_res_scale_init=float(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_INIT', 0.1)),
+            )
+            if self.fdmf_fused_form == 'raw_fdmf':
+                self.fusion_dim = self.mamba_dim + self.osnet_dim + self.mamba_dim
+            elif self.fdmf_fused_form == 'mamba_fdmf':
+                self.fusion_dim = self.mamba_dim * 2
+            else:
+                self.fusion_dim = self.mamba_dim
+        else:
+            self.fusion_dim = self.mamba_dim + self.osnet_dim
         self.fusion_bottleneck = nn.BatchNorm1d(self.fusion_dim)
         self.fusion_bottleneck.bias.requires_grad_(False)
         self.fusion_bottleneck.apply(weights_init_kaiming)
         self.fusion_classifier = self._make_classifier(self.fusion_dim)
 
-        if self.fusion_type == 'stage_fcu':
+        self.use_stage_fcu_exchange = self.fusion_type == 'stage_fcu' or bool(getattr(fusion_cfg, 'FCU_ENABLED', False))
+        if self.use_stage_fcu_exchange:
             if not hasattr(self.mamba.base, 'levels') or len(self.mamba.base.levels) < 4:
                 raise ValueError('stage_fcu requires a MambaVision backbone with four stages')
             self.fcu_stages = [int(stage) for stage in getattr(fusion_cfg, 'FCU_STAGES', [2, 3])]
@@ -1280,45 +1523,76 @@ class MambaOSNetFusion(nn.Module):
             mamba_stage2_dim = self._mamba_stage_out_dim(self.mamba.base.levels[1])
             mamba_stage3_dim = self._mamba_stage_out_dim(self.mamba.base.levels[2])
             fcu_init_scale = float(getattr(fusion_cfg, 'FCU_INIT_SCALE', 0.1))
+            fcu_gate_type = str(getattr(fusion_cfg, 'FCU_GATE_TYPE', 'none')).lower()
+            fcu_gate_reduction = int(getattr(fusion_cfg, 'FCU_GATE_REDUCTION', 16))
+            fcu_gate_init_bias = float(getattr(fusion_cfg, 'FCU_GATE_INIT_BIAS', 0.0))
             self.fcu_direction = str(getattr(fusion_cfg, 'FCU_DIRECTION', 'bidirectional')).lower()
+            self.fcu_stage2_direction = str(getattr(fusion_cfg, 'FCU_STAGE2_DIRECTION', '')).lower()
+            self.fcu_stage3_direction = str(getattr(fusion_cfg, 'FCU_STAGE3_DIRECTION', '')).lower()
+            if not self.fcu_stage2_direction:
+                self.fcu_stage2_direction = self.fcu_direction
+            if not self.fcu_stage3_direction:
+                self.fcu_stage3_direction = self.fcu_direction
             if 2 in self.fcu_stages:
                 self.stage2_fcu = StageFCU(
                     mamba_stage2_dim,
                     self.osnet_stage2_dim,
                     init_scale=fcu_init_scale,
-                    direction=self.fcu_direction,
+                    direction=self.fcu_stage2_direction,
+                    gate_type=fcu_gate_type,
+                    gate_reduction=fcu_gate_reduction,
+                    gate_init_bias=fcu_gate_init_bias,
                 )
             if 3 in self.fcu_stages:
                 self.stage3_fcu = StageFCU(
                     mamba_stage3_dim,
                     self.osnet_stage3_dim,
                     init_scale=fcu_init_scale,
-                    direction=self.fcu_direction,
+                    direction=self.fcu_stage3_direction,
+                    gate_type=fcu_gate_type,
+                    gate_reduction=fcu_gate_reduction,
+                    gate_init_bias=fcu_gate_init_bias,
                 )
 
         print(
-            '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_norm={}, beta={:.2f}'.format(
+            '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_dim={}, fusion_norm={}, beta={:.2f}'.format(
                 self.fusion_type,
                 self.mamba_dim,
                 osnet_type,
                 self.osnet_dim,
+                self.fusion_dim,
                 self.fusion_norm,
                 self.fusion_beta,
             )
         )
-        if self.fusion_type == 'stage_fcu':
+        if self.fusion_type == 'fdmf':
             print(
-                '[Model] Stage-FCU exchange enabled at stages={}, direction={}, init_scale={:.3f}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
+                '[Model] FDMF enabled: osnet_map_dim={}, form={}, filter={}, bidirectional={}, msef={}, msef_res_scale={}'.format(
+                    self.osnet_map_dim,
+                    self.fdmf_fused_form,
+                    self.fdmf_refiner.filter_type,
+                    bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                    bool(getattr(fusion_cfg, 'FDMF_MSEF_ENABLED', True)),
+                    bool(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_ENABLED', False)),
+                )
+            )
+        if self.use_stage_fcu_exchange:
+            print(
+                '[Model] Stage-FCU exchange enabled at stages={}, direction={}, stage2_direction={}, stage3_direction={}, init_scale={:.3f}, gate_type={}, gate_reduction={}, gate_init_bias={:.2f}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
                     self.fcu_stages,
                     self.fcu_direction,
+                    self.fcu_stage2_direction,
+                    self.fcu_stage3_direction,
                     fcu_init_scale,
+                    fcu_gate_type,
+                    fcu_gate_reduction,
+                    fcu_gate_init_bias,
                     mamba_stage2_dim,
                     self.osnet_stage2_dim,
                     mamba_stage3_dim,
                     self.osnet_stage3_dim,
                 )
             )
-
     def _make_classifier(self, in_planes):
         if self.ID_LOSS_TYPE == 'arcface':
             return Arcface(in_planes, self.num_classes, s=self.cosine_scale, m=self.cosine_margin)
@@ -1360,6 +1634,19 @@ class MambaOSNetFusion(nn.Module):
         if self.fusion_norm == 'weighted_branch':
             osnet_feat_n = self.fusion_beta * osnet_feat_n
         return torch.cat([mamba_feat_n, osnet_feat_n], dim=1)
+
+    def _make_fdmf_fused_feat(self, mamba_feat, osnet_feat, mamba_map, osnet_map, return_fdmf_feat=False):
+        fdmf_map = self.fdmf_refiner(mamba_map, osnet_map)
+        fdmf_feat = self.mamba._pool_feature_map(fdmf_map)
+        if self.fdmf_fused_form == 'raw_fdmf':
+            fused_feat = torch.cat([mamba_feat, osnet_feat, fdmf_feat], dim=1)
+        elif self.fdmf_fused_form == 'mamba_fdmf':
+            fused_feat = torch.cat([mamba_feat, fdmf_feat], dim=1)
+        else:
+            fused_feat = fdmf_feat
+        if return_fdmf_feat:
+            return fused_feat, fdmf_feat
+        return fused_feat
 
     def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None, return_map=False):
         output = self.mamba.base(x, cam_label=cam_label, view_label=view_label)
@@ -1438,7 +1725,7 @@ class MambaOSNetFusion(nn.Module):
         osnet_map = self.osnet.conv5(osnet_map)
         return mamba_map, osnet_map
 
-    def _forward_stage_fcu_branches(self, x, label=None, cam_label=None, view_label=None):
+    def _forward_stage_fcu_branches(self, x, label=None, cam_label=None, view_label=None, return_map=False):
         mamba_map, osnet_map = self._forward_stage_fcu_maps(
             x,
             cam_label=cam_label,
@@ -1457,56 +1744,111 @@ class MambaOSNetFusion(nn.Module):
         if self.training:
             mamba_score = self.mamba._classify(self.mamba.classifier, mamba_bn, label)
             osnet_score = self._classify(self.osnet_classifier, osnet_bn, label)
+            if return_map:
+                return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn, mamba_map, osnet_map
             return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn
+        if return_map:
+            return mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map
         return mamba_feat, mamba_bn, osnet_feat, osnet_bn
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
+        use_fdmf = self.fusion_type == 'fdmf'
         if self.training:
-            if self.fusion_type == 'stage_fcu':
-                (
-                    mamba_score,
-                    mamba_feat,
-                    mamba_bn,
-                    osnet_score,
-                    osnet_feat,
-                    osnet_bn,
-                ) = self._forward_stage_fcu_branches(
+            if self.use_stage_fcu_exchange:
+                stage_out = self._forward_stage_fcu_branches(
                     x,
                     label=label,
                     cam_label=cam_label,
                     view_label=view_label,
+                    return_map=use_fdmf,
                 )
+                if use_fdmf:
+                    (
+                        mamba_score,
+                        mamba_feat,
+                        mamba_bn,
+                        osnet_score,
+                        osnet_feat,
+                        osnet_bn,
+                        mamba_map,
+                        osnet_map,
+                    ) = stage_out
+                    fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
+                else:
+                    (
+                        mamba_score,
+                        mamba_feat,
+                        mamba_bn,
+                        osnet_score,
+                        osnet_feat,
+                        osnet_bn,
+                    ) = stage_out
             else:
                 mamba_out = self._forward_mamba_branch(
                     x,
                     label=label,
                     cam_label=cam_label,
                     view_label=view_label,
+                    return_map=use_fdmf,
                 )
-                osnet_out = self._forward_osnet_branch(x, label=label)
-                mamba_score, mamba_feat, mamba_bn = mamba_out
-                osnet_score, osnet_feat, osnet_bn = osnet_out
-            fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
+                osnet_out = self._forward_osnet_branch(x, label=label, return_map=use_fdmf)
+                if use_fdmf:
+                    mamba_score, mamba_feat, mamba_bn, mamba_map = mamba_out
+                    osnet_score, osnet_feat, osnet_bn, osnet_map = osnet_out
+                    fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
+                else:
+                    mamba_score, mamba_feat, mamba_bn = mamba_out
+                    osnet_score, osnet_feat, osnet_bn = osnet_out
+                    fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
+            if self.use_stage_fcu_exchange and not use_fdmf:
+                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
             fused_bn = self.fusion_bottleneck(fused_feat)
             fused_score = self._classify(self.fusion_classifier, fused_bn, label)
             return [mamba_score, osnet_score, fused_score], [mamba_feat, osnet_feat, fused_feat]
 
-        if self.fusion_type == 'stage_fcu':
-            mamba_feat, mamba_bn, osnet_feat, osnet_bn = self._forward_stage_fcu_branches(
+        if self.use_stage_fcu_exchange:
+            stage_out = self._forward_stage_fcu_branches(
                 x,
                 cam_label=cam_label,
                 view_label=view_label,
+                return_map=use_fdmf,
             )
+            if use_fdmf:
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map = stage_out
+                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
+                    mamba_feat,
+                    osnet_feat,
+                    mamba_map,
+                    osnet_map,
+                    return_fdmf_feat=True,
+                )
+            else:
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn = stage_out
+                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         else:
             mamba_out = self._forward_mamba_branch(
                 x,
                 cam_label=cam_label,
                 view_label=view_label,
+                return_map=use_fdmf,
             )
-            osnet_out = self._forward_osnet_branch(x)
-            mamba_feat, mamba_bn = mamba_out
-            osnet_feat, osnet_bn = osnet_out
-        fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
+            osnet_out = self._forward_osnet_branch(x, return_map=use_fdmf)
+            if use_fdmf:
+                mamba_feat, mamba_bn, mamba_map = mamba_out
+                osnet_feat, osnet_bn, osnet_map = osnet_out
+                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
+                    mamba_feat,
+                    osnet_feat,
+                    mamba_map,
+                    osnet_map,
+                    return_fdmf_feat=True,
+                )
+            else:
+                mamba_feat, mamba_bn = mamba_out
+                osnet_feat, osnet_bn = osnet_out
+                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
+        if self.use_stage_fcu_exchange and not use_fdmf:
+            fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         fused_bn = self.fusion_bottleneck(fused_feat)
 
         if self.neck_feat == 'after':
@@ -1521,8 +1863,13 @@ class MambaOSNetFusion(nn.Module):
         output = {
             'backbone': mamba_out,
             'osnet': osnet_out,
-            'concat': fused_out,
         }
+        if use_fdmf:
+            output['raw_concat'] = torch.cat([mamba_out, osnet_out], dim=1)
+            output['fdmf'] = fused_out
+            output['mamba_fdmf_osnet'] = torch.cat([mamba_out, fdmf_feat, osnet_out], dim=1)
+        else:
+            output['concat'] = fused_out
         return output
 
     def load_param(self, trained_path):

@@ -4,9 +4,10 @@
 @contact: sherlockliao01@gmail.com
 """
 
+import torch
 import torch.nn.functional as F
 from .softmax_loss import CrossEntropyLabelSmooth, LabelSmoothingCrossEntropy
-from .triplet_loss import TripletLoss
+from .triplet_loss import TripletLoss, euclidean_dist, hard_example_mining
 from .center_loss import CenterLoss
 from .ratr_loss import RATRLoss
 
@@ -29,6 +30,39 @@ def make_loss(cfg, num_classes):    # modified by gu
     if cfg.MODEL.IF_LABELSMOOTH == 'on':
         xent = CrossEntropyLabelSmooth(num_classes=num_classes)
         print("label smooth on, numclasses:", num_classes)
+
+    def _ce_vector(inputs, targets):
+        inputs = inputs.float()
+        if cfg.MODEL.IF_LABELSMOOTH == 'on':
+            log_probs = F.log_softmax(inputs, dim=1)
+            one_hot = torch.zeros_like(log_probs).scatter_(1, targets.unsqueeze(1), 1)
+            smooth_targets = (1 - xent.epsilon) * one_hot + xent.epsilon / num_classes
+            return (-smooth_targets * log_probs).sum(dim=1)
+        return F.cross_entropy(inputs, targets, reduction='none')
+
+    def _id_loss(inputs, target_a, target_b=None, lam=None):
+        loss_a = _ce_vector(inputs, target_a)
+        if target_b is None or lam is None:
+            return loss_a.mean()
+        lam = lam.to(device=inputs.device, dtype=loss_a.dtype).view(-1)
+        loss_b = _ce_vector(inputs, target_b.to(inputs.device))
+        return (lam * loss_a + (1.0 - lam) * loss_b).mean()
+
+    def _triplet_vector(global_feat, labels):
+        dist_mat = euclidean_dist(global_feat, global_feat)
+        dist_ap, dist_an = hard_example_mining(dist_mat, labels)
+        dist_ap *= (1.0 + triplet.hard_factor)
+        dist_an *= (1.0 - triplet.hard_factor)
+        y = dist_an.new_ones(dist_an.size())
+        if triplet.margin is not None:
+            return F.margin_ranking_loss(dist_an, dist_ap, y, margin=triplet.margin, reduction='none')
+        return F.soft_margin_loss(dist_an - dist_ap, y, reduction='none')
+
+    def _tri_loss(global_feat, target_a, target_b=None, lam=None):
+        global_feat = global_feat.float()
+        # OSBBM mixed labels are valid for ID/CE loss, but not for hard triplet
+        # mining: donor labels do not preserve the PK sampler structure.
+        return triplet(global_feat, target_a)[0]
     
     # RATR Loss 初始化
     ratr_fn = None
@@ -39,11 +73,11 @@ def make_loss(cfg, num_classes):    # modified by gu
         ratr_fn = RATRLoss(num_branches=2, num_classes=p, samples_per_class=pk, tau=tau)
 
     if sampler == 'softmax':
-        def loss_func(score, feat, target):
-            return F.cross_entropy(score, target)
+        def loss_func(score, feat, target, target_cam=None, osbbm_target=None, osbbm_lambda=None):
+            return _id_loss(score, target, osbbm_target, osbbm_lambda)
 
     elif cfg.DATALOADER.SAMPLER == 'softmax_triplet':
-        def loss_func(score, feat, target, target_cam):
+        def loss_func(score, feat, target, target_cam=None, osbbm_target=None, osbbm_lambda=None):
             nonlocal ratr_fn
             if cfg.MODEL.METRIC_LOSS_TYPE == 'triplet':
                 # 支持多分支模式 (PMS 或 SFM)
@@ -68,12 +102,15 @@ def make_loss(cfg, num_classes):    # modified by gu
                         id_losses = []
                         tri_losses = []
 
-                        for branch_score, branch_feat in zip(score[:3], feat[:3]):
-                            if cfg.MODEL.IF_LABELSMOOTH == 'on':
-                                id_losses.append(xent(branch_score.float(), target))
-                            else:
-                                id_losses.append(F.cross_entropy(branch_score.float(), target))
-                            tri_losses.append(triplet(branch_feat.float(), target)[0])
+                        osbbm_apply_to = str(getattr(getattr(cfg.INPUT, 'OSBBM', None), 'APPLY_TO', 'base')).lower()
+                        for branch_idx, (branch_score, branch_feat) in enumerate(zip(score[:3], feat[:3])):
+                            use_osbbm_labels = osbbm_target is not None and (
+                                branch_idx == 0 or osbbm_apply_to == 'all'
+                            )
+                            branch_target_b = osbbm_target if use_osbbm_labels else None
+                            branch_lambda = osbbm_lambda if use_osbbm_labels else None
+                            id_losses.append(_id_loss(branch_score, target, branch_target_b, branch_lambda))
+                            tri_losses.append(_tri_loss(branch_feat, target, branch_target_b, branch_lambda))
 
                         pam_denominator = 1.0 + 2.0 * pam_weight
                         ID_LOSS = (id_losses[0] + pam_weight * (id_losses[1] + id_losses[2])) / \
@@ -94,13 +131,12 @@ def make_loss(cfg, num_classes):    # modified by gu
                             local_tri_losses = []
 
                             aux_end = aux_start + local_num_stripes
+                            local_target_b = osbbm_target
+                            local_lambda = osbbm_lambda
                             for local_score, local_feat in zip(score[aux_start:aux_end], feat[aux_start:aux_end]):
-                                if cfg.MODEL.IF_LABELSMOOTH == 'on':
-                                    local_id_losses.append(xent(local_score.float(), target))
-                                else:
-                                    local_id_losses.append(F.cross_entropy(local_score.float(), target))
+                                local_id_losses.append(_id_loss(local_score, target, local_target_b, local_lambda))
                                 if local_use_triplet:
-                                    local_tri_losses.append(triplet(local_feat.float(), target)[0])
+                                    local_tri_losses.append(_tri_loss(local_feat, target, local_target_b, local_lambda))
 
                             LOCAL_ID_LOSS = sum(local_id_losses) / len(local_id_losses)
                             ID_LOSS = ID_LOSS + local_weight * LOCAL_ID_LOSS
@@ -125,7 +161,7 @@ def make_loss(cfg, num_classes):    # modified by gu
                             raise ValueError('OSNET_FUSION loss expects Mamba, OSNet and fused branches')
 
                         fusion_type = str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
-                        fused_branch_name = 'concat'
+                        fused_branch_name = 'fdmf' if fusion_type == 'fdmf' else 'concat'
                         branch_names = ('mamba', 'osnet', fused_branch_name)
                         branch_weights = (
                             1.0,
@@ -139,11 +175,8 @@ def make_loss(cfg, num_classes):    # modified by gu
                         id_losses = []
                         tri_losses = []
                         for branch_score, branch_feat in zip(score, feat):
-                            if cfg.MODEL.IF_LABELSMOOTH == 'on':
-                                id_losses.append(xent(branch_score.float(), target))
-                            else:
-                                id_losses.append(F.cross_entropy(branch_score.float(), target))
-                            tri_losses.append(triplet(branch_feat.float(), target)[0])
+                            id_losses.append(_id_loss(branch_score, target, osbbm_target, osbbm_lambda))
+                            tri_losses.append(_tri_loss(branch_feat, target, osbbm_target, osbbm_lambda))
 
                         ID_LOSS = sum(w * l for w, l in zip(branch_weights, id_losses)) / weight_sum
                         TRI_LOSS = sum(w * l for w, l in zip(branch_weights, tri_losses)) / weight_sum
@@ -158,6 +191,7 @@ def make_loss(cfg, num_classes):    # modified by gu
                             'w_mamba': branch_weights[0],
                             'w_osnet': branch_weights[1],
                             'w_concat': branch_weights[2],
+                            'w_fdmf': branch_weights[2],
                         }
                         for name, id_loss, tri_loss in zip(branch_names, id_losses, tri_losses):
                             loss_detail[f'id_{name}'] = id_loss.item()
@@ -194,11 +228,8 @@ def make_loss(cfg, num_classes):    # modified by gu
                         sfm_lambda_aux = getattr(cfg.SOLVER, 'SFM_LAMBDA_AUX', 0.5)
                         
                         # 1. Backbone 分支 (权重 = 1.0)
-                        if cfg.MODEL.IF_LABELSMOOTH == 'on':
-                            id_b = xent(score[0].float(), target)
-                        else:
-                            id_b = F.cross_entropy(score[0].float(), target)
-                        tri_b = triplet(feat[0].float(), target)[0]
+                        id_b = _id_loss(score[0], target, osbbm_target, osbbm_lambda)
+                        tri_b = _tri_loss(feat[0], target, osbbm_target, osbbm_lambda)
                         
                         # 2. Fused 分支 (循环处理所有聚合层级)
                         id_f_list = []
@@ -220,11 +251,8 @@ def make_loss(cfg, num_classes):    # modified by gu
                             is_last = (i == len(score) - 1)
                             w = sfm_lambda if is_last else sfm_lambda_aux
                             
-                            if cfg.MODEL.IF_LABELSMOOTH == 'on':
-                                id_fi = xent(score[i].float(), target)
-                            else:
-                                id_fi = F.cross_entropy(score[i].float(), target)
-                            tri_fi = triplet(feat[i].float(), target)[0]
+                            id_fi = _id_loss(score[i], target, osbbm_target, osbbm_lambda)
+                            tri_fi = _tri_loss(feat[i], target, osbbm_target, osbbm_lambda)
                             
                             total_id_loss = total_id_loss + w * id_fi
                             total_tri_loss = total_tri_loss + w * tri_fi
@@ -268,11 +296,8 @@ def make_loss(cfg, num_classes):    # modified by gu
                     raise ValueError('Unhandled multi-branch loss configuration')
                 else:
                     # 单分支逻辑
-                    if cfg.MODEL.IF_LABELSMOOTH == 'on':
-                        ID_LOSS = xent(score.float(), target)
-                    else:
-                        ID_LOSS = F.cross_entropy(score.float(), target)
-                    TRI_LOSS = triplet(feat.float(), target)[0]
+                    ID_LOSS = _id_loss(score, target, osbbm_target, osbbm_lambda)
+                    TRI_LOSS = _tri_loss(feat, target, osbbm_target, osbbm_lambda)
                     
                     return cfg.MODEL.ID_LOSS_WEIGHT * ID_LOSS + \
                            cfg.MODEL.TRIPLET_LOSS_WEIGHT * TRI_LOSS
