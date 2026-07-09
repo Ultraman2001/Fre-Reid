@@ -1484,64 +1484,6 @@ class StageFCU(nn.Module):
         return new_mamba_map, new_osnet_map
 
 
-class StripeConvEnhance(nn.Module):
-    """Lightweight local convolution enhancement inside a fused body stripe."""
-
-    def __init__(self, dim, conv_type='none', init_scale=0.1):
-        super().__init__()
-        self.dim = int(dim)
-        self.conv_type = str(conv_type).lower()
-        if self.conv_type not in ('none', 'dw3', 'inception'):
-            raise ValueError("conv_type must be one of: none, dw3, inception")
-        if self.conv_type == 'none':
-            self.register_buffer('gamma', torch.ones(1) * float(init_scale))
-        else:
-            self.gamma = nn.Parameter(torch.ones(1) * float(init_scale))
-            self.gamma._no_weight_decay = True
-
-        if self.conv_type == 'none':
-            self.block = nn.Identity()
-            self.split_sizes = None
-        elif self.conv_type == 'dw3':
-            self.block = nn.Sequential(
-                nn.Conv2d(self.dim, self.dim, kernel_size=3, padding=1, groups=self.dim, bias=False),
-                nn.BatchNorm2d(self.dim),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(self.dim),
-            )
-            self.split_sizes = None
-        else:
-            branch_dim = max(self.dim // 4, 1)
-            identity_dim = self.dim - branch_dim * 3
-            if identity_dim <= 0:
-                raise ValueError('inception stripe conv requires dim >= 4')
-            self.split_sizes = [identity_dim, branch_dim, branch_dim, branch_dim]
-            self.dw3 = nn.Conv2d(branch_dim, branch_dim, kernel_size=3, padding=1, groups=branch_dim, bias=False)
-            self.dwh = nn.Conv2d(branch_dim, branch_dim, kernel_size=(1, 5), padding=(0, 2), groups=branch_dim, bias=False)
-            self.dwv = nn.Conv2d(branch_dim, branch_dim, kernel_size=(3, 1), padding=(1, 0), groups=branch_dim, bias=False)
-            self.block = nn.Sequential(
-                nn.BatchNorm2d(self.dim),
-                nn.SiLU(inplace=True),
-                nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(self.dim),
-            )
-
-        for child in self.children():
-            child.apply(weights_init_kaiming)
-
-    def forward(self, x):
-        if self.conv_type == 'none':
-            return x
-        if self.conv_type == 'dw3':
-            delta = self.block(x)
-        else:
-            x_id, x_3, x_h, x_v = torch.split(x, self.split_sizes, dim=1)
-            mixed = torch.cat([x_id, self.dw3(x_3), self.dwh(x_h), self.dwv(x_v)], dim=1)
-            delta = self.block(mixed)
-        return x + self.gamma.to(dtype=x.dtype) * delta
-
-
 class Stage3PartStripeFusion(nn.Module):
     """Part-wise two-branch stripe fusion head on aligned feature maps."""
 
@@ -1559,8 +1501,13 @@ class Stage3PartStripeFusion(nn.Module):
         mlp_ratio=2.0,
         part_dim=0,
         pooling_type='gem',
-        conv_enhance_type='none',
-        conv_init_scale=0.1,
+        overlap_ratio=0.0,
+        context_mixer_type='none',
+        context_mixer_kernel=3,
+        context_mixer_init_scale=1e-3,
+        reliability_gate=False,
+        reliability_hidden_ratio=0.25,
+        reliability_init_bias=2.0,
     ):
         super().__init__()
         self.num_stripes = max(int(num_stripes), 1)
@@ -1569,10 +1516,8 @@ class Stage3PartStripeFusion(nn.Module):
         self.osnet_dim = int(osnet_dim)
         self.fuse_dim = self.mamba_dim
         self.part_dim = int(part_dim) if int(part_dim) > 0 else self.fuse_dim
-        self.conv_enhance_type = str(conv_enhance_type).lower()
+        self.overlap_ratio = max(float(overlap_ratio), 0.0)
         self.pool = create_pooling(pooling_type)
-        if self.conv_enhance_type not in ('none', 'dw3', 'inception'):
-            raise ValueError("stripe conv_enhance_type must be one of: none, dw3, inception")
 
         self.osnet_proj = (
             nn.Identity()
@@ -1603,21 +1548,10 @@ class Stage3PartStripeFusion(nn.Module):
                 for _ in range(max(int(mamba_depth), 0))
             ])
 
-        def make_conv_enhance():
-            return StripeConvEnhance(
-                self.fuse_dim,
-                conv_type=self.conv_enhance_type,
-                init_scale=conv_init_scale,
-            )
-
         self.shared_fuse = make_fuse() if self.share_params else None
-        self.shared_conv_enhance = make_conv_enhance() if self.share_params else None
         self.shared_mamba = make_mamba_stack() if self.share_params else None
         self.stripe_fuse = None if self.share_params else nn.ModuleList([
             make_fuse() for _ in range(self.num_stripes)
-        ])
-        self.stripe_conv_enhance = None if self.share_params else nn.ModuleList([
-            make_conv_enhance() for _ in range(self.num_stripes)
         ])
         self.stripe_mamba = None if self.share_params else nn.ModuleList([
             make_mamba_stack() for _ in range(self.num_stripes)
@@ -1630,6 +1564,22 @@ class Stage3PartStripeFusion(nn.Module):
                 nn.Linear(self.fuse_dim, self.part_dim),
                 nn.ReLU(inplace=True),
             )
+        )
+        self.context_mixer = StripeContextMixer(
+            self.part_dim,
+            self.num_stripes,
+            mixer_type=context_mixer_type,
+            kernel_size=context_mixer_kernel,
+            init_scale=context_mixer_init_scale,
+        )
+        self.reliability_gate = (
+            StripeReliabilityGate(
+                self.part_dim,
+                hidden_ratio=reliability_hidden_ratio,
+                init_bias=reliability_init_bias,
+            )
+            if reliability_gate
+            else None
         )
         self.out_dim = self.num_stripes * self.part_dim
 
@@ -1645,6 +1595,11 @@ class Stage3PartStripeFusion(nn.Module):
         y1 = (idx + 1) * height // self.num_stripes
         if y1 <= y0:
             y1 = min(y0 + 1, height)
+        if self.overlap_ratio > 0 and self.num_stripes > 1:
+            stripe_h = max(y1 - y0, 1)
+            overlap = max(int(round(stripe_h * self.overlap_ratio)), 1)
+            y0 = max(y0 - overlap, 0)
+            y1 = min(y1 + overlap, height)
         return y0, y1
 
     def forward(self, mamba_map, osnet_map, return_parts=False):
@@ -1664,18 +1619,84 @@ class Stage3PartStripeFusion(nn.Module):
             mamba_stripe = mamba_map[:, :, y0:y1, :]
             osnet_stripe = osnet_map[:, :, y0:y1, :]
             fuse = self.shared_fuse if self.share_params else self.stripe_fuse[idx]
-            conv_enhance = self.shared_conv_enhance if self.share_params else self.stripe_conv_enhance[idx]
             mamba_stack = self.shared_mamba if self.share_params else self.stripe_mamba[idx]
             stripe = fuse(torch.cat([mamba_stripe, osnet_stripe], dim=1))
-            stripe = conv_enhance(stripe)
             stripe = mamba_stack(stripe)
             part = self.pool(stripe).flatten(1)
             part = self.part_reduce(part)
             parts.append(part)
-        local_feat = torch.cat(parts, dim=1)
+        part_tokens = torch.stack(parts, dim=1)
+        part_tokens = self.context_mixer(part_tokens)
+        if self.reliability_gate is not None:
+            part_tokens = self.reliability_gate(part_tokens)
+        local_feat = part_tokens.flatten(1)
         if return_parts:
-            return local_feat, torch.stack(parts, dim=1)
+            return local_feat, part_tokens
         return local_feat
+
+
+class StripeContextMixer(nn.Module):
+    """Lightweight context exchange over pooled horizontal stripe tokens."""
+
+    def __init__(self, dim, num_stripes, mixer_type='none', kernel_size=3, init_scale=1e-3):
+        super().__init__()
+        self.mixer_type = str(mixer_type).lower()
+        if self.mixer_type not in ('none', 'dwconv', 'mlp'):
+            raise ValueError("stripe context mixer type must be one of: none, dwconv, mlp")
+        self.gamma = None
+        if self.mixer_type == 'none':
+            self.norm = None
+            self.mixer = None
+            return
+        self.norm = nn.LayerNorm(dim)
+        self.gamma = nn.Parameter(torch.ones(1) * float(init_scale))
+        self.gamma._no_weight_decay = True
+        if self.mixer_type == 'dwconv':
+            kernel_size = max(int(kernel_size), 1)
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+            self.mixer = nn.Sequential(
+                nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim, bias=False),
+                nn.GELU(),
+                nn.Conv1d(dim, dim, kernel_size=1, bias=False),
+            )
+        else:
+            self.mixer = nn.Sequential(
+                nn.Linear(num_stripes, num_stripes),
+                nn.GELU(),
+                nn.Linear(num_stripes, num_stripes),
+            )
+        self.mixer.apply(weights_init_kaiming)
+
+    def forward(self, tokens):
+        if self.mixer_type == 'none':
+            return tokens
+        y = self.norm(tokens)
+        if self.mixer_type == 'dwconv':
+            y = self.mixer(y.transpose(1, 2)).transpose(1, 2).contiguous()
+        else:
+            y = self.mixer(y.transpose(1, 2)).transpose(1, 2).contiguous()
+        return tokens + self.gamma.to(tokens.dtype) * y
+
+
+class StripeReliabilityGate(nn.Module):
+    """Predict a soft reliability score for each pooled stripe token."""
+
+    def __init__(self, dim, hidden_ratio=0.25, init_bias=2.0):
+        super().__init__()
+        hidden_dim = max(int(dim * float(hidden_ratio)), 16)
+        self.gate = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, 1),
+            nn.Sigmoid(),
+        )
+        nn.init.zeros_(self.gate[3].weight)
+        nn.init.constant_(self.gate[3].bias, float(init_bias))
+
+    def forward(self, tokens):
+        return tokens * self.gate(tokens).to(tokens.dtype)
 
 
 class Stage3StripeLocalGlobalEnhancer(nn.Module):
@@ -1909,8 +1930,13 @@ class MambaOSNetFusion(nn.Module):
                     mlp_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MLP_RATIO', 2.0)),
                     part_dim=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_DIM', 0)),
                     pooling_type=getattr(cfg.MODEL, 'POOLING_TYPE', 'gem'),
-                    conv_enhance_type=str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
-                    conv_init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONV_INIT_SCALE', 0.1)),
+                    overlap_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
+                    context_mixer_type=str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
+                    context_mixer_kernel=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_KERNEL', 3)),
+                    context_mixer_init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_INIT_SCALE', 1e-3)),
+                    reliability_gate=bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
+                    reliability_hidden_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_HIDDEN_RATIO', 0.25)),
+                    reliability_init_bias=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_INIT_BIAS', 2.0)),
                 )
                 self.stage3_stripe_local_bottleneck = nn.BatchNorm1d(self.stage3_stripe_local.out_dim)
                 self.stage3_stripe_local_bottleneck.bias.requires_grad_(False)
@@ -1949,8 +1975,13 @@ class MambaOSNetFusion(nn.Module):
                     mlp_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MLP_RATIO', 2.0)),
                     part_dim=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_PART_DIM', 0)),
                     pooling_type=getattr(cfg.MODEL, 'POOLING_TYPE', 'gem'),
-                    conv_enhance_type=str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
-                    conv_init_scale=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONV_INIT_SCALE', 0.1)),
+                    overlap_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
+                    context_mixer_type=str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
+                    context_mixer_kernel=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_KERNEL', 3)),
+                    context_mixer_init_scale=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_INIT_SCALE', 1e-3)),
+                    reliability_gate=bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
+                    reliability_hidden_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_HIDDEN_RATIO', 0.25)),
+                    reliability_init_bias=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_INIT_BIAS', 2.0)),
                 )
                 self.stage4_stripe_local_bottleneck = nn.BatchNorm1d(self.stage4_stripe_local.out_dim)
                 self.stage4_stripe_local_bottleneck.bias.requires_grad_(False)
@@ -1985,11 +2016,13 @@ class MambaOSNetFusion(nn.Module):
             )
         if self.stage3_stripe_local_enabled:
             print(
-                '[Model] Stage3 stripe-local head enabled at conv3 point: stripes={}, share={}, depth={}, conv={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, part_sup={}, lg_enhance={}, lg_direction={}, dims={}/{}'.format(
+                '[Model] Stage3 stripe-local head enabled at conv3 point: stripes={}, share={}, depth={}, overlap={:.2f}, mixer={}, gate={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, part_sup={}, lg_enhance={}, lg_direction={}, dims={}/{}'.format(
                     int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 4)),
                     bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_SHARE_PARAMS', True)),
                     int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
-                    str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
+                    float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
+                    str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
+                    bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
                     self.stage3_stripe_local.part_dim,
                     self.stage3_stripe_local.out_dim,
                     float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)),
@@ -2003,11 +2036,13 @@ class MambaOSNetFusion(nn.Module):
             )
         if self.stage4_stripe_local_enabled:
             print(
-                '[Model] Stage4 stripe-local head enabled before FDMF: stripes={}, share={}, depth={}, conv={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, dims={}/{}'.format(
+                '[Model] Stage4 stripe-local head enabled before FDMF: stripes={}, share={}, depth={}, overlap={:.2f}, mixer={}, gate={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, dims={}/{}'.format(
                     int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_NUM_STRIPES', 4)),
                     bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_SHARE_PARAMS', True)),
                     int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
-                    str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
+                    float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
+                    str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
+                    bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
                     self.stage4_stripe_local.part_dim,
                     self.stage4_stripe_local.out_dim,
                     float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)),
