@@ -30,7 +30,7 @@ MODEL:
   OSNET_FUSION:
     ENABLED: True
     OSNET_TYPE: 'osnet_x1_0'
-    PRETRAIN_PATH: 'pretrained/osnet_x1_0_imagenet.pth'
+    PRETRAIN_PATH: '/workspace/pretrained/osnet_x1_0_imagenet.pth'
     FREEZE_OSNET: False
     OSNET_LOSS_WEIGHT: 0.5
     FUSED_LOSS_WEIGHT: 1.0
@@ -131,4 +131,4 @@ TEST:
   NECK_FEAT: 'before'
   FEAT_NORM: 'yes'
 
-OUTPUT_DIR: './logs/Market/tiny/mambavision_tiny_osnet_fdmf_msef_stage_fcu_osbbm-b64k4'
+OUTPUT_DIR: './logs/Market/tiny/Posnet_fdmf_msef_stage_fcu_osbbm-b64k4'

@@ -46,6 +46,10 @@ def make_optimizer(cfg, model, center_criterion):
             or key.startswith("stage2_fcu")
             or key.startswith("stage3_fcu")
             or key.startswith("fdmf_refiner")
+            or key.startswith("stage3_stripe_local")
+            or key.startswith("stage3_stripe_part")
+            or key.startswith("stage3_stripe_lg_enhancer")
+            or key.startswith("stage4_stripe_local")
         ):
             fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
@@ -71,11 +75,12 @@ def make_optimizer(cfg, model, center_criterion):
             weight_decay = cfg.SOLVER.WEIGHT_DECAY_BIAS
         
         # fusion_scale is a gate scalar, should not have weight decay
-        # and needs higher LR to learn effectively
+        # and follows the fusion-head LR so it learns without becoming too aggressive
         if "fusion_scale" in key:
             weight_decay = 0.0
-            lr = cfg.SOLVER.BASE_LR * 3.0
-            print(f"Using 3x LR and no weight decay for fusion_scale: {key}")
+            fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
+            lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
+            print(f"Using {fusion_lr_factor}x LR and no weight decay for fusion_scale: {key}")
             
         if cfg.SOLVER.LARGE_FC_LR:
             if "classifier" in key or "arcface" in key:

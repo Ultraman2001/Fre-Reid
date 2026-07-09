@@ -557,6 +557,8 @@ def weights_init_kaiming(m):
         nn.init.constant_(m.bias, 0.0)
 
     elif classname.find('Conv') != -1:
+        if not hasattr(m, 'weight'):
+            return
         nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
         if m.bias is not None:
             nn.init.constant_(m.bias, 0.0)
@@ -1200,6 +1202,59 @@ class SameScaleFrequencyMambaBlock(nn.Module):
         return seq.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
 
+class StripeMambaBlock(nn.Module):
+    """Apply a spatial Mamba block independently on horizontal body stripes."""
+
+    def __init__(
+        self,
+        dim,
+        num_stripes=4,
+        shared_params=True,
+        mlp_ratio=2.0,
+        init_scale=0.1,
+        d_state=8,
+        d_conv=3,
+        bidirectional=True,
+    ):
+        super().__init__()
+        self.num_stripes = max(int(num_stripes), 1)
+        self.shared_params = bool(shared_params)
+        block_kwargs = dict(
+            dim=dim,
+            mlp_ratio=mlp_ratio,
+            init_scale=init_scale,
+            d_state=d_state,
+            d_conv=d_conv,
+            bidirectional=bidirectional,
+        )
+        if self.shared_params:
+            self.shared_block = SameScaleFrequencyMambaBlock(**block_kwargs)
+            self.stripe_blocks = None
+        else:
+            self.shared_block = None
+            self.stripe_blocks = nn.ModuleList([
+                SameScaleFrequencyMambaBlock(**block_kwargs)
+                for _ in range(self.num_stripes)
+            ])
+
+    def forward(self, feature_map):
+        _, _, h, _ = feature_map.shape
+        if self.num_stripes <= 1 or h <= 1:
+            block = self.shared_block if self.shared_params else self.stripe_blocks[0]
+            return block(feature_map)
+
+        stripe_outs = []
+        for idx in range(self.num_stripes):
+            y0 = idx * h // self.num_stripes
+            y1 = (idx + 1) * h // self.num_stripes
+            if y1 <= y0:
+                continue
+            stripe = feature_map[:, :, y0:y1, :]
+            block = self.shared_block if self.shared_params else self.stripe_blocks[idx]
+            stripe_outs.append(block(stripe))
+        return torch.cat(stripe_outs, dim=2).contiguous()
+
+
 class MSEFBlock(nn.Module):
     """Multi-Scale Enhancement Fusion block from Multinex.
 
@@ -1256,6 +1311,9 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         mamba_init_scale=0.1,
         mamba_bidirectional=True,
         mlp_ratio=2.0,
+        stripe_depth=0,
+        stripe_num=4,
+        stripe_share_params=True,
         msef_enabled=True,
         msef_reduction_ratio=16,
         msef_res_scale_enabled=False,
@@ -1279,6 +1337,19 @@ class SameScaleFrequencyMambaFusion(nn.Module):
             nn.BatchNorm2d(dim),
             nn.SiLU(inplace=True),
         )
+        self.stripe_blocks = nn.ModuleList([
+            StripeMambaBlock(
+                dim,
+                num_stripes=stripe_num,
+                shared_params=stripe_share_params,
+                mlp_ratio=mlp_ratio,
+                init_scale=mamba_init_scale,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                bidirectional=mamba_bidirectional,
+            )
+            for _ in range(max(int(stripe_depth), 0))
+        ])
         self.mamba_blocks = nn.ModuleList([
             SameScaleFrequencyMambaBlock(
                 dim,
@@ -1315,6 +1386,8 @@ class SameScaleFrequencyMambaFusion(nn.Module):
         osnet_map = self.osnet_map_proj(osnet_map)
 
         fused_map = self.fuse_proj(torch.cat([mamba_map, osnet_map], dim=1))
+        for block in self.stripe_blocks:
+            fused_map = block(fused_map)
         for block in self.mamba_blocks:
             fused_map = block(fused_map)
         fused_map = self.msef(fused_map)
@@ -1411,6 +1484,239 @@ class StageFCU(nn.Module):
         return new_mamba_map, new_osnet_map
 
 
+class StripeConvEnhance(nn.Module):
+    """Lightweight local convolution enhancement inside a fused body stripe."""
+
+    def __init__(self, dim, conv_type='none', init_scale=0.1):
+        super().__init__()
+        self.dim = int(dim)
+        self.conv_type = str(conv_type).lower()
+        if self.conv_type not in ('none', 'dw3', 'inception'):
+            raise ValueError("conv_type must be one of: none, dw3, inception")
+        if self.conv_type == 'none':
+            self.register_buffer('gamma', torch.ones(1) * float(init_scale))
+        else:
+            self.gamma = nn.Parameter(torch.ones(1) * float(init_scale))
+            self.gamma._no_weight_decay = True
+
+        if self.conv_type == 'none':
+            self.block = nn.Identity()
+            self.split_sizes = None
+        elif self.conv_type == 'dw3':
+            self.block = nn.Sequential(
+                nn.Conv2d(self.dim, self.dim, kernel_size=3, padding=1, groups=self.dim, bias=False),
+                nn.BatchNorm2d(self.dim),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.dim),
+            )
+            self.split_sizes = None
+        else:
+            branch_dim = max(self.dim // 4, 1)
+            identity_dim = self.dim - branch_dim * 3
+            if identity_dim <= 0:
+                raise ValueError('inception stripe conv requires dim >= 4')
+            self.split_sizes = [identity_dim, branch_dim, branch_dim, branch_dim]
+            self.dw3 = nn.Conv2d(branch_dim, branch_dim, kernel_size=3, padding=1, groups=branch_dim, bias=False)
+            self.dwh = nn.Conv2d(branch_dim, branch_dim, kernel_size=(1, 5), padding=(0, 2), groups=branch_dim, bias=False)
+            self.dwv = nn.Conv2d(branch_dim, branch_dim, kernel_size=(3, 1), padding=(1, 0), groups=branch_dim, bias=False)
+            self.block = nn.Sequential(
+                nn.BatchNorm2d(self.dim),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(self.dim, self.dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.dim),
+            )
+
+        for child in self.children():
+            child.apply(weights_init_kaiming)
+
+    def forward(self, x):
+        if self.conv_type == 'none':
+            return x
+        if self.conv_type == 'dw3':
+            delta = self.block(x)
+        else:
+            x_id, x_3, x_h, x_v = torch.split(x, self.split_sizes, dim=1)
+            mixed = torch.cat([x_id, self.dw3(x_3), self.dwh(x_h), self.dwv(x_v)], dim=1)
+            delta = self.block(mixed)
+        return x + self.gamma.to(dtype=x.dtype) * delta
+
+
+class Stage3PartStripeFusion(nn.Module):
+    """Part-wise two-branch stripe fusion head on aligned feature maps."""
+
+    def __init__(
+        self,
+        mamba_dim,
+        osnet_dim,
+        num_stripes=4,
+        share_params=True,
+        mamba_depth=1,
+        mamba_d_state=8,
+        mamba_d_conv=3,
+        mamba_init_scale=0.1,
+        mamba_bidirectional=True,
+        mlp_ratio=2.0,
+        part_dim=0,
+        pooling_type='gem',
+        conv_enhance_type='none',
+        conv_init_scale=0.1,
+    ):
+        super().__init__()
+        self.num_stripes = max(int(num_stripes), 1)
+        self.share_params = bool(share_params)
+        self.mamba_dim = int(mamba_dim)
+        self.osnet_dim = int(osnet_dim)
+        self.fuse_dim = self.mamba_dim
+        self.part_dim = int(part_dim) if int(part_dim) > 0 else self.fuse_dim
+        self.conv_enhance_type = str(conv_enhance_type).lower()
+        self.pool = create_pooling(pooling_type)
+        if self.conv_enhance_type not in ('none', 'dw3', 'inception'):
+            raise ValueError("stripe conv_enhance_type must be one of: none, dw3, inception")
+
+        self.osnet_proj = (
+            nn.Identity()
+            if self.osnet_dim == self.fuse_dim
+            else nn.Sequential(
+                nn.Conv2d(self.osnet_dim, self.fuse_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.fuse_dim),
+            )
+        )
+
+        def make_fuse():
+            return nn.Sequential(
+                nn.Conv2d(self.fuse_dim * 2, self.fuse_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(self.fuse_dim),
+                nn.SiLU(inplace=True),
+            )
+
+        def make_mamba_stack():
+            return nn.Sequential(*[
+                SameScaleFrequencyMambaBlock(
+                    self.fuse_dim,
+                    mlp_ratio=mlp_ratio,
+                    init_scale=mamba_init_scale,
+                    d_state=mamba_d_state,
+                    d_conv=mamba_d_conv,
+                    bidirectional=mamba_bidirectional,
+                )
+                for _ in range(max(int(mamba_depth), 0))
+            ])
+
+        def make_conv_enhance():
+            return StripeConvEnhance(
+                self.fuse_dim,
+                conv_type=self.conv_enhance_type,
+                init_scale=conv_init_scale,
+            )
+
+        self.shared_fuse = make_fuse() if self.share_params else None
+        self.shared_conv_enhance = make_conv_enhance() if self.share_params else None
+        self.shared_mamba = make_mamba_stack() if self.share_params else None
+        self.stripe_fuse = None if self.share_params else nn.ModuleList([
+            make_fuse() for _ in range(self.num_stripes)
+        ])
+        self.stripe_conv_enhance = None if self.share_params else nn.ModuleList([
+            make_conv_enhance() for _ in range(self.num_stripes)
+        ])
+        self.stripe_mamba = None if self.share_params else nn.ModuleList([
+            make_mamba_stack() for _ in range(self.num_stripes)
+        ])
+        self.part_reduce = (
+            nn.Identity()
+            if self.part_dim == self.fuse_dim
+            else nn.Sequential(
+                nn.LayerNorm(self.fuse_dim),
+                nn.Linear(self.fuse_dim, self.part_dim),
+                nn.ReLU(inplace=True),
+            )
+        )
+        self.out_dim = self.num_stripes * self.part_dim
+
+        self.osnet_proj.apply(weights_init_kaiming)
+        if self.shared_fuse is not None:
+            self.shared_fuse.apply(weights_init_kaiming)
+        if self.stripe_fuse is not None:
+            self.stripe_fuse.apply(weights_init_kaiming)
+        self.part_reduce.apply(weights_init_kaiming)
+
+    def _stripe_range(self, height, idx):
+        y0 = idx * height // self.num_stripes
+        y1 = (idx + 1) * height // self.num_stripes
+        if y1 <= y0:
+            y1 = min(y0 + 1, height)
+        return y0, y1
+
+    def forward(self, mamba_map, osnet_map, return_parts=False):
+        if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
+            osnet_map = F.interpolate(
+                osnet_map,
+                size=mamba_map.shape[-2:],
+                mode='bilinear',
+                align_corners=False,
+            )
+        osnet_map = self.osnet_proj(osnet_map)
+
+        _, _, height, _ = mamba_map.shape
+        parts = []
+        for idx in range(self.num_stripes):
+            y0, y1 = self._stripe_range(height, idx)
+            mamba_stripe = mamba_map[:, :, y0:y1, :]
+            osnet_stripe = osnet_map[:, :, y0:y1, :]
+            fuse = self.shared_fuse if self.share_params else self.stripe_fuse[idx]
+            conv_enhance = self.shared_conv_enhance if self.share_params else self.stripe_conv_enhance[idx]
+            mamba_stack = self.shared_mamba if self.share_params else self.stripe_mamba[idx]
+            stripe = fuse(torch.cat([mamba_stripe, osnet_stripe], dim=1))
+            stripe = conv_enhance(stripe)
+            stripe = mamba_stack(stripe)
+            part = self.pool(stripe).flatten(1)
+            part = self.part_reduce(part)
+            parts.append(part)
+        local_feat = torch.cat(parts, dim=1)
+        if return_parts:
+            return local_feat, torch.stack(parts, dim=1)
+        return local_feat
+
+
+class Stage3StripeLocalGlobalEnhancer(nn.Module):
+    """Low-scale DES-like interaction between FDMF global and stripe-local parts."""
+
+    def __init__(self, global_dim, part_dim, init_scale=0.05, direction='global_to_local'):
+        super().__init__()
+        self.global_dim = int(global_dim)
+        self.part_dim = int(part_dim)
+        self.direction = str(direction).lower()
+        if self.direction not in ('global_to_local', 'local_to_global', 'bidirectional'):
+            raise ValueError("STAGE3_STRIPE_LOCAL_LG_ENHANCE_DIRECTION must be 'global_to_local', 'local_to_global', or 'bidirectional'")
+        self.global_from_local = nn.Sequential(
+            nn.LayerNorm(self.part_dim),
+            nn.Linear(self.part_dim, self.global_dim),
+        )
+        self.local_from_global = nn.Sequential(
+            nn.LayerNorm(self.global_dim),
+            nn.Linear(self.global_dim, self.part_dim),
+        )
+        self.global_scale = nn.Parameter(torch.ones(1) * float(init_scale))
+        self.local_scale = nn.Parameter(torch.ones(1) * float(init_scale))
+        self.global_scale._no_weight_decay = True
+        self.local_scale._no_weight_decay = True
+        self.global_from_local.apply(weights_init_kaiming)
+        self.local_from_global.apply(weights_init_kaiming)
+
+    def forward(self, global_feat, part_feats):
+        local_context = part_feats.mean(dim=1)
+        enhanced_global = global_feat
+        enhanced_parts = part_feats
+        if self.direction in ('local_to_global', 'bidirectional'):
+            global_delta = self.global_from_local(local_context)
+            enhanced_global = global_feat + self.global_scale.to(global_feat.dtype) * global_delta
+        if self.direction in ('global_to_local', 'bidirectional'):
+            local_delta = self.local_from_global(global_feat).unsqueeze(1)
+            enhanced_parts = part_feats + self.local_scale.to(part_feats.dtype) * local_delta
+        enhanced_local = enhanced_parts.flatten(1)
+        return enhanced_global, enhanced_local, enhanced_parts
+
+
 class MambaOSNetFusion(nn.Module):
     """MambaVision + OSNet fusion."""
 
@@ -1492,6 +1798,9 @@ class MambaOSNetFusion(nn.Module):
                 mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
                 mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
                 mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
+                stripe_depth=int(getattr(fusion_cfg, 'FDMF_STRIPE_DEPTH', 0)),
+                stripe_num=int(getattr(fusion_cfg, 'FDMF_STRIPE_NUM', 4)),
+                stripe_share_params=bool(getattr(fusion_cfg, 'FDMF_STRIPE_SHARE_PARAMS', True)),
                 msef_enabled=bool(getattr(fusion_cfg, 'FDMF_MSEF_ENABLED', True)),
                 msef_reduction_ratio=int(getattr(fusion_cfg, 'FDMF_MSEF_REDUCTION_RATIO', 16)),
                 msef_res_scale_enabled=bool(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_ENABLED', False)),
@@ -1511,6 +1820,37 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_classifier = self._make_classifier(self.fusion_dim)
 
         self.use_stage_fcu_exchange = self.fusion_type == 'stage_fcu' or bool(getattr(fusion_cfg, 'FCU_ENABLED', False))
+        self.stage3_stripe_local_enabled = bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_ENABLED', False))
+        self.stage3_stripe_local = None
+        self.stage3_stripe_local_bottleneck = None
+        self.stage3_stripe_local_classifier = None
+        self.stage3_stripe_part_bottlenecks = None
+        self.stage3_stripe_part_classifiers = None
+        self.stage3_stripe_lg_enhancer = None
+        self.stage3_stripe_local_infer_weight = float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_INFER_WEIGHT', 0.3))
+        self.stage4_stripe_local_enabled = bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_ENABLED', False))
+        self.stage4_stripe_local = None
+        self.stage4_stripe_local_bottleneck = None
+        self.stage4_stripe_local_classifier = None
+        self.stage4_stripe_local_infer_weight = float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_INFER_WEIGHT', 0.3))
+        self.stage3_stripe_part_supervision_enabled = bool(
+            getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_SUPERVISION_ENABLED', False)
+        )
+        self.stage3_stripe_lg_enhance_enabled = bool(
+            getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_ENABLED', False)
+        )
+        if self.stage3_stripe_part_supervision_enabled and not self.stage3_stripe_local_enabled:
+            raise ValueError('STAGE3_STRIPE_LOCAL_PART_SUPERVISION_ENABLED requires STAGE3_STRIPE_LOCAL_ENABLED=True')
+        if self.stage3_stripe_lg_enhance_enabled and not self.stage3_stripe_local_enabled:
+            raise ValueError('STAGE3_STRIPE_LOCAL_LG_ENHANCE_ENABLED requires STAGE3_STRIPE_LOCAL_ENABLED=True')
+        if self.stage3_stripe_lg_enhance_enabled and self.fusion_type != 'fdmf':
+            raise ValueError('STAGE3_STRIPE_LOCAL_LG_ENHANCE_ENABLED requires FUSION_TYPE=fdmf')
+        if self.stage4_stripe_local_enabled and self.fusion_type != 'fdmf':
+            raise ValueError('STAGE4_STRIPE_LOCAL_ENABLED requires FUSION_TYPE=fdmf')
+        if self.stage3_stripe_local_enabled and not self.use_stage_fcu_exchange:
+            raise ValueError('STAGE3_STRIPE_LOCAL_ENABLED requires Stage-FCU/manual branch forwarding (set FCU_ENABLED=True)')
+        if self.stage4_stripe_local_enabled and not self.use_stage_fcu_exchange:
+            raise ValueError('STAGE4_STRIPE_LOCAL_ENABLED requires Stage-FCU/manual branch forwarding (set FCU_ENABLED=True)')
         if self.use_stage_fcu_exchange:
             if not hasattr(self.mamba.base, 'levels') or len(self.mamba.base.levels) < 4:
                 raise ValueError('stage_fcu requires a MambaVision backbone with four stages')
@@ -1553,6 +1893,69 @@ class MambaOSNetFusion(nn.Module):
                     gate_reduction=fcu_gate_reduction,
                     gate_init_bias=fcu_gate_init_bias,
                 )
+            if self.stage3_stripe_local_enabled:
+                if 2 not in self.fcu_stages:
+                    raise ValueError('STAGE3_STRIPE_LOCAL_ENABLED requires stage 2 FCU before OSNet conv3/Mamba level2 local fusion')
+                self.stage3_stripe_local = Stage3PartStripeFusion(
+                    mamba_stage3_dim,
+                    self.osnet_stage2_dim,
+                    num_stripes=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 4)),
+                    share_params=bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_SHARE_PARAMS', True)),
+                    mamba_depth=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
+                    mamba_d_state=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_D_STATE', 8)),
+                    mamba_d_conv=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_D_CONV', 3)),
+                    mamba_init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_INIT_SCALE', 0.1)),
+                    mamba_bidirectional=bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_BIDIRECTIONAL', True)),
+                    mlp_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MLP_RATIO', 2.0)),
+                    part_dim=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_DIM', 0)),
+                    pooling_type=getattr(cfg.MODEL, 'POOLING_TYPE', 'gem'),
+                    conv_enhance_type=str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
+                    conv_init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONV_INIT_SCALE', 0.1)),
+                )
+                self.stage3_stripe_local_bottleneck = nn.BatchNorm1d(self.stage3_stripe_local.out_dim)
+                self.stage3_stripe_local_bottleneck.bias.requires_grad_(False)
+                self.stage3_stripe_local_bottleneck.apply(weights_init_kaiming)
+                self.stage3_stripe_local_classifier = self._make_classifier(self.stage3_stripe_local.out_dim)
+                if self.stage3_stripe_part_supervision_enabled:
+                    self.stage3_stripe_part_bottlenecks = nn.ModuleList([
+                        nn.BatchNorm1d(self.stage3_stripe_local.part_dim)
+                        for _ in range(self.stage3_stripe_local.num_stripes)
+                    ])
+                    for bottleneck in self.stage3_stripe_part_bottlenecks:
+                        bottleneck.bias.requires_grad_(False)
+                        bottleneck.apply(weights_init_kaiming)
+                    self.stage3_stripe_part_classifiers = nn.ModuleList([
+                        self._make_classifier(self.stage3_stripe_local.part_dim)
+                        for _ in range(self.stage3_stripe_local.num_stripes)
+                    ])
+                if self.stage3_stripe_lg_enhance_enabled:
+                    self.stage3_stripe_lg_enhancer = Stage3StripeLocalGlobalEnhancer(
+                        self.mamba_dim,
+                        self.stage3_stripe_local.part_dim,
+                        init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_INIT_SCALE', 0.05)),
+                        direction=str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_DIRECTION', 'global_to_local')),
+                    )
+            if self.stage4_stripe_local_enabled:
+                self.stage4_stripe_local = Stage3PartStripeFusion(
+                    self.mamba_dim,
+                    self.osnet_map_dim,
+                    num_stripes=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_NUM_STRIPES', 4)),
+                    share_params=bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_SHARE_PARAMS', True)),
+                    mamba_depth=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
+                    mamba_d_state=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_D_STATE', 8)),
+                    mamba_d_conv=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_D_CONV', 3)),
+                    mamba_init_scale=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_INIT_SCALE', 0.1)),
+                    mamba_bidirectional=bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_BIDIRECTIONAL', True)),
+                    mlp_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MLP_RATIO', 2.0)),
+                    part_dim=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_PART_DIM', 0)),
+                    pooling_type=getattr(cfg.MODEL, 'POOLING_TYPE', 'gem'),
+                    conv_enhance_type=str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
+                    conv_init_scale=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONV_INIT_SCALE', 0.1)),
+                )
+                self.stage4_stripe_local_bottleneck = nn.BatchNorm1d(self.stage4_stripe_local.out_dim)
+                self.stage4_stripe_local_bottleneck.bias.requires_grad_(False)
+                self.stage4_stripe_local_bottleneck.apply(weights_init_kaiming)
+                self.stage4_stripe_local_classifier = self._make_classifier(self.stage4_stripe_local.out_dim)
 
         print(
             '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_dim={}, fusion_norm={}, beta={:.2f}'.format(
@@ -1567,13 +1970,50 @@ class MambaOSNetFusion(nn.Module):
         )
         if self.fusion_type == 'fdmf':
             print(
-                '[Model] FDMF enabled: osnet_map_dim={}, form={}, filter={}, bidirectional={}, msef={}, msef_res_scale={}'.format(
+                '[Model] FDMF enabled: osnet_map_dim={}, form={}, filter={}, global_depth={}, stripe_depth={}, stripe_num={}, stripe_share={}, bidirectional={}, msef={}, msef_res_scale={}'.format(
                     self.osnet_map_dim,
                     self.fdmf_fused_form,
                     self.fdmf_refiner.filter_type,
+                    int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
+                    int(getattr(fusion_cfg, 'FDMF_STRIPE_DEPTH', 0)),
+                    int(getattr(fusion_cfg, 'FDMF_STRIPE_NUM', 4)),
+                    bool(getattr(fusion_cfg, 'FDMF_STRIPE_SHARE_PARAMS', True)),
                     bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
                     bool(getattr(fusion_cfg, 'FDMF_MSEF_ENABLED', True)),
                     bool(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_ENABLED', False)),
+                )
+            )
+        if self.stage3_stripe_local_enabled:
+            print(
+                '[Model] Stage3 stripe-local head enabled at conv3 point: stripes={}, share={}, depth={}, conv={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, part_sup={}, lg_enhance={}, lg_direction={}, dims={}/{}'.format(
+                    int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 4)),
+                    bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_SHARE_PARAMS', True)),
+                    int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
+                    str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
+                    self.stage3_stripe_local.part_dim,
+                    self.stage3_stripe_local.out_dim,
+                    float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)),
+                    self.stage3_stripe_local_infer_weight,
+                    self.stage3_stripe_part_supervision_enabled,
+                    self.stage3_stripe_lg_enhance_enabled,
+                    str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_DIRECTION', 'global_to_local')),
+                    mamba_stage3_dim,
+                    self.osnet_stage2_dim,
+                )
+            )
+        if self.stage4_stripe_local_enabled:
+            print(
+                '[Model] Stage4 stripe-local head enabled before FDMF: stripes={}, share={}, depth={}, conv={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, dims={}/{}'.format(
+                    int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_NUM_STRIPES', 4)),
+                    bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_SHARE_PARAMS', True)),
+                    int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
+                    str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONV_ENHANCE_TYPE', 'none')),
+                    self.stage4_stripe_local.part_dim,
+                    self.stage4_stripe_local.out_dim,
+                    float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)),
+                    self.stage4_stripe_local_infer_weight,
+                    self.mamba_dim,
+                    self.osnet_map_dim,
                 )
             )
         if self.use_stage_fcu_exchange:
@@ -1635,18 +2075,32 @@ class MambaOSNetFusion(nn.Module):
             osnet_feat_n = self.fusion_beta * osnet_feat_n
         return torch.cat([mamba_feat_n, osnet_feat_n], dim=1)
 
-    def _make_fdmf_fused_feat(self, mamba_feat, osnet_feat, mamba_map, osnet_map, return_fdmf_feat=False):
-        fdmf_map = self.fdmf_refiner(mamba_map, osnet_map)
-        fdmf_feat = self.mamba._pool_feature_map(fdmf_map)
+    def _compose_fdmf_fused_feat(self, mamba_feat, osnet_feat, fdmf_feat):
         if self.fdmf_fused_form == 'raw_fdmf':
             fused_feat = torch.cat([mamba_feat, osnet_feat, fdmf_feat], dim=1)
         elif self.fdmf_fused_form == 'mamba_fdmf':
             fused_feat = torch.cat([mamba_feat, fdmf_feat], dim=1)
         else:
             fused_feat = fdmf_feat
+        return fused_feat
+
+    def _make_fdmf_fused_feat(self, mamba_feat, osnet_feat, mamba_map, osnet_map, return_fdmf_feat=False):
+        fdmf_map = self.fdmf_refiner(mamba_map, osnet_map)
+        fdmf_feat = self.mamba._pool_feature_map(fdmf_map)
+        fused_feat = self._compose_fdmf_fused_feat(mamba_feat, osnet_feat, fdmf_feat)
         if return_fdmf_feat:
             return fused_feat, fdmf_feat
         return fused_feat
+
+    def _enhance_stage3_local_with_fdmf(self, fdmf_feat, stage3_part_feats):
+        if not self.stage3_stripe_lg_enhance_enabled:
+            return fdmf_feat, stage3_part_feats.flatten(1), stage3_part_feats
+        return self.stage3_stripe_lg_enhancer(fdmf_feat, stage3_part_feats)
+
+    def _make_stage4_stripe_local_feat(self, mamba_map, osnet_map):
+        if not self.stage4_stripe_local_enabled:
+            return None
+        return self.stage4_stripe_local(mamba_map, osnet_map, return_parts=False)
 
     def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None, return_map=False):
         output = self.mamba.base(x, cam_label=cam_label, view_label=view_label)
@@ -1703,6 +2157,8 @@ class MambaOSNetFusion(nn.Module):
 
     def _forward_stage_fcu_maps(self, x, cam_label=None, view_label=None):
         base = self.mamba.base
+        stage3_local_feat = None
+        stage3_part_feats = None
 
         mamba_map = self._mamba_patch_embed_with_sie(x, cam_label=cam_label, view_label=view_label)
         osnet_map = self.osnet.conv1(x)
@@ -1716,6 +2172,12 @@ class MambaOSNetFusion(nn.Module):
             mamba_map, osnet_map = self.stage2_fcu(mamba_map, osnet_map)
 
         mamba_map = base.levels[2](mamba_map)
+        if self.stage3_stripe_local_enabled:
+            stage3_local_feat, stage3_part_feats = self.stage3_stripe_local(
+                mamba_map,
+                osnet_map,
+                return_parts=True,
+            )
         osnet_map = self.osnet.conv4(osnet_map)
         if 3 in self.fcu_stages:
             mamba_map, osnet_map = self.stage3_fcu(mamba_map, osnet_map)
@@ -1723,14 +2185,22 @@ class MambaOSNetFusion(nn.Module):
         mamba_map = base.main_proj(mamba_map)
         mamba_map = base.levels[3](mamba_map)
         osnet_map = self.osnet.conv5(osnet_map)
+        if self.stage3_stripe_local_enabled:
+            return mamba_map, osnet_map, stage3_local_feat, stage3_part_feats
         return mamba_map, osnet_map
 
     def _forward_stage_fcu_branches(self, x, label=None, cam_label=None, view_label=None, return_map=False):
-        mamba_map, osnet_map = self._forward_stage_fcu_maps(
+        stage_maps = self._forward_stage_fcu_maps(
             x,
             cam_label=cam_label,
             view_label=view_label,
         )
+        if self.stage3_stripe_local_enabled:
+            mamba_map, osnet_map, stage3_local_feat, stage3_part_feats = stage_maps
+        else:
+            mamba_map, osnet_map = stage_maps
+            stage3_local_feat = None
+            stage3_part_feats = None
 
         mamba_feat = self.mamba._pool_feature_map(mamba_map)
         mamba_bn = self.mamba.bottleneck(mamba_feat)
@@ -1744,16 +2214,36 @@ class MambaOSNetFusion(nn.Module):
         if self.training:
             mamba_score = self.mamba._classify(self.mamba.classifier, mamba_bn, label)
             osnet_score = self._classify(self.osnet_classifier, osnet_bn, label)
+            if self.stage3_stripe_local_enabled:
+                if return_map:
+                    return (
+                        mamba_score, mamba_feat, mamba_bn,
+                        osnet_score, osnet_feat, osnet_bn,
+                        stage3_local_feat, stage3_part_feats,
+                        mamba_map, osnet_map,
+                    )
+                return (
+                    mamba_score, mamba_feat, mamba_bn,
+                    osnet_score, osnet_feat, osnet_bn,
+                    stage3_local_feat, stage3_part_feats,
+                )
             if return_map:
                 return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn, mamba_map, osnet_map
             return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn
         if return_map:
+            if self.stage3_stripe_local_enabled:
+                return mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats, mamba_map, osnet_map
             return mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map
+        if self.stage3_stripe_local_enabled:
+            return mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats
         return mamba_feat, mamba_bn, osnet_feat, osnet_bn
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
         use_fdmf = self.fusion_type == 'fdmf'
         if self.training:
+            stage3_local_feat = None
+            stage3_part_feats = None
+            stage4_local_feat = None
             if self.use_stage_fcu_exchange:
                 stage_out = self._forward_stage_fcu_branches(
                     x,
@@ -1762,7 +2252,33 @@ class MambaOSNetFusion(nn.Module):
                     view_label=view_label,
                     return_map=use_fdmf,
                 )
-                if use_fdmf:
+                if self.stage3_stripe_local_enabled and use_fdmf:
+                    (
+                        mamba_score,
+                        mamba_feat,
+                        mamba_bn,
+                        osnet_score,
+                        osnet_feat,
+                        osnet_bn,
+                        stage3_local_feat,
+                        stage3_part_feats,
+                        mamba_map,
+                        osnet_map,
+                    ) = stage_out
+                    stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
+                    fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
+                        mamba_feat,
+                        osnet_feat,
+                        mamba_map,
+                        osnet_map,
+                        return_fdmf_feat=True,
+                    )
+                    fdmf_feat, stage3_local_feat, stage3_part_feats = self._enhance_stage3_local_with_fdmf(
+                        fdmf_feat,
+                        stage3_part_feats,
+                    )
+                    fused_feat = self._compose_fdmf_fused_feat(mamba_feat, osnet_feat, fdmf_feat)
+                elif use_fdmf:
                     (
                         mamba_score,
                         mamba_feat,
@@ -1773,7 +2289,19 @@ class MambaOSNetFusion(nn.Module):
                         mamba_map,
                         osnet_map,
                     ) = stage_out
+                    stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
                     fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
+                elif self.stage3_stripe_local_enabled:
+                    (
+                        mamba_score,
+                        mamba_feat,
+                        mamba_bn,
+                        osnet_score,
+                        osnet_feat,
+                        osnet_bn,
+                        stage3_local_feat,
+                        stage3_part_feats,
+                    ) = stage_out
                 else:
                     (
                         mamba_score,
@@ -1795,6 +2323,7 @@ class MambaOSNetFusion(nn.Module):
                 if use_fdmf:
                     mamba_score, mamba_feat, mamba_bn, mamba_map = mamba_out
                     osnet_score, osnet_feat, osnet_bn, osnet_map = osnet_out
+                    stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
                     fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
                 else:
                     mamba_score, mamba_feat, mamba_bn = mamba_out
@@ -1804,8 +2333,40 @@ class MambaOSNetFusion(nn.Module):
                 fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
             fused_bn = self.fusion_bottleneck(fused_feat)
             fused_score = self._classify(self.fusion_classifier, fused_bn, label)
-            return [mamba_score, osnet_score, fused_score], [mamba_feat, osnet_feat, fused_feat]
+            scores = [mamba_score, osnet_score, fused_score]
+            feats = [mamba_feat, osnet_feat, fused_feat]
+            if self.stage3_stripe_local_enabled:
+                stage3_local_bn = self.stage3_stripe_local_bottleneck(stage3_local_feat)
+                stage3_local_score = self._classify(
+                    self.stage3_stripe_local_classifier,
+                    stage3_local_bn,
+                    label,
+                )
+                scores.append(stage3_local_score)
+                feats.append(stage3_local_feat)
+                if self.stage3_stripe_part_supervision_enabled:
+                    for idx in range(self.stage3_stripe_local.num_stripes):
+                        part_feat = stage3_part_feats[:, idx]
+                        part_bn = self.stage3_stripe_part_bottlenecks[idx](part_feat)
+                        part_score = self._classify(
+                            self.stage3_stripe_part_classifiers[idx],
+                            part_bn,
+                            label,
+                        )
+                        scores.append(part_score)
+                        feats.append(part_feat)
+            if self.stage4_stripe_local_enabled:
+                stage4_local_bn = self.stage4_stripe_local_bottleneck(stage4_local_feat)
+                stage4_local_score = self._classify(
+                    self.stage4_stripe_local_classifier,
+                    stage4_local_bn,
+                    label,
+                )
+                scores.append(stage4_local_score)
+                feats.append(stage4_local_feat)
+            return scores, feats
 
+        stage4_local_feat = None
         if self.use_stage_fcu_exchange:
             stage_out = self._forward_stage_fcu_branches(
                 x,
@@ -1813,8 +2374,9 @@ class MambaOSNetFusion(nn.Module):
                 view_label=view_label,
                 return_map=use_fdmf,
             )
-            if use_fdmf:
-                mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map = stage_out
+            if self.stage3_stripe_local_enabled and use_fdmf:
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats, mamba_map, osnet_map = stage_out
+                stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
                 fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
                     mamba_feat,
                     osnet_feat,
@@ -1822,6 +2384,24 @@ class MambaOSNetFusion(nn.Module):
                     osnet_map,
                     return_fdmf_feat=True,
                 )
+                fdmf_feat, stage3_local_feat, stage3_part_feats = self._enhance_stage3_local_with_fdmf(
+                    fdmf_feat,
+                    stage3_part_feats,
+                )
+                fused_feat = self._compose_fdmf_fused_feat(mamba_feat, osnet_feat, fdmf_feat)
+            elif use_fdmf:
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map = stage_out
+                stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
+                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
+                    mamba_feat,
+                    osnet_feat,
+                    mamba_map,
+                    osnet_map,
+                    return_fdmf_feat=True,
+                )
+            elif self.stage3_stripe_local_enabled:
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats = stage_out
+                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
             else:
                 mamba_feat, mamba_bn, osnet_feat, osnet_bn = stage_out
                 fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
@@ -1836,6 +2416,7 @@ class MambaOSNetFusion(nn.Module):
             if use_fdmf:
                 mamba_feat, mamba_bn, mamba_map = mamba_out
                 osnet_feat, osnet_bn, osnet_map = osnet_out
+                stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
                 fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
                     mamba_feat,
                     osnet_feat,
@@ -1849,27 +2430,71 @@ class MambaOSNetFusion(nn.Module):
                 fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         if self.use_stage_fcu_exchange and not use_fdmf:
             fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
+        if self.stage3_stripe_local_enabled:
+            stage3_local_bn = self.stage3_stripe_local_bottleneck(stage3_local_feat)
+        if self.stage4_stripe_local_enabled:
+            stage4_local_bn = self.stage4_stripe_local_bottleneck(stage4_local_feat)
         fused_bn = self.fusion_bottleneck(fused_feat)
 
         if self.neck_feat == 'after':
             mamba_out = mamba_bn
             osnet_out = osnet_bn
             fused_out = fused_bn
+            if self.stage3_stripe_local_enabled:
+                stage3_local_out = stage3_local_bn
+            if self.stage4_stripe_local_enabled:
+                stage4_local_out = stage4_local_bn
         else:
             mamba_out = mamba_feat
             osnet_out = osnet_feat
             fused_out = fused_feat
+            if self.stage3_stripe_local_enabled:
+                stage3_local_out = stage3_local_feat
+            if self.stage4_stripe_local_enabled:
+                stage4_local_out = stage4_local_feat
 
         output = {
             'backbone': mamba_out,
             'osnet': osnet_out,
         }
+        if self.stage3_stripe_local_enabled:
+            output['stage3_stripe_local'] = stage3_local_out
+        if self.stage4_stripe_local_enabled:
+            output['stage4_stripe_local'] = stage4_local_out
         if use_fdmf:
             output['raw_concat'] = torch.cat([mamba_out, osnet_out], dim=1)
             output['fdmf'] = fused_out
             output['mamba_fdmf_osnet'] = torch.cat([mamba_out, fdmf_feat, osnet_out], dim=1)
+            if self.stage3_stripe_local_enabled:
+                output['mamba_fdmf_osnet_stage3local'] = torch.cat(
+                    [
+                        mamba_out,
+                        fdmf_feat,
+                        osnet_out,
+                        self.stage3_stripe_local_infer_weight * stage3_local_out,
+                    ],
+                    dim=1,
+                )
+            if self.stage4_stripe_local_enabled:
+                output['mamba_fdmf_osnet_stage4local'] = torch.cat(
+                    [
+                        mamba_out,
+                        fdmf_feat,
+                        osnet_out,
+                        self.stage4_stripe_local_infer_weight * stage4_local_out,
+                    ],
+                    dim=1,
+                )
         else:
             output['concat'] = fused_out
+            if self.stage3_stripe_local_enabled:
+                output['concat_stage3local'] = torch.cat(
+                    [
+                        fused_out,
+                        self.stage3_stripe_local_infer_weight * stage3_local_out,
+                    ],
+                    dim=1,
+                )
         return output
 
     def load_param(self, trained_path):

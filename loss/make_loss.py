@@ -157,17 +157,46 @@ def make_loss(cfg, num_classes):    # modified by gu
                         return total_loss, loss_detail
                     
                     if use_osnet_fusion:
-                        if len(score) != 3 or len(feat) != 3:
-                            raise ValueError('OSNET_FUSION loss expects Mamba, OSNet and fused branches')
-
                         fusion_type = str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
+                        use_stage3_local = bool(getattr(osnet_fusion_cfg, 'STAGE3_STRIPE_LOCAL_ENABLED', False))
+                        use_stage4_local = bool(getattr(osnet_fusion_cfg, 'STAGE4_STRIPE_LOCAL_ENABLED', False))
+                        use_stage3_part_sup = bool(
+                            getattr(osnet_fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_SUPERVISION_ENABLED', False)
+                        )
+                        local_num_stripes = int(getattr(osnet_fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 4))
+                        if not use_stage3_local:
+                            use_stage3_part_sup = False
+                            local_num_stripes = 0
+                        expected_len = 3 + (1 if use_stage3_local else 0) + (
+                            local_num_stripes if use_stage3_part_sup else 0
+                        ) + (1 if use_stage4_local else 0)
+                        if len(score) != expected_len or len(feat) != expected_len:
+                            raise ValueError(
+                                'OSNET_FUSION loss expects Mamba, OSNet, fused{}{}{} branches'.format(
+                                    ', stage3_stripe_local' if use_stage3_local else '',
+                                    ', and per-stripe locals' if use_stage3_part_sup else '',
+                                    ', and stage4_stripe_local' if use_stage4_local else '',
+                                )
+                            )
+
                         fused_branch_name = 'fdmf' if fusion_type == 'fdmf' else 'concat'
-                        branch_names = ('mamba', 'osnet', fused_branch_name)
-                        branch_weights = (
+                        branch_names = ['mamba', 'osnet', fused_branch_name]
+                        branch_weights = [
                             1.0,
                             float(getattr(osnet_fusion_cfg, 'OSNET_LOSS_WEIGHT', 0.5)),
                             float(getattr(osnet_fusion_cfg, 'FUSED_LOSS_WEIGHT', 1.0)),
-                        )
+                        ]
+                        if use_stage3_local:
+                            branch_names.append('stage3_stripe_local')
+                            branch_weights.append(float(getattr(osnet_fusion_cfg, 'STAGE3_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)))
+                        if use_stage3_part_sup:
+                            part_weight = float(getattr(osnet_fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_LOSS_WEIGHT', 0.05))
+                            for idx in range(local_num_stripes):
+                                branch_names.append('stage3_part_{}'.format(idx + 1))
+                                branch_weights.append(part_weight)
+                        if use_stage4_local:
+                            branch_names.append('stage4_stripe_local')
+                            branch_weights.append(float(getattr(osnet_fusion_cfg, 'STAGE4_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)))
                         weight_sum = sum(branch_weights)
                         if weight_sum <= 0:
                             raise ValueError('OSNET_FUSION branch weights must sum to a positive value')
@@ -193,6 +222,25 @@ def make_loss(cfg, num_classes):    # modified by gu
                             'w_concat': branch_weights[2],
                             'w_fdmf': branch_weights[2],
                         }
+                        if use_stage3_local:
+                            loss_detail['w_stage3_stripe_local'] = branch_weights[3]
+                        if use_stage3_part_sup:
+                            part_start = 4
+                            part_id_losses = id_losses[part_start:part_start + local_num_stripes]
+                            part_tri_losses = tri_losses[part_start:part_start + local_num_stripes]
+                            loss_detail['w_stage3_part'] = float(
+                                getattr(osnet_fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_LOSS_WEIGHT', 0.05)
+                            )
+                            loss_detail['num_stage3_parts'] = local_num_stripes
+                            loss_detail['id_stage3_part_avg'] = (
+                                sum(loss.item() for loss in part_id_losses) / max(len(part_id_losses), 1)
+                            )
+                            loss_detail['tri_stage3_part_avg'] = (
+                                sum(loss.item() for loss in part_tri_losses) / max(len(part_tri_losses), 1)
+                            )
+                        if use_stage4_local:
+                            stage4_idx = len(branch_names) - 1
+                            loss_detail['w_stage4_stripe_local'] = branch_weights[stage4_idx]
                         for name, id_loss, tri_loss in zip(branch_names, id_losses, tri_losses):
                             loss_detail[f'id_{name}'] = id_loss.item()
                             loss_detail[f'tri_{name}'] = tri_loss.item()

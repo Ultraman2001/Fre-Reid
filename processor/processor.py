@@ -60,7 +60,7 @@ def _fdmf_training_stats(cfg, feat):
         return None
     if str(getattr(osnet_fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower() != 'fdmf':
         return None
-    if not isinstance(feat, list) or len(feat) != 3:
+    if not isinstance(feat, list) or len(feat) < 3:
         return None
 
     mamba_feat = feat[0].detach().float()
@@ -313,6 +313,25 @@ def do_train(cfg,
                                 name,
                                 loss_detail.get(f'id_{key}', 0.0),
                                 loss_detail.get(f'tri_{key}', 0.0),
+                            )
+                        if 'w_stage3_stripe_local' in loss_detail:
+                            log_msg += " | S3Local[w={:.2f}, ID={:.2f}, Tri={:.4f}]".format(
+                                loss_detail.get('w_stage3_stripe_local', 0.0),
+                                loss_detail.get('id_stage3_stripe_local', 0.0),
+                                loss_detail.get('tri_stage3_stripe_local', 0.0),
+                            )
+                        if 'w_stage3_part' in loss_detail:
+                            log_msg += " | S3Part[n={}, w={:.2f}, ID={:.2f}, Tri={:.4f}]".format(
+                                int(loss_detail.get('num_stage3_parts', 0)),
+                                loss_detail.get('w_stage3_part', 0.0),
+                                loss_detail.get('id_stage3_part_avg', 0.0),
+                                loss_detail.get('tri_stage3_part_avg', 0.0),
+                            )
+                        if 'w_stage4_stripe_local' in loss_detail:
+                            log_msg += " | S4Local[w={:.2f}, ID={:.2f}, Tri={:.4f}]".format(
+                                loss_detail.get('w_stage4_stripe_local', 0.0),
+                                loss_detail.get('id_stage4_stripe_local', 0.0),
+                                loss_detail.get('tri_stage4_stripe_local', 0.0),
                             )
                         if 'ratr' in loss_detail:
                             log_msg += " | RATR[{}]={:.4f}".format(

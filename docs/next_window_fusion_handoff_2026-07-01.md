@@ -447,3 +447,378 @@ no matches
 ## One-Sentence Research Positioning
 
 The strongest current contribution candidate is not late token fusion, but **direction-aware stage-level cross-branch feature exchange**, where OSNet injects mid-level local cues into Mamba at stage 2 and Mamba injects stronger semantic/global cues into OSNet at stage 3.
+
+---
+
+# 2026-07-07 Window Update: Current Mainline and Negative Results
+
+This section overrides several earlier assumptions in this document. The project has moved from plain Stage-FCU toward:
+
+```text
+Direction-aware Stage-FCU
+  + same-scale map-Mamba fusion
+  + MSEF refinement
+  + triple descriptor inference
+```
+
+The most useful inference feature is:
+
+```text
+TEST.FEAT_MODE = 'mamba_fdmf_osnet'
+```
+
+This means the final test descriptor is:
+
+```text
+[MambaVision descriptor, map-Mamba/MSEF fused descriptor, OSNet descriptor]
+```
+
+The old `FDMF` name is kept for code/config compatibility, but the frequency decomposition path is no longer the important part. The effective current map fusion is:
+
+```text
+Mamba map + OSNet map
+  -> align OSNet map to Mamba map size
+  -> project OSNet map to Mamba channel dimension
+  -> concat on channel
+  -> 1x1 Conv / BN / SiLU
+  -> Spatial Mamba
+  -> MSEFBlock
+  -> pooling
+```
+
+## Current Best Duke Result
+
+The strongest Duke line so far is:
+
+```text
+Direction-aware Stage-FCU:
+  stage2: OSNet -> Mamba
+  stage3: Mamba -> OSNet
+
+Map fusion:
+  same-scale map-Mamba + MSEF
+
+Inference:
+  mamba_fdmf_osnet triple descriptor
+```
+
+Best reported Duke result:
+
+```text
+fdmf_msef_s2o2m_s3m2o
+mAP: 84.0%
+Rank-1: 91.5%
+Rank-5: 96.0%
+Rank-10: 97.1%
+```
+
+The same experiment's training-time fused feature alone was slightly lower:
+
+```text
+mAP: 83.9%
+Rank-1: 91.4%
+```
+
+Interpretation:
+
+- The triple descriptor at inference is better than relying only on the fused descriptor.
+- The method works best when the branches remain partly independent instead of being over-merged.
+
+## Pure Frequency Fusion Was Not Useful
+
+The old FDMF frequency branch was tested and did not justify its cost.
+
+Important Duke FDMF ablation results:
+
+```text
+fdmf_raw_no_mamba:
+  mAP: 82.1
+  Rank-1: 90.0
+
+fdmf_mamba_fdmf:
+  mAP: 83.4
+  Rank-1: 90.8
+
+pure no-frequency map-Mamba + MSEF:
+  mAP: 83.7 / 83.8 range
+  Rank-1: 91.2 / 91.6 range
+```
+
+Conclusion:
+
+- The useful signal is not the frequency decomposition itself.
+- The useful part is the same-scale map-Mamba refinement plus MSEF.
+- The current mainline should not reintroduce heavy frequency filtering unless there is a very specific reason.
+
+## MSEF Placement and Effect
+
+MSEF from `multinex-main` is a single feature-map refinement block, not a two-branch fusion module.
+
+Effective use in this project:
+
+```text
+concat maps
+  -> 1x1 Conv
+  -> SpatialMamba
+  -> MSEFBlock
+  -> pooling
+```
+
+Duke comparison:
+
+```text
+plain map-Mamba:
+  mAP: 83.7
+  Rank-1: 91.2
+
++ MSEF:
+  mAP: 83.8
+  Rank-1: 91.6
+
++ MSEF + residual scale:
+  mAP: 83.8
+  Rank-1: 91.6
+```
+
+Conclusion:
+
+- MSEF is mildly useful, especially for Rank-1.
+- Residual scale did not clearly improve over plain MSEF.
+- Keep MSEF as a lightweight refinement, but do not overstate it as the main novelty.
+
+## Stage-FCU With Map Fusion
+
+After adding map-Mamba/MSEF, Stage-FCU was rerun.
+
+Duke training summary:
+
+```text
+fdmf_msef_s2_o2m       mAP 83.5 / R1 90.9
+fdmf_msef_s2_m2o       mAP 83.6 / R1 91.1
+fdmf_msef_s2_bidir     mAP 83.4 / R1 90.9
+fdmf_msef_s3_o2m       mAP 83.6 / R1 91.1
+fdmf_msef_s3_m2o       mAP 83.7 / R1 91.1
+fdmf_msef_s3_bidir     mAP 83.6 / R1 91.2
+fdmf_msef_s23_bidir    mAP 83.7 / R1 90.8
+fdmf_msef_s2o2m_s3m2o  mAP 83.9 / R1 91.4
+```
+
+Triple descriptor inference on the same weights:
+
+```text
+fdmf_msef_s2_o2m       mAP 83.6 / R1 90.8
+fdmf_msef_s2_m2o       mAP 77.9 / R1 88.2
+fdmf_msef_s2_bidir     mAP 83.2 / R1 90.5
+fdmf_msef_s3_o2m       mAP 82.9 / R1 91.3
+fdmf_msef_s3_m2o       mAP 83.9 / R1 91.2
+fdmf_msef_s3_bidir     mAP 83.7 / R1 91.0
+fdmf_msef_s23_bidir    mAP 83.8 / R1 91.5
+fdmf_msef_s2o2m_s3m2o  mAP 84.0 / R1 91.5
+```
+
+Interpretation:
+
+- Direction-aware Stage-FCU remains the best internal interaction setting.
+- Stage 2 still prefers OSNet -> Mamba.
+- Stage 3 still prefers Mamba -> OSNet.
+- Some single-direction settings can look fine during training but behave poorly under triple descriptor inference.
+
+## OSBBM Summary
+
+OSBBM was fully implemented as an augmentation option, including grayscale rotation and random single-channel grayscale replacement.
+
+For Duke with current best fusion:
+
+```text
+no_osbbm                    mAP 84.0 / R1 91.5
+osbbm_p025_b8_m2_g05        mAP 84.0 / R1 91.6
+osbbm_p050_b8_m2_g05        mAP 84.0 / R1 91.7
+osbbm_p075_b8_m2_g05        mAP 83.6 / R1 91.6
+osbbm_p050_b8_m1_g05        mAP 84.1 / R1 91.4
+osbbm_p050_b8_m3_g05        mAP 83.1 / R1 91.2
+osbbm_p050_b8_m4_g05        mAP 67.7 / R1 84.2
+osbbm_p050_b6_m2_g05        mAP 82.9 / R1 90.0
+osbbm_p050_b10_m2_g05       mAP 84.0 / R1 91.2
+osbbm_p050_b12_m3_g05       mAP 83.8 / R1 90.9
+osbbm_p050_b8_m2_g00        mAP 84.0 / R1 91.1
+osbbm_p050_b8_m2_g025       mAP 84.1 / R1 91.3
+osbbm_p050_b8_m2_g075       mAP 84.2 / R1 91.3
+osbbm_p050_b8_m2_g10        mAP 84.1 / R1 91.7
+osbbm_p025_b8_m4_g05        mAP 79.0 / R1 88.9
+osbbm_p075_b8_m4_g05        mAP 58.9 / R1 78.6
+```
+
+Recommended OSBBM regularization setting:
+
+```text
+PROB: 0.5
+NUM_BLOCKS: 8
+NUM_MIX_BLOCKS: 2
+GRAY_PROB: 0.75
+MIXED_LABEL: False
+SCHEDULE: always
+```
+
+Market/MSMT17 observation:
+
+- OSBBM gives about +0.3 mAP on Market/MSMT17.
+- Rank-1 may drop by a few tenths.
+- Treat OSBBM as a regularization option, not a core method contribution.
+
+OCC-Duke observation:
+
+- Current network is not strong on OCC-Duke.
+- OSNet may introduce too much occlusion noise.
+- Do not make OCC-Duke the main dataset unless a visible-region/occlusion-aware mechanism is added.
+
+## Stripe Mamba Ablation
+
+A checkpoint was saved before stripe-Mamba work:
+
+```text
+commit a7e12a4
+message: checkpoint before stripe mamba fusion
+```
+
+Stripe-Mamba support was then added:
+
+```text
+FDMF_STRIPE_DEPTH
+FDMF_STRIPE_NUM
+FDMF_STRIPE_SHARE_PARAMS
+```
+
+Market no-OSBBM ablation:
+
+```text
+fdmf_global_d1                 mAP 89.7 / R1 95.3
+fdmf_global_d2                 mAP 89.3 / R1 95.2
+fdmf_stripe_s1_g0_shared       last mAP 0.4 / R1 0.1, best mAP 85.7 / R1 93.8
+fdmf_stripe_s1_g1_shared_k2    mAP 89.4 / R1 95.0
+fdmf_stripe_s1_g1_shared       mAP 89.5 / R1 95.6
+fdmf_stripe_s1_g1_shared_k8    mAP 89.4 / R1 95.2
+fdmf_stripe_s1_g1_indep        mAP 89.7 / R1 95.4
+fdmf_stripe_s2_g0_shared       mAP 89.7 / R1 95.4
+```
+
+Conclusion:
+
+- Stripe-local scanning is not a core improvement.
+- `global_d1` remains very strong.
+- `global_d2` hurts.
+- Stripe-only without global can collapse.
+- `s1_g1_indep` and `s2_g0_shared` are only tiny Rank-1 variants, not convincing enough to replace the mainline.
+
+## Negative Results From This Window
+
+The following directions were attempted or clarified as ineffective:
+
+| # | Direction | Specific idea | Location |
+|---:|---|---|---|
+| 1 | Stripe scan | Cut FDMF map into 4 stripes, scan each, concat | FDMF forward |
+| 2 | SPD descriptor decomposition | Shared/private split plus orthogonality loss | after pooling + loss |
+| 3 | Token concat fusion | Convert pooled mamba/osnet descriptors to tokens, Mamba scan, stitch back | after pooling |
+| 4 | CBSF cross-branch modulation | OSNet global vector modulates MambaVisionMixer B and Delta parameters | inside Mamba scan |
+| 5 | ETFFM token fusion | LN -> concat -> dual independent gates -> mutual gating -> projection | after pooling |
+| 6 | USE upsample stripe | Upsample FDMF map 2x, cut stripes, GeM pool, add per-stripe inference/supervision | after FDMF + loss |
+| 7 | S4-FCU | Add Stage-FCU at stage 4 before concat/residual injection | after backbone |
+
+Important correction:
+
+- Channel-Gated FCU had a script but was not actually run in the earlier count.
+- The corrected count of poor directions is 7.
+
+Overall interpretation:
+
+```text
+The system does not lack another interaction module.
+It is more sensitive to over-interaction and branch homogenization.
+```
+
+The best behavior comes from:
+
+- light direction-aware interaction inside stage 2/3,
+- one fused map branch,
+- keeping MambaVision, OSNet, and fused descriptors available at inference.
+
+## Current Research Judgment
+
+The strongest paper-positioning sentence is now:
+
+```text
+MambaVision and OSNet are complementary mainly as heterogeneous descriptor branches.
+Light stage-level exchange and a small fused-map refinement branch help,
+but overly strong stage/token/channel fusion weakens branch diversity and hurts ReID retrieval.
+```
+
+This explains both:
+
+- why `mamba_fdmf_osnet` triple descriptor works;
+- why many heavier fusion modules underperform.
+
+## Recommended Next Steps From Here
+
+1. Freeze the main structure:
+
+```text
+Direction-aware Stage-FCU
+  stage2: OSNet -> Mamba
+  stage3: Mamba -> OSNet
+same-scale map-Mamba + MSEF
+triple descriptor inference
+```
+
+2. Prefer low-cost inference/regularization studies over new heavy modules:
+
+```text
+branch-wise L2 normalize + weighted concat
+Mamba : FDMF : OSNet weight search
+DropBranch / DropDescriptor during training
+OSBBM as optional regularization
+```
+
+3. If trying one more map-fusion variant, the only promising one is late compression:
+
+```text
+Mamba map, OSNet map
+  -> cat to 2C
+  -> Mamba in 2C token space
+  -> reduce to C
+  -> MSEF
+  -> pooling
+```
+
+Rationale:
+
+- Current FDMF compresses two maps to C before Mamba.
+- Similar Mamba fusion papers usually scan spatial tokens, not channel dimension as the main sequence.
+- Channel modeling is better used as gate/attention/auxiliary Channel-SSM, not the primary scan axis.
+
+Do not prioritize:
+
+- more stripe-local scanning,
+- pooled-token Mamba,
+- invasive Mamba internal modulation,
+- stronger orthogonality loss,
+- deeper global Mamba.
+
+## Current Working Tree Notes
+
+At the time of this update, relevant local status included:
+
+```text
+M config/defaults.py
+M configs/Market/mambavision_tiny_osnet_fdmf_msef_stage_fcu_b64k4.yml
+M model/make_model.py
+M processor/processor.py
+?? scripts/run_duke_osnet_fdmf_stripe_mamba.sh
+?? scripts/run_market_osnet_fdmf_stripe_mamba.sh
+?? data/
+?? datasets/Occluded_Duke/
+?? etffm_backup/
+?? s4fcu_backup/
+?? tmp/
+?? use_backup/
+```
+
+Do not delete or revert these unless explicitly asked. Data and backup folders are intentionally untracked.
