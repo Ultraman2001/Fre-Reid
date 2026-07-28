@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import time
 import torch
@@ -7,8 +8,81 @@ import torch.nn.functional as F
 from utils.meter import AverageMeter
 from utils.metrics import R1_mAP_eval
 from utils.osbbm import apply_osbbm_batch
+from utils.feature_complementarity import (
+    analyze_feature_complementarity,
+    attach_retrieval_results,
+    attach_weight_sweep_results,
+    build_branch_normalized_descriptors,
+    iter_weighted_branch_descriptors,
+    log_feature_complementarity,
+    save_feature_complementarity,
+)
 from torch import amp
 import torch.distributed as dist
+
+
+def _top_level_tensor_health(value, prefix, names=None):
+    """Summarize branch tensors only when a non-finite loss is detected."""
+    if torch.is_tensor(value):
+        items = [(prefix, value)]
+    elif isinstance(value, (list, tuple)):
+        items = []
+        for idx, item in enumerate(value):
+            if not torch.is_tensor(item):
+                continue
+            name = names[idx] if names is not None and idx < len(names) else str(idx)
+            items.append(('{}.{}'.format(prefix, name), item))
+    elif isinstance(value, dict):
+        items = [
+            ('{}.{}'.format(prefix, key), item)
+            for key, item in value.items()
+            if torch.is_tensor(item)
+        ]
+    else:
+        return []
+
+    summaries = []
+    for name, tensor in items:
+        detached = tensor.detach()
+        finite = torch.isfinite(detached)
+        total = detached.numel()
+        finite_count = int(finite.sum().item())
+        if finite_count:
+            abs_max = detached[finite].float().abs().max().item()
+        else:
+            abs_max = float('nan')
+        summaries.append(
+            '{} shape={} finite={}/{} nan={} inf={} absmax={:.3e}'.format(
+                name,
+                tuple(detached.shape),
+                finite_count,
+                total,
+                int(torch.isnan(detached).sum().item()),
+                int(torch.isinf(detached).sum().item()),
+                abs_max,
+            )
+        )
+    return summaries
+
+
+def _nonfinite_loss_details(loss_detail):
+    if not isinstance(loss_detail, dict):
+        return []
+    bad = []
+    for key, value in loss_detail.items():
+        if isinstance(value, (int, float)) and not math.isfinite(float(value)):
+            bad.append('{}={}'.format(key, value))
+    return bad
+
+
+def _nonfinite_parameter_names(model, limit=12):
+    bad = []
+    for name, parameter in model.named_parameters():
+        if parameter.is_floating_point() and not torch.isfinite(parameter.detach()).all():
+            bad.append(name)
+            if len(bad) >= limit:
+                break
+    return bad
 
 
 def _osbbm_active_for_epoch(osbbm_cfg, epoch, max_epochs):
@@ -105,6 +179,9 @@ def do_train(cfg,
     checkpoint_period = cfg.SOLVER.CHECKPOINT_PERIOD
     eval_period = cfg.SOLVER.EVAL_PERIOD
     pam_enabled = cfg.INPUT.PAM.ENABLED
+    dual_view_enabled = bool(getattr(cfg.INPUT.DUAL_VIEW, 'ENABLED', False))
+    if pam_enabled and dual_view_enabled:
+        raise ValueError('INPUT.PAM and INPUT.DUAL_VIEW are mutually exclusive')
 
     device = "cuda"
     epochs = cfg.SOLVER.MAX_EPOCHS
@@ -113,17 +190,25 @@ def do_train(cfg,
     logger.info('start training')
     osbbm_cfg = getattr(cfg.INPUT, 'OSBBM', None)
     osbbm_enabled = bool(getattr(osbbm_cfg, 'ENABLED', False))
+    if dual_view_enabled and osbbm_enabled:
+        raise ValueError(
+            'INPUT.DUAL_VIEW and INPUT.OSBBM must be evaluated separately'
+        )
     osbbm_mixed_label = bool(getattr(osbbm_cfg, 'MIXED_LABEL', True))
     if osbbm_enabled:
         osbbm_end_epoch = int(getattr(osbbm_cfg, 'END_EPOCH', 0))
         if osbbm_end_epoch <= 0:
             osbbm_end_epoch = epochs
         logger.info(
-            "[OSBBM] enabled: prob={:.2f}, blocks={}, mix_blocks={}, gray_prob={:.2f}, apply_to={}, mixed_label={}, schedule={}, start={}, end={}, period={}, on={}".format(
+            "[OSBBM] enabled: prob={:.2f}, blocks={}, mix_blocks={}, gray_prob={:.2f}, gray_scope={}, sample={}, donor={}, block_mode={}, apply_to={}, mixed_label={}, schedule={}, start={}, end={}, period={}, on={}".format(
                 float(getattr(osbbm_cfg, 'PROB', 0.5)),
                 int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
-                int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 2)),
                 float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                str(getattr(osbbm_cfg, 'GRAY_SCOPE', 'all')).lower(),
+                str(getattr(osbbm_cfg, 'SAMPLE_MODE', 'random')).lower(),
+                str(getattr(osbbm_cfg, 'DONOR_MODE', 'random')).lower(),
+                str(getattr(osbbm_cfg, 'BLOCK_MODE', 'random')).lower(),
                 str(getattr(osbbm_cfg, 'APPLY_TO', 'base')).lower(),
                 osbbm_mixed_label,
                 str(getattr(osbbm_cfg, 'SCHEDULE', 'always')).lower(),
@@ -178,8 +263,12 @@ def do_train(cfg,
                         cfg.INPUT.PIXEL_STD,
                         prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
                         num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
-                        num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                        num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 2)),
                         gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                        gray_scope=str(getattr(osbbm_cfg, 'GRAY_SCOPE', 'all')),
+                        sample_mode=str(getattr(osbbm_cfg, 'SAMPLE_MODE', 'random')),
+                        donor_mode=str(getattr(osbbm_cfg, 'DONOR_MODE', 'random')),
+                        block_mode=str(getattr(osbbm_cfg, 'BLOCK_MODE', 'random')),
                         return_info=True,
                     )
                     if apply_to == 'all':
@@ -190,8 +279,9 @@ def do_train(cfg,
                             cfg.INPUT.PIXEL_STD,
                             prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
                             num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
-                            num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                            num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 2)),
                             gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                            gray_scope=str(getattr(osbbm_cfg, 'GRAY_SCOPE', 'all')),
                             mix_info=osbbm_info,
                         )
                         img_erase = apply_osbbm_batch(
@@ -201,8 +291,9 @@ def do_train(cfg,
                             cfg.INPUT.PIXEL_STD,
                             prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
                             num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
-                            num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                            num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 2)),
                             gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                            gray_scope=str(getattr(osbbm_cfg, 'GRAY_SCOPE', 'all')),
                             mix_info=osbbm_info,
                         )
                 img = (
@@ -214,6 +305,14 @@ def do_train(cfg,
                     osbbm_target_b = None
                     osbbm_lambda = None
                 batch_size = img_base.shape[0]
+            elif dual_view_enabled:
+                img_mamba, img_osnet, vid, target_cam, target_view = batch
+                target = vid.to(device)
+                img = (
+                    img_mamba.to(device),
+                    img_osnet.to(device),
+                )
+                batch_size = img[0].shape[0]
             else:
                 img, vid, target_cam, target_view = batch
                 img = img.to(device)
@@ -226,8 +325,12 @@ def do_train(cfg,
                         cfg.INPUT.PIXEL_STD,
                         prob=float(getattr(osbbm_cfg, 'PROB', 0.5)),
                         num_blocks=int(getattr(osbbm_cfg, 'NUM_BLOCKS', 8)),
-                        num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 4)),
+                        num_mix_blocks=int(getattr(osbbm_cfg, 'NUM_MIX_BLOCKS', 2)),
                         gray_prob=float(getattr(osbbm_cfg, 'GRAY_PROB', 0.5)),
+                        gray_scope=str(getattr(osbbm_cfg, 'GRAY_SCOPE', 'all')),
+                        sample_mode=str(getattr(osbbm_cfg, 'SAMPLE_MODE', 'random')),
+                        donor_mode=str(getattr(osbbm_cfg, 'DONOR_MODE', 'random')),
+                        block_mode=str(getattr(osbbm_cfg, 'BLOCK_MODE', 'random')),
                         return_info=True,
                     )
                     if not osbbm_mixed_label:
@@ -240,11 +343,38 @@ def do_train(cfg,
                 score, feat = model(img, target, cam_label=target_cam, view_label=target_view)
             
             # Loss 计算在 FP32 下进行，避免 FP16 溢出导致 NaN
-            loss_result = loss_fn(score, feat, target, target_cam, osbbm_target_b, osbbm_lambda)
+            loss_result = loss_fn(
+                score,
+                feat,
+                target,
+                target_cam,
+                osbbm_target_b,
+                osbbm_lambda,
+                epoch=epoch,
+            )
             if isinstance(loss_result, tuple):
                 loss, loss_detail = loss_result
             else:
                 loss, loss_detail = loss_result, None
+            if not torch.isfinite(loss).all():
+                branch_names = ('mamba', 'osnet', 'fdmf', 'stage3_local')
+                input_stats = _top_level_tensor_health(img, 'input')
+                score_stats = _top_level_tensor_health(score, 'score', branch_names)
+                feat_stats = _top_level_tensor_health(feat, 'feat', branch_names)
+                bad_loss_terms = _nonfinite_loss_details(loss_detail)
+                bad_parameters = _nonfinite_parameter_names(model)
+                raise FloatingPointError(
+                    'Non-finite loss at epoch {} iteration {}; optimizer step aborted. '
+                    'OSBBM_active={}; nonfinite_loss_terms={}; nonfinite_parameters={}; '
+                    'tensor_health={}'.format(
+                        epoch,
+                        n_iter + 1,
+                        osbbm_active,
+                        bad_loss_terms or 'none reported',
+                        bad_parameters or 'none',
+                        ' | '.join(input_stats + score_stats + feat_stats),
+                    )
+                )
             fdmf_stats = _fdmf_training_stats(cfg, feat)
             scaler.scale(loss).backward()
 
@@ -320,23 +450,64 @@ def do_train(cfg,
                                 loss_detail.get('id_stage3_stripe_local', 0.0),
                                 loss_detail.get('tri_stage3_stripe_local', 0.0),
                             )
-                        if 'w_stage3_part' in loss_detail:
-                            log_msg += " | S3Part[n={}, w={:.2f}, ID={:.2f}, Tri={:.4f}]".format(
-                                int(loss_detail.get('num_stage3_parts', 0)),
-                                loss_detail.get('w_stage3_part', 0.0),
-                                loss_detail.get('id_stage3_part_avg', 0.0),
-                                loss_detail.get('tri_stage3_part_avg', 0.0),
-                            )
-                        if 'w_stage4_stripe_local' in loss_detail:
-                            log_msg += " | S4Local[w={:.2f}, ID={:.2f}, Tri={:.4f}]".format(
-                                loss_detail.get('w_stage4_stripe_local', 0.0),
-                                loss_detail.get('id_stage4_stripe_local', 0.0),
-                                loss_detail.get('tri_stage4_stripe_local', 0.0),
+                            if 'tri_stage3_stripe_local_guided' in loss_detail:
+                                log_msg += " | GuidedTri[src={},mix={:.2f},loss={:.4f},ap/an={:.3f}/{:.3f}]".format(
+                                    loss_detail.get('local_guided_triplet_source', 'main'),
+                                    loss_detail.get('local_guided_triplet_mix', 0.0),
+                                    loss_detail.get('tri_stage3_stripe_local_guided', 0.0),
+                                    loss_detail.get('stage3_local_guided_ap', 0.0),
+                                    loss_detail.get('stage3_local_guided_an', 0.0),
+                                )
+                        if 'role_compensation_loss' in loss_detail:
+                            log_msg += (
+                                " | RoleSpec[{}/{}/{} drop={:.3f}] "
+                                "Comp[w={:.3f}x{:.2f},loss={:.4f},"
+                                "cos={:.3f}->{:.3f},gain={:+.3f}]"
+                            ).format(
+                                loss_detail.get('role_branch', 'none'),
+                                loss_detail.get('role_location', 'none'),
+                                loss_detail.get('role_mask_type', 'none'),
+                                loss_detail.get('role_drop_fraction', 0.0),
+                                loss_detail.get('role_compensation_base_weight', 0.0),
+                                loss_detail.get('role_compensation_scale', 0.0),
+                                loss_detail.get('role_compensation_loss', 0.0),
+                                loss_detail.get('role_pre_cosine', 0.0),
+                                loss_detail.get('role_post_cosine', 0.0),
+                                loss_detail.get('role_recovery_gain', 0.0),
                             )
                         if 'ratr' in loss_detail:
-                            log_msg += " | RATR[{}]={:.4f}".format(
+                            log_msg += " | RATR[{}]={:.4f}(intra={:.3f},inter={:.3f})".format(
                                 loss_detail.get('ratr_pair', 'pair'),
                                 loss_detail['ratr'],
+                                loss_detail.get('ratr_intra_corr', 0.0),
+                                loss_detail.get('ratr_inter_corr', 0.0),
+                            )
+                        if 'complementarity_mode' in loss_detail:
+                            log_msg += " | Comp[{},id_w={:.2f},tri_w={:.2f},drop={}] ID={:.2f} Tri={:.4f} Pred={:.4f} Energy={:.4f} Cov={:.4f}".format(
+                                loss_detail['complementarity_mode'],
+                                loss_detail.get('joint_id_weight', 0.0),
+                                loss_detail.get('joint_triplet_weight', 0.0),
+                                loss_detail.get('dropped_branch', 'none'),
+                                loss_detail.get('id_joint', 0.0),
+                                loss_detail.get('tri_joint', 0.0),
+                                loss_detail.get('prediction_loss', 0.0),
+                                loss_detail.get('residual_energy_loss', 0.0),
+                                loss_detail.get('covariance_loss', 0.0),
+                            )
+                        if 'peer_loss' in loss_detail:
+                            peer_stats = loss_detail.get('peer_stats', {})
+                            log_msg += " | PeerComp[s={:.2f},fused={:.4f},peer={:.4f},margin={:.3f}]".format(
+                                loss_detail.get('peer_complement_scale', 0.0),
+                                loss_detail.get('peer_fused_metric', 0.0),
+                                loss_detail.get('peer_loss', 0.0),
+                                peer_stats.get('fused_margin', 0.0),
+                            )
+                        if 'stage3_soft_balance' in loss_detail:
+                            log_msg += " | SoftPart[bal={:.4f},ord={:.4f},mass={},center={}]".format(
+                                loss_detail.get('stage3_soft_balance', 0.0),
+                                loss_detail.get('stage3_soft_order', 0.0),
+                                [round(value, 3) for value in loss_detail.get('stage3_soft_fraction', [])],
+                                [round(value, 3) for value in loss_detail.get('stage3_soft_centers', [])],
                             )
                         if fdmf_stats is not None:
                             log_msg += " | FDMFStats[M_norm={:.3f}, F_norm={:.3f}, cos(M,F)={:.3f}, cos(Fused,RawCat)={:.3f}]".format(
@@ -480,6 +651,12 @@ def do_inference(cfg,
     ]
     eval_all_feats = bool(getattr(getattr(cfg, 'TEST', None), 'EVAL_ALL_FEATS', True))
     preferred_feat = str(getattr(getattr(cfg, 'TEST', None), 'FEAT_MODE', 'concat')).lower()
+    weight_sweep_enabled = bool(
+        getattr(getattr(cfg, 'TEST', None), 'COMPLEMENTARITY_WEIGHT_SWEEP', False)
+    )
+    complementarity_enabled = weight_sweep_enabled or bool(
+        getattr(getattr(cfg, 'TEST', None), 'COMPLEMENTARITY_ANALYSIS', False)
+    )
     
     # Collect features for all reported branches.
     all_feats = {}
@@ -500,36 +677,49 @@ def do_inference(cfg,
                     for key in feat.keys():
                         all_feats.setdefault(key, [])
                         all_feats[key].append(feat[key].cpu())
+                elif complementarity_enabled:
+                    analysis_keys = {
+                        'backbone',
+                        'fdmf_only',
+                        'osnet',
+                        'stage3_stripe_local',
+                        preferred_feat,
+                    }
+                    for key in analysis_keys:
+                        if key in feat:
+                            all_feats.setdefault(key, [])
+                            all_feats[key].append(feat[key].cpu())
                 else:
                     selected_feat = _select_eval_feature(cfg, feat)
                     all_feats.setdefault(preferred_feat, [])
                     all_feats[preferred_feat].append(selected_feat.cpu())
 
-                if eval_all_feats and 'backbone' in feat and 'osnet' in feat:
+                if (eval_all_feats or complementarity_enabled) and 'backbone' in feat and 'osnet' in feat:
                     mamba_feat = feat['backbone']
                     osnet_feat = feat['osnet']
                     branch_norm_stats['mamba'].append(torch.norm(mamba_feat, p=2, dim=1).cpu())
                     branch_norm_stats['osnet'].append(torch.norm(osnet_feat, p=2, dim=1).cpu())
-                    branch_norm_concat = torch.cat(
-                        [
-                            F.normalize(mamba_feat, p=2, dim=1),
-                            F.normalize(osnet_feat, p=2, dim=1),
-                        ],
-                        dim=1,
-                    )
-                    all_feats.setdefault('branch_norm_concat', [])
-                    all_feats['branch_norm_concat'].append(branch_norm_concat.cpu())
-                    for beta in branch_norm_betas:
-                        beta_key = 'weighted_branch_norm_concat_b{:03d}'.format(int(round(beta * 100)))
-                        weighted_branch_norm_concat = torch.cat(
+                    if eval_all_feats:
+                        branch_norm_concat = torch.cat(
                             [
                                 F.normalize(mamba_feat, p=2, dim=1),
-                                beta * F.normalize(osnet_feat, p=2, dim=1),
+                                F.normalize(osnet_feat, p=2, dim=1),
                             ],
                             dim=1,
                         )
-                        all_feats.setdefault(beta_key, [])
-                        all_feats[beta_key].append(weighted_branch_norm_concat.cpu())
+                        all_feats.setdefault('branch_norm_concat', [])
+                        all_feats['branch_norm_concat'].append(branch_norm_concat.cpu())
+                        for beta in branch_norm_betas:
+                            beta_key = 'weighted_branch_norm_concat_b{:03d}'.format(int(round(beta * 100)))
+                            weighted_branch_norm_concat = torch.cat(
+                                [
+                                    F.normalize(mamba_feat, p=2, dim=1),
+                                    beta * F.normalize(osnet_feat, p=2, dim=1),
+                                ],
+                                dim=1,
+                            )
+                            all_feats.setdefault(beta_key, [])
+                            all_feats[beta_key].append(weighted_branch_norm_concat.cpu())
             else:
                 # Normal mode: only one descriptor is available.
                 all_feats.setdefault('concat', [])
@@ -543,6 +733,25 @@ def do_inference(cfg,
     import numpy as np
     all_pids = np.array(all_pids)
     all_camids = np.array(all_camids)
+
+    feature_tensors = {
+        name: torch.cat(feature_list, dim=0)
+        for name, feature_list in all_feats.items()
+        if feature_list
+    }
+    complementarity_report = None
+    if complementarity_enabled:
+        complementarity_report = analyze_feature_complementarity(
+            feature_tensors,
+            num_query=num_query,
+            topk=int(getattr(cfg.TEST, 'COMPLEMENTARITY_TOPK', 10)),
+            cka_samples=int(getattr(cfg.TEST, 'COMPLEMENTARITY_CKA_SAMPLES', 2048)),
+            query_samples=int(getattr(cfg.TEST, 'COMPLEMENTARITY_QUERY_SAMPLES', 256)),
+            gallery_samples=int(getattr(cfg.TEST, 'COMPLEMENTARITY_GALLERY_SAMPLES', 4096)),
+            seed=int(getattr(cfg.SOLVER, 'SEED', 42)),
+        )
+        if not weight_sweep_enabled:
+            feature_tensors.update(build_branch_normalized_descriptors(feature_tensors))
 
     if branch_norm_stats['mamba'] and branch_norm_stats['osnet']:
         mamba_norm = torch.cat(branch_norm_stats['mamba'], dim=0)
@@ -561,25 +770,80 @@ def do_inference(cfg,
     
     # Evaluate each feature type
     results = {}
-    for feat_name, feat_list in all_feats.items():
-        if len(feat_list) == 0:
-            continue
-            
-        feats = torch.cat(feat_list, dim=0)
+    def evaluate_descriptor(feat_name, feats, verbose=True):
         evaluator = R1_mAP_eval(num_query, max_rank=50, feat_norm=cfg.TEST.FEAT_NORM)
         evaluator.reset()
-        
-        # Update evaluator with all features at once
-        for i in range(len(all_pids)):
-            evaluator.update((feats[i:i+1], [all_pids[i]], [all_camids[i]]))
-        
+
+        evaluator.update((feats, all_pids, all_camids))
+
         cmc, mAP, _, _, _, _, _ = evaluator.compute()
-        results[feat_name] = {'cmc': cmc, 'mAP': mAP}
-        
-        logger.info(f"=== {feat_name.upper()} Results ===")
-        logger.info("mAP: {:.1%}".format(mAP))
-        for r in [1, 5, 10]:
-            logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+        result = {'cmc': cmc, 'mAP': mAP}
+        if verbose:
+            logger.info(f"=== {feat_name.upper()} Results ===")
+            logger.info("mAP: {:.1%}".format(mAP))
+            for r in [1, 5, 10]:
+                logger.info("CMC curve, Rank-{:<3}:{:.1%}".format(r, cmc[r - 1]))
+        return result
+
+    for feat_name, feats in feature_tensors.items():
+        results[feat_name] = evaluate_descriptor(feat_name, feats)
+
+    weight_metadata = {}
+    if weight_sweep_enabled:
+        for feat_name, feats, weights in iter_weighted_branch_descriptors(
+            feature_tensors,
+            fdmf_weights=list(getattr(cfg.TEST, 'COMPLEMENTARITY_FDMF_WEIGHTS', [])),
+            osnet_weights=list(getattr(cfg.TEST, 'COMPLEMENTARITY_OSNET_WEIGHTS', [])),
+            local_weights=list(getattr(cfg.TEST, 'COMPLEMENTARITY_LOCAL_WEIGHTS', [])),
+        ):
+            weight_metadata[feat_name] = weights
+            results[feat_name] = evaluate_descriptor(feat_name, feats, verbose=False)
+            result = results[feat_name]
+            logger.info(
+                'WeightSweep {} mAP={:.2f}% R1={:.2f}%'.format(
+                    feat_name,
+                    100.0 * result['mAP'],
+                    100.0 * result['cmc'][0],
+                )
+            )
+
+    if complementarity_report is not None:
+        base_results = {
+            name: result
+            for name, result in results.items()
+            if not name.startswith('ws_')
+        }
+        attach_retrieval_results(complementarity_report, base_results)
+        if weight_sweep_enabled:
+            attach_weight_sweep_results(complementarity_report, weight_metadata, results)
+            weighted = complementarity_report.get('weight_sweep', {})
+            if weighted:
+                best_map_name, best_map = max(weighted.items(), key=lambda item: item[1]['mAP'])
+                best_r1_name, best_r1 = max(weighted.items(), key=lambda item: item[1]['R1'])
+                logger.info(
+                    'Best weight-sweep mAP: {} mAP={:.2f}% R1={:.2f}%'.format(
+                        best_map_name,
+                        100.0 * best_map['mAP'],
+                        100.0 * best_map['R1'],
+                    )
+                )
+                logger.info(
+                    'Best weight-sweep R1: {} mAP={:.2f}% R1={:.2f}%'.format(
+                        best_r1_name,
+                        100.0 * best_r1['mAP'],
+                        100.0 * best_r1['R1'],
+                    )
+                )
+        log_feature_complementarity(logger, complementarity_report)
+        output_name = str(
+            getattr(cfg.TEST, 'COMPLEMENTARITY_OUTPUT', 'feature_complementarity.json')
+        )
+        output_path = output_name if os.path.isabs(output_name) else os.path.join(
+            cfg.OUTPUT_DIR,
+            output_name,
+        )
+        save_feature_complementarity(complementarity_report, output_path)
+        logger.info('Complementarity report saved to {}'.format(output_path))
     
     for key in (preferred_feat, 'fdmf', 'concat', 'raw_concat', 'backbone'):
         if key in results:

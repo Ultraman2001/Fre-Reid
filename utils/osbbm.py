@@ -26,6 +26,29 @@ def _different_identity_permutation(labels):
     return perm
 
 
+def _different_identity_derangement(labels, attempts=64):
+    """Build a one-to-one donor assignment whenever the batch permits it."""
+    batch_size = labels.shape[0]
+    identity = torch.arange(batch_size, device=labels.device)
+    if batch_size <= 1:
+        return identity
+
+    _, counts = labels.unique(return_counts=True)
+    max_count = int(counts.max().item())
+    if max_count * 2 <= batch_size:
+        order = torch.argsort(labels)
+        perm = torch.empty_like(order)
+        perm[order] = torch.roll(order, shifts=-max_count)
+        if torch.all(labels[perm] != labels):
+            return perm
+
+    for _ in range(attempts):
+        perm = torch.randperm(batch_size, device=labels.device)
+        if torch.all(labels[perm] != labels):
+            return perm
+    return _different_identity_permutation(labels)
+
+
 def _sample_rotated_rect(height, width, device, scale=(0.02, 0.25), ratio=(0.3, 3.3), attempts=10):
     area = float(height * width)
     log_ratio = (math.log(ratio[0]), math.log(ratio[1]))
@@ -61,7 +84,7 @@ def _rotated_rect_mask(height, width, top, left, rect_h, rect_w, angle, device):
     return (xr.abs() <= float(rect_w) * 0.5) & (yr.abs() <= float(rect_h) * 0.5)
 
 
-def _apply_local_rotated_grayscale(images, prob):
+def _apply_local_rotated_grayscale(images, prob, apply_mask=None):
     """Apply the local grayscale preprocessing described by OSBBM.
 
     For each selected image, a random rotated rectangle is converted to grayscale.
@@ -73,6 +96,8 @@ def _apply_local_rotated_grayscale(images, prob):
     out = images.clone()
     batch_size, _, height, width = out.shape
     for idx in range(batch_size):
+        if apply_mask is not None and not bool(apply_mask[idx]):
+            continue
         if torch.rand((), device=out.device) >= prob:
             continue
         top, left, rect_h, rect_w, angle = _sample_rotated_rect(height, width, out.device)
@@ -88,15 +113,61 @@ def _apply_local_rotated_grayscale(images, prob):
     return out
 
 
-def _build_mix_info(labels, prob, num_blocks, num_mix_blocks):
+def _sample_apply_mask(labels, prob, sample_mode):
+    if sample_mode == 'random':
+        return torch.rand(labels.shape[0], device=labels.device) < float(prob)
+    if sample_mode != 'pk_half':
+        raise ValueError("OSBBM SAMPLE_MODE must be 'random' or 'pk_half'")
+
+    apply_mask = torch.zeros(labels.shape[0], device=labels.device, dtype=torch.bool)
+    for identity in labels.unique():
+        indices = torch.nonzero(labels == identity, as_tuple=False).flatten()
+        count = int(round(indices.numel() * float(prob)))
+        count = max(0, min(count, indices.numel()))
+        if count > 0:
+            selected = indices[torch.randperm(indices.numel(), device=labels.device)[:count]]
+            apply_mask[selected] = True
+    return apply_mask
+
+
+def _sample_blocks(num_blocks, num_mix_blocks, block_mode, device):
+    if block_mode == 'random':
+        return torch.randperm(num_blocks, device=device)[:num_mix_blocks]
+    if block_mode != 'part_balanced':
+        raise ValueError("OSBBM BLOCK_MODE must be 'random' or 'part_balanced'")
+
+    zones = torch.tensor_split(torch.arange(num_blocks, device=device), num_mix_blocks)
+    selected = [zone[torch.randint(zone.numel(), (), device=device)] for zone in zones if zone.numel()]
+    return torch.stack(selected)
+
+
+def _build_mix_info(
+    labels,
+    prob,
+    num_blocks,
+    num_mix_blocks,
+    sample_mode='random',
+    donor_mode='random',
+    block_mode='random',
+):
     batch_size = labels.shape[0]
-    donor_perm = _different_identity_permutation(labels)
-    apply_mask = torch.rand(batch_size, device=labels.device) < float(prob)
+    if donor_mode == 'random':
+        donor_perm = _different_identity_permutation(labels)
+    elif donor_mode == 'derangement':
+        donor_perm = _different_identity_derangement(labels)
+    else:
+        raise ValueError("OSBBM DONOR_MODE must be 'random' or 'derangement'")
+    apply_mask = _sample_apply_mask(labels, prob, sample_mode)
     block_mask = torch.zeros(batch_size, num_blocks, device=labels.device, dtype=torch.bool)
     lam = torch.ones(batch_size, device=labels.device, dtype=torch.float32)
 
     for idx in torch.nonzero(apply_mask, as_tuple=False).flatten().tolist():
-        donor_blocks = torch.randperm(num_blocks, device=labels.device)[:num_mix_blocks]
+        donor_blocks = _sample_blocks(
+            num_blocks,
+            num_mix_blocks,
+            block_mode,
+            labels.device,
+        )
         block_mask[idx, donor_blocks] = True
         lam[idx] = 1.0 - float(num_mix_blocks) / float(num_blocks)
 
@@ -116,8 +187,12 @@ def apply_osbbm_batch(
     std,
     prob=0.5,
     num_blocks=8,
-    num_mix_blocks=4,
+    num_mix_blocks=2,
     gray_prob=0.5,
+    gray_scope='all',
+    sample_mode='random',
+    donor_mode='random',
+    block_mode='random',
     mix_info=None,
     return_info=False,
 ):
@@ -136,17 +211,29 @@ def apply_osbbm_batch(
     num_blocks = max(1, int(num_blocks))
     num_mix_blocks = max(1, min(int(num_mix_blocks), num_blocks))
     gray_prob = float(gray_prob)
+    gray_scope = str(gray_scope).lower()
+    if gray_scope not in ('all', 'mixed'):
+        raise ValueError("OSBBM GRAY_SCOPE must be 'all' or 'mixed'")
 
     orig_dtype = images.dtype
     work = images.float()
     mean_t, std_t = _norm_stats(mean, std, work.device, work.dtype)
     work = (work * std_t + mean_t).clamp(0.0, 1.0)
-    work = _apply_local_rotated_grayscale(work, gray_prob)
-    mixed = work.clone()
 
     labels = labels.detach()
     if mix_info is None:
-        mix_info = _build_mix_info(labels, prob, num_blocks, num_mix_blocks)
+        mix_info = _build_mix_info(
+            labels,
+            prob,
+            num_blocks,
+            num_mix_blocks,
+            sample_mode=sample_mode,
+            donor_mode=donor_mode,
+            block_mode=block_mode,
+        )
+    gray_mask = mix_info['apply_mask'] if gray_scope == 'mixed' else None
+    work = _apply_local_rotated_grayscale(work, gray_prob, apply_mask=gray_mask)
+    mixed = work.clone()
     donor_perm = mix_info['donor_perm'].to(device=work.device)
     block_mask = mix_info['block_mask'].to(device=work.device)
     target_b = mix_info['target_b'].to(device=labels.device)

@@ -110,7 +110,6 @@ run_experiment() {
     MODEL.OSNET_FUSION.FCU_DIRECTION "'${fcu_direction}'" \
     "${fcu_stage_direction_opts[@]}" \
     MODEL.OSNET_FUSION.FCU_INIT_SCALE "${init_scale}" \
-    MODEL.OSNET_FUSION.FDMF_FILTER_TYPE "'none'" \
     MODEL.OSNET_FUSION.FDMF_FUSED_FORM "'mamba_fdmf'" \
     MODEL.OSNET_FUSION.FDMF_MAMBA_DEPTH 1 \
     MODEL.OSNET_FUSION.FDMF_MAMBA_INIT_SCALE 0.1 \

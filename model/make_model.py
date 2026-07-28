@@ -554,7 +554,8 @@ def weights_init_kaiming(m):
     classname = m.__class__.__name__
     if classname.find('Linear') != -1:
         nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
-        nn.init.constant_(m.bias, 0.0)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.0)
 
     elif classname.find('Conv') != -1:
         if not hasattr(m, 'weight'):
@@ -1154,8 +1155,8 @@ _factory_osnet = {
 }
 
 
-class SameScaleFrequencyMambaBlock(nn.Module):
-    """Spatial Mamba block for a same-scale feature map."""
+class SpatialMambaBlock(nn.Module):
+    """Mamba refinement for a same-scale feature map."""
 
     def __init__(
         self,
@@ -1165,17 +1166,39 @@ class SameScaleFrequencyMambaBlock(nn.Module):
         d_state=8,
         d_conv=3,
         bidirectional=True,
+        scan_mode='raster',
+        learnable_direction_weights=False,
+        conditional_enabled=False,
+        condition_init_scale=0.1,
+        mixer_expand=1,
     ):
         super().__init__()
         hidden_dim = max(int(dim * mlp_ratio), dim)
         self.bidirectional = bidirectional
+        self.scan_mode = str(scan_mode).lower()
+        if self.scan_mode not in ('raster', 'axial4', 'snake4'):
+            raise ValueError(
+                "SpatialMambaBlock scan_mode must be 'raster', 'axial4', or 'snake4'"
+            )
+        self.num_scan_directions = (
+            4 if self.scan_mode in ('axial4', 'snake4') else (2 if bidirectional else 1)
+        )
+        self.direction_logits = (
+            nn.Parameter(torch.zeros(self.num_scan_directions))
+            if learnable_direction_weights and self.num_scan_directions > 1
+            else None
+        )
+        if self.direction_logits is not None:
+            self.direction_logits._no_weight_decay = True
         self.norm1 = nn.LayerNorm(dim)
         self.mixer = MambaVisionMixer(
             d_model=dim,
             d_state=d_state,
             d_conv=d_conv,
-            expand=1,
+            expand=mixer_expand,
             use_sasf=False,
+            condition_dim=dim if conditional_enabled else None,
+            condition_init_scale=condition_init_scale,
         )
         self.norm2 = nn.LayerNorm(dim)
         self.mlp = nn.Sequential(
@@ -1188,79 +1211,164 @@ class SameScaleFrequencyMambaBlock(nn.Module):
         self.gamma1._no_weight_decay = True
         self.gamma2._no_weight_decay = True
 
-    def forward(self, feature_map):
+    @staticmethod
+    def _four_direction_indices(h, w, device, snake):
+        grid = torch.arange(h * w, device=device).reshape(h, w)
+        if snake:
+            horizontal = grid.clone()
+            horizontal[1::2] = horizontal[1::2].flip(1)
+            vertical = grid.transpose(0, 1).contiguous()
+            vertical[1::2] = vertical[1::2].flip(1)
+        else:
+            horizontal = grid
+            vertical = grid.transpose(0, 1).contiguous()
+
+        horizontal = horizontal.flatten()
+        vertical = vertical.flatten()
+        return (
+            horizontal,
+            horizontal.flip(0),
+            vertical,
+            vertical.flip(0),
+        )
+
+    def _mix_four_directions(
+        self,
+        seq_norm,
+        h,
+        w,
+        condition_norm=None,
+        condition_parts='none',
+        condition_merge='residual',
+    ):
+        indices = self._four_direction_indices(
+            h,
+            w,
+            seq_norm.device,
+            snake=self.scan_mode == 'snake4',
+        )
+        restored = []
+        for scan_index in indices:
+            scanned = seq_norm.index_select(1, scan_index)
+            if isinstance(condition_norm, dict):
+                scanned_condition = {
+                    part: states.index_select(1, scan_index)
+                    for part, states in condition_norm.items()
+                }
+            else:
+                scanned_condition = (
+                    condition_norm.index_select(1, scan_index)
+                    if condition_norm is not None
+                    else None
+                )
+            mixed = self.mixer(
+                scanned,
+                H=h,
+                W=w,
+                condition_states=scanned_condition,
+                condition_parts=condition_parts,
+                condition_merge=condition_merge,
+            )
+            inverse_index = torch.empty_like(scan_index)
+            inverse_index[scan_index] = torch.arange(
+                scan_index.numel(),
+                device=scan_index.device,
+            )
+            restored.append(mixed.index_select(1, inverse_index))
+
+        stacked = torch.stack(restored, dim=0)
+        if self.direction_logits is None:
+            return stacked.mean(dim=0)
+        weights = F.softmax(self.direction_logits.float(), dim=0).to(dtype=stacked.dtype)
+        return (stacked * weights.view(-1, 1, 1, 1)).sum(dim=0)
+
+    def forward(
+        self,
+        feature_map,
+        include_mlp=True,
+        condition_map=None,
+        condition_parts='none',
+        condition_merge='residual',
+    ):
         b, c, h, w = feature_map.shape
         seq = feature_map.flatten(2).transpose(1, 2).contiguous()
         seq_norm = self.norm1(seq)
-        mixed = self.mixer(seq_norm, H=h, W=w)
-        if self.bidirectional:
-            rev_norm = torch.flip(seq_norm, dims=(1,)).contiguous()
-            mixed_rev = self.mixer(rev_norm, H=h, W=w)
-            mixed = 0.5 * (mixed + torch.flip(mixed_rev, dims=(1,)))
+        condition_norm = None
+        if condition_map is not None:
+            if isinstance(condition_map, dict):
+                condition_norm = {}
+                for part, part_map in condition_map.items():
+                    if part_map.shape != feature_map.shape:
+                        raise ValueError(
+                            '{} condition_map and feature_map must have '
+                            'identical shapes'.format(part)
+                        )
+                    condition_norm[part] = (
+                        part_map.flatten(2).transpose(1, 2).contiguous()
+                    )
+            else:
+                if condition_map.shape != feature_map.shape:
+                    raise ValueError(
+                        'condition_map and feature_map must have identical shapes'
+                    )
+                condition_norm = (
+                    condition_map.flatten(2).transpose(1, 2).contiguous()
+                )
+        if self.scan_mode == 'raster':
+            mixed = self.mixer(
+                seq_norm,
+                H=h,
+                W=w,
+                condition_states=condition_norm,
+                condition_parts=condition_parts,
+                condition_merge=condition_merge,
+            )
+            if self.bidirectional:
+                rev_norm = torch.flip(seq_norm, dims=(1,)).contiguous()
+                if isinstance(condition_norm, dict):
+                    rev_condition = {
+                        part: torch.flip(states, dims=(1,)).contiguous()
+                        for part, states in condition_norm.items()
+                    }
+                else:
+                    rev_condition = (
+                        torch.flip(condition_norm, dims=(1,)).contiguous()
+                        if condition_norm is not None
+                        else None
+                    )
+                mixed_rev = self.mixer(
+                    rev_norm,
+                    H=h,
+                    W=w,
+                    condition_states=rev_condition,
+                    condition_parts=condition_parts,
+                    condition_merge=condition_merge,
+                )
+                mixed_rev = torch.flip(mixed_rev, dims=(1,))
+                if self.direction_logits is None:
+                    mixed = 0.5 * (mixed + mixed_rev)
+                else:
+                    weights = F.softmax(self.direction_logits.float(), dim=0).to(
+                        dtype=mixed.dtype
+                    )
+                    mixed = weights[0] * mixed + weights[1] * mixed_rev
+        else:
+            mixed = self._mix_four_directions(
+                seq_norm,
+                h,
+                w,
+                condition_norm=condition_norm,
+                condition_parts=condition_parts,
+                condition_merge=condition_merge,
+            )
         seq = seq + self.gamma1 * mixed
-        seq = seq + self.gamma2 * self.mlp(self.norm2(seq))
+        if include_mlp:
+            seq = seq + self.gamma2 * self.mlp(self.norm2(seq))
         return seq.transpose(1, 2).reshape(b, c, h, w).contiguous()
 
 
-class StripeMambaBlock(nn.Module):
-    """Apply a spatial Mamba block independently on horizontal body stripes."""
-
-    def __init__(
-        self,
-        dim,
-        num_stripes=4,
-        shared_params=True,
-        mlp_ratio=2.0,
-        init_scale=0.1,
-        d_state=8,
-        d_conv=3,
-        bidirectional=True,
-    ):
-        super().__init__()
-        self.num_stripes = max(int(num_stripes), 1)
-        self.shared_params = bool(shared_params)
-        block_kwargs = dict(
-            dim=dim,
-            mlp_ratio=mlp_ratio,
-            init_scale=init_scale,
-            d_state=d_state,
-            d_conv=d_conv,
-            bidirectional=bidirectional,
-        )
-        if self.shared_params:
-            self.shared_block = SameScaleFrequencyMambaBlock(**block_kwargs)
-            self.stripe_blocks = None
-        else:
-            self.shared_block = None
-            self.stripe_blocks = nn.ModuleList([
-                SameScaleFrequencyMambaBlock(**block_kwargs)
-                for _ in range(self.num_stripes)
-            ])
-
-    def forward(self, feature_map):
-        _, _, h, _ = feature_map.shape
-        if self.num_stripes <= 1 or h <= 1:
-            block = self.shared_block if self.shared_params else self.stripe_blocks[0]
-            return block(feature_map)
-
-        stripe_outs = []
-        for idx in range(self.num_stripes):
-            y0 = idx * h // self.num_stripes
-            y1 = (idx + 1) * h // self.num_stripes
-            if y1 <= y0:
-                continue
-            stripe = feature_map[:, :, y0:y1, :]
-            block = self.shared_block if self.shared_params else self.stripe_blocks[idx]
-            stripe_outs.append(block(stripe))
-        return torch.cat(stripe_outs, dim=2).contiguous()
-
-
 class MSEFBlock(nn.Module):
-    """Multi-Scale Enhancement Fusion block from Multinex.
-
-    Spatial-channel product interaction with tanh-gated channel recalibration.
-    DWConv_3x3(LN(x)) * tanh_SE(LN(x)) + x
-    """
+    """Multi-stage squeeze-and-excite fusion block."""
 
     def __init__(self, ch, reduction_ratio=16, use_res_scale=False, res_scale_init=0.1):
         super().__init__()
@@ -1287,43 +1395,464 @@ class MSEFBlock(nn.Module):
         return identity + delta
 
 
-class SameScaleFrequencyMambaFusion(nn.Module):
-    """Same-scale OSNet/Mamba map fusion followed by SpatialMamba refinement.
+class OrthogonalDualStateFusion(nn.Module):
+    """Consensus/discrepancy state modeling for aligned heterogeneous maps.
 
-    The FDMF interface is kept for config/checkpoint compatibility, but the
-    frequency low/high decomposition path has been removed. The module now uses:
-        F_init = Conv1x1(cat(MambaMap, OSNetMap))
-        F_out  = SpatialMamba(F_init)
+    The branch-axis transform is lossless for the default fixed orthogonal
+    basis.  A projection carrier preserves a short, stable information path;
+    Mamba only supplies bounded residual corrections to the consensus and
+    discrepancy states.
     """
+
+    _VALID_BASES = {
+        'fixed', 'absdiff', 'signed_abs',
+        'learned_orthogonal', 'learned_free',
+    }
+    _VALID_GATES = {'separable', 'spatial', 'channel', 'none'}
+
+    def __init__(
+        self,
+        input_dim,
+        state_dim=256,
+        depth=1,
+        d_state=8,
+        d_conv=3,
+        init_scale=0.1,
+        bidirectional=True,
+        scan_mode='raster',
+        learnable_direction_weights=False,
+        mlp_ratio=2.0,
+        use_consensus=True,
+        use_discrepancy=True,
+        share_mamba=True,
+        share_norm=False,
+        packed_scan=False,
+        basis='fixed',
+        gate='separable',
+        shuffle_discrepancy=False,
+        detach_discrepancy=False,
+        carrier_enabled=True,
+        residual_scale_init=0.1,
+        residual_scale_max=0.5,
+        semantic_perp=False,
+        modulation='none',
+        modulation_scale=0.5,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.state_dim = int(state_dim)
+        self.depth = int(depth)
+        self.use_consensus = bool(use_consensus)
+        self.use_discrepancy = bool(use_discrepancy)
+        self.share_mamba = bool(share_mamba)
+        self.share_norm = bool(share_norm)
+        self.packed_scan = bool(packed_scan)
+        self.basis = str(basis).strip().lower()
+        self.gate_type = str(gate).strip().lower()
+        self.shuffle_discrepancy = bool(shuffle_discrepancy)
+        self.detach_discrepancy = bool(detach_discrepancy)
+        self.carrier_enabled = bool(carrier_enabled)
+        self.residual_scale_max = float(residual_scale_max)
+        self.semantic_perp = bool(semantic_perp)
+        self.modulation = str(modulation).strip().lower()
+        self.modulation_scale = float(modulation_scale)
+        if self.state_dim <= 0 or self.depth < 0:
+            raise ValueError('ODSMF state_dim must be positive and depth non-negative')
+        if not (self.use_consensus or self.use_discrepancy):
+            raise ValueError('ODSMF requires at least one active state')
+        if self.basis not in self._VALID_BASES:
+            raise ValueError('Unknown ODSMF basis: {}'.format(self.basis))
+        if self.gate_type not in self._VALID_GATES:
+            raise ValueError('Unknown ODSMF gate: {}'.format(self.gate_type))
+        if self.residual_scale_max <= 0:
+            raise ValueError('ODSMF residual_scale_max must be positive')
+        if self.modulation not in ('none', 'c2d', 'd2c'):
+            raise ValueError('Unknown ODSMF modulation: {}'.format(self.modulation))
+        if not 0.0 < self.modulation_scale <= 1.0:
+            raise ValueError('ODSMF modulation_scale must be in (0, 1]')
+
+        self.mamba_state_proj = nn.Conv2d(
+            self.input_dim, self.state_dim, kernel_size=1, bias=False
+        )
+        self.osnet_state_proj = nn.Conv2d(
+            self.input_dim, self.state_dim, kernel_size=1, bias=False
+        )
+        self.mamba_state_norm = nn.LayerNorm(self.state_dim)
+        self.osnet_state_norm = nn.LayerNorm(self.state_dim)
+
+        root_half = 2.0 ** -0.5
+        self.basis_angle = nn.Parameter(torch.tensor(0.7853981633974483))
+        self.basis_matrix = nn.Parameter(torch.tensor([
+            [root_half, root_half],
+            [root_half, -root_half],
+        ]))
+        self.basis_angle.requires_grad_(self.basis == 'learned_orthogonal')
+        self.basis_matrix.requires_grad_(self.basis == 'learned_free')
+        self.basis_angle._no_weight_decay = True
+        self.basis_matrix._no_weight_decay = True
+        self.signed_abs_proj = nn.Conv2d(
+            self.state_dim * 2, self.state_dim, kernel_size=1, bias=False
+        )
+
+        block_kwargs = dict(
+            mlp_ratio=mlp_ratio,
+            init_scale=init_scale,
+            d_state=d_state,
+            d_conv=d_conv,
+            bidirectional=bidirectional,
+            scan_mode=scan_mode,
+            learnable_direction_weights=learnable_direction_weights,
+            conditional_enabled=False,
+        )
+        self.consensus_blocks = nn.ModuleList([
+            SpatialMambaBlock(self.state_dim, **block_kwargs)
+            for _ in range(self.depth)
+        ])
+        self.discrepancy_blocks = nn.ModuleList([
+            SpatialMambaBlock(self.state_dim, **block_kwargs)
+            for _ in range(self.depth)
+        ])
+        if self.share_mamba:
+            for consensus_block, discrepancy_block in zip(
+                self.consensus_blocks, self.discrepancy_blocks
+            ):
+                discrepancy_block.mixer = consensus_block.mixer
+        if self.share_norm:
+            for consensus_block, discrepancy_block in zip(
+                self.consensus_blocks, self.discrepancy_blocks
+            ):
+                discrepancy_block.norm1 = consensus_block.norm1
+                discrepancy_block.norm2 = consensus_block.norm2
+
+        self.carrier = nn.Sequential(
+            nn.Conv2d(self.state_dim * 2, self.input_dim, 1, bias=False),
+            nn.BatchNorm2d(self.input_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.consensus_out = nn.Conv2d(
+            self.state_dim, self.input_dim, kernel_size=1, bias=False
+        )
+        self.discrepancy_out = nn.Conv2d(
+            self.state_dim, self.input_dim, kernel_size=1, bias=False
+        )
+        relation_dim = self.state_dim * 2
+        gate_hidden = max(self.state_dim // 16, 8)
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(
+                relation_dim, relation_dim, 3,
+                padding=1, groups=relation_dim, bias=False,
+            ),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(relation_dim, 1, kernel_size=1, bias=True),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(relation_dim, gate_hidden, kernel_size=1, bias=False),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(gate_hidden, self.state_dim, kernel_size=1, bias=True),
+        )
+        modulation_hidden = max(self.state_dim // 16, 8)
+        self.c2d_modulator = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(
+                self.state_dim, modulation_hidden, kernel_size=1, bias=False
+            ),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(
+                modulation_hidden, self.state_dim, kernel_size=1, bias=True
+            ),
+        )
+        self.d2c_modulator = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(
+                self.state_dim, modulation_hidden, kernel_size=1, bias=False
+            ),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(
+                modulation_hidden, self.state_dim, kernel_size=1, bias=True
+            ),
+        )
+        self.consensus_scale = nn.Parameter(
+            torch.tensor(float(residual_scale_init))
+        )
+        self.discrepancy_scale = nn.Parameter(
+            torch.tensor(float(residual_scale_init))
+        )
+        self.consensus_scale._no_weight_decay = True
+        self.discrepancy_scale._no_weight_decay = True
+
+        self.mamba_state_proj.apply(weights_init_kaiming)
+        self.osnet_state_proj.apply(weights_init_kaiming)
+        self.signed_abs_proj.apply(weights_init_kaiming)
+        self.carrier.apply(weights_init_kaiming)
+        self.consensus_out.apply(weights_init_kaiming)
+        self.discrepancy_out.apply(weights_init_kaiming)
+        self.spatial_gate.apply(weights_init_kaiming)
+        self.channel_gate.apply(weights_init_kaiming)
+        self.c2d_modulator.apply(weights_init_kaiming)
+        self.d2c_modulator.apply(weights_init_kaiming)
+        # Every learned gate starts at exactly one after 2*sigmoid(.), making
+        # gate ablations comparable and avoiding early suppression.
+        nn.init.zeros_(self.spatial_gate[-1].weight)
+        nn.init.zeros_(self.spatial_gate[-1].bias)
+        nn.init.zeros_(self.channel_gate[-1].weight)
+        nn.init.zeros_(self.channel_gate[-1].bias)
+        # Bounded state modulation starts as an exact identity transform.
+        nn.init.zeros_(self.c2d_modulator[-1].weight)
+        nn.init.zeros_(self.c2d_modulator[-1].bias)
+        nn.init.zeros_(self.d2c_modulator[-1].weight)
+        nn.init.zeros_(self.d2c_modulator[-1].bias)
+
+        if not self.carrier_enabled:
+            self._freeze_module(self.carrier)
+        if self.gate_type == 'none':
+            self._freeze_module(self.spatial_gate)
+            self._freeze_module(self.channel_gate)
+        elif self.gate_type == 'spatial':
+            self._freeze_module(self.channel_gate)
+        elif self.gate_type == 'channel':
+            self._freeze_module(self.spatial_gate)
+        if self.basis != 'signed_abs':
+            self._freeze_module(self.signed_abs_proj)
+        if self.modulation != 'c2d':
+            self._freeze_module(self.c2d_modulator)
+        if self.modulation != 'd2c':
+            self._freeze_module(self.d2c_modulator)
+
+    @staticmethod
+    def _freeze_module(module):
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+
+    @staticmethod
+    def _norm_map(feature_map, norm):
+        return norm(feature_map.permute(0, 2, 3, 1)).permute(
+            0, 3, 1, 2
+        ).contiguous()
+
+    @staticmethod
+    def _run_state(feature_map, blocks):
+        output = feature_map
+        for block in blocks:
+            output = block(output, include_mlp=True)
+        return output
+
+    def _make_states(self, mamba_state, osnet_state):
+        if self.basis == 'learned_orthogonal':
+            cosine = torch.cos(self.basis_angle).to(mamba_state.dtype)
+            sine = torch.sin(self.basis_angle).to(mamba_state.dtype)
+            consensus = cosine * mamba_state + sine * osnet_state
+            discrepancy = sine * mamba_state - cosine * osnet_state
+        elif self.basis == 'learned_free':
+            matrix = self.basis_matrix.to(mamba_state.dtype)
+            consensus = matrix[0, 0] * mamba_state + matrix[0, 1] * osnet_state
+            discrepancy = matrix[1, 0] * mamba_state + matrix[1, 1] * osnet_state
+        else:
+            scale = 2.0 ** -0.5
+            consensus = scale * (mamba_state + osnet_state)
+            signed = scale * (mamba_state - osnet_state)
+            if self.basis == 'absdiff':
+                discrepancy = signed.abs()
+            elif self.basis == 'signed_abs':
+                discrepancy = self.signed_abs_proj(
+                    torch.cat([signed, signed.abs()], dim=1)
+                )
+            else:
+                discrepancy = signed
+        return consensus, discrepancy
+
+    @staticmethod
+    def _semantic_residualize(consensus, discrepancy):
+        """Remove the point-wise channel projection of D onto C in FP32."""
+        output_dtype = discrepancy.dtype
+        with torch.autocast(device_type=discrepancy.device.type, enabled=False):
+            consensus_fp32 = consensus.float()
+            discrepancy_fp32 = discrepancy.float()
+            numerator = (discrepancy_fp32 * consensus_fp32).sum(
+                dim=1, keepdim=True
+            )
+            denominator = consensus_fp32.square().sum(
+                dim=1, keepdim=True
+            ).clamp_min(1e-4)
+            residual = discrepancy_fp32 - (
+                numerator / denominator
+            ) * consensus_fp32
+        return residual.to(output_dtype)
+
+    def _modulate_states(self, consensus, discrepancy):
+        with torch.autocast(device_type=discrepancy.device.type, enabled=False):
+            if self.modulation == 'c2d':
+                gamma = self.modulation_scale * torch.tanh(
+                    self.c2d_modulator(consensus.float())
+                )
+                discrepancy = discrepancy * (
+                    1.0 + gamma.to(discrepancy.dtype)
+                )
+            elif self.modulation == 'd2c':
+                gamma = self.modulation_scale * torch.tanh(
+                    self.d2c_modulator(discrepancy.float().abs())
+                )
+                consensus = consensus * (1.0 + gamma.to(consensus.dtype))
+        return consensus, discrepancy
+
+    def _reliability_gate(self, consensus, discrepancy):
+        if self.gate_type == 'none':
+            return discrepancy.new_ones(
+                discrepancy.shape[0], self.state_dim,
+                discrepancy.shape[2], discrepancy.shape[3],
+            )
+        output_dtype = discrepancy.dtype
+        # The product term is the only multiplicative path in ODSMF. Keep the
+        # small gate predictor in FP32 so AMP cannot reproduce the overflow
+        # observed in the discarded prototype-alignment experiments.
+        with torch.autocast(device_type=discrepancy.device.type, enabled=False):
+            consensus_fp32 = consensus.float()
+            discrepancy_fp32 = discrepancy.float()
+            relation = torch.cat(
+                [discrepancy_fp32.abs(), consensus_fp32 * discrepancy_fp32],
+                dim=1,
+            )
+            spatial = (
+                2.0 * torch.sigmoid(self.spatial_gate(relation))
+                if self.gate_type in ('spatial', 'separable') else None
+            )
+            channel = (
+                2.0 * torch.sigmoid(self.channel_gate(relation))
+                if self.gate_type in ('channel', 'separable') else None
+            )
+        if self.gate_type == 'spatial':
+            return spatial.to(output_dtype)
+        if self.gate_type == 'channel':
+            return channel.to(output_dtype)
+        # Geometric composition retains separability and also starts at one.
+        return torch.sqrt((spatial * channel).clamp_min(1e-6)).to(output_dtype)
+
+    def forward(self, mamba_map, osnet_map, return_diagnostics=False):
+        mamba_state = self._norm_map(
+            self.mamba_state_proj(mamba_map), self.mamba_state_norm
+        )
+        osnet_state = self._norm_map(
+            self.osnet_state_proj(osnet_map), self.osnet_state_norm
+        )
+        consensus, discrepancy = self._make_states(mamba_state, osnet_state)
+        if self.semantic_perp:
+            discrepancy = self._semantic_residualize(consensus, discrepancy)
+        consensus, discrepancy = self._modulate_states(consensus, discrepancy)
+        discrepancy_scan = (
+            discrepancy.detach() if self.detach_discrepancy else discrepancy
+        )
+        if self.shuffle_discrepancy and self.training and discrepancy.shape[0] > 1:
+            discrepancy_scan = torch.roll(discrepancy_scan, shifts=1, dims=0)
+
+        if self.packed_scan and self.use_consensus and self.use_discrepancy:
+            width = consensus.shape[-1]
+            packed = torch.cat([consensus, discrepancy_scan], dim=-1)
+            packed = self._run_state(packed, self.consensus_blocks)
+            consensus_refined = packed[..., :width]
+            discrepancy_refined = packed[..., width:]
+        else:
+            consensus_refined = (
+                self._run_state(consensus, self.consensus_blocks)
+                if self.use_consensus else consensus
+            )
+            discrepancy_refined = (
+                self._run_state(discrepancy_scan, self.discrepancy_blocks)
+                if self.use_discrepancy else discrepancy_scan
+            )
+
+        gate = self._reliability_gate(consensus, discrepancy_scan)
+        consensus_delta = self.consensus_out(consensus_refined - consensus)
+        discrepancy_delta = self.discrepancy_out(
+            gate * (discrepancy_refined - discrepancy_scan)
+        )
+        if self.carrier_enabled:
+            output = self.carrier(torch.cat([consensus, discrepancy], dim=1))
+            if self.use_consensus:
+                scale = self.consensus_scale.clamp(
+                    -self.residual_scale_max, self.residual_scale_max
+                )
+                output = output + scale.to(output.dtype) * consensus_delta
+            if self.use_discrepancy:
+                scale = self.discrepancy_scale.clamp(
+                    -self.residual_scale_max, self.residual_scale_max
+                )
+                output = output + scale.to(output.dtype) * discrepancy_delta
+        else:
+            full_states = []
+            if self.use_consensus:
+                full_states.append(self.consensus_out(consensus_refined))
+            if self.use_discrepancy:
+                full_states.append(
+                    self.discrepancy_out(gate * discrepancy_refined)
+                )
+            output = sum(full_states) / float(len(full_states))
+
+        diagnostics = {}
+        if return_diagnostics:
+            # Positive maps are pooled only for checkpoint decomposition; they
+            # are never added to the training loss or default descriptor.
+            diagnostics = {
+                'odsmf_consensus_map': F.relu(
+                    self.consensus_out(consensus_refined), inplace=False
+                ),
+                'odsmf_discrepancy_map': F.relu(
+                    self.discrepancy_out(discrepancy_refined.abs()), inplace=False
+                ),
+            }
+        return output, diagnostics
+
+
+class SameScaleMambaFusion(nn.Module):
+    """Stable legacy FDMF with an optional orthogonal dual-state path."""
 
     def __init__(
         self,
         dim,
         osnet_dim,
-        compressed_channels=64,
-        lowpass_kernel=5,
-        highpass_kernel=3,
-        use_hamming=True,
-        filter_type='none',
         mamba_depth=1,
         mamba_d_state=8,
         mamba_d_conv=3,
         mamba_init_scale=0.1,
         mamba_bidirectional=True,
+        mamba_scan_mode='raster',
+        mamba_learnable_direction_weights=False,
         mlp_ratio=2.0,
-        stripe_depth=0,
-        stripe_num=4,
-        stripe_share_params=True,
+        mamba_forward_enabled=True,
+        mamba_mlp_enabled=True,
         msef_enabled=True,
+        msef_forward_enabled=True,
         msef_reduction_ratio=16,
         msef_res_scale_enabled=False,
         msef_res_scale_init=0.1,
+        odsmf_enabled=False,
+        odsmf_state_dim=256,
+        odsmf_depth=1,
+        odsmf_use_consensus=True,
+        odsmf_use_discrepancy=True,
+        odsmf_share_mamba=True,
+        odsmf_share_norm=False,
+        odsmf_packed_scan=False,
+        odsmf_basis='fixed',
+        odsmf_gate='separable',
+        odsmf_shuffle_discrepancy=False,
+        odsmf_detach_discrepancy=False,
+        odsmf_carrier_enabled=True,
+        odsmf_res_scale_init=0.1,
+        odsmf_res_scale_max=0.5,
+        odsmf_semantic_perp=False,
+        odsmf_modulation='none',
+        odsmf_modulation_scale=0.5,
     ):
         super().__init__()
         if mamba_depth < 0:
             raise ValueError('FDMF_MAMBA_DEPTH must be >= 0')
-        self.dim = dim
-        self.filter_type = 'none'
+        self.dim = int(dim)
+        self.output_dim = int(dim)
+        self.mamba_forward_enabled = bool(mamba_forward_enabled)
+        self.mamba_mlp_enabled = bool(mamba_mlp_enabled)
+        self.msef_forward_enabled = bool(msef_forward_enabled)
+        self.odsmf_enabled = bool(odsmf_enabled)
+
         self.osnet_map_proj = (
             nn.Identity()
             if osnet_dim == dim
@@ -1337,27 +1866,17 @@ class SameScaleFrequencyMambaFusion(nn.Module):
             nn.BatchNorm2d(dim),
             nn.SiLU(inplace=True),
         )
-        self.stripe_blocks = nn.ModuleList([
-            StripeMambaBlock(
-                dim,
-                num_stripes=stripe_num,
-                shared_params=stripe_share_params,
-                mlp_ratio=mlp_ratio,
-                init_scale=mamba_init_scale,
-                d_state=mamba_d_state,
-                d_conv=mamba_d_conv,
-                bidirectional=mamba_bidirectional,
-            )
-            for _ in range(max(int(stripe_depth), 0))
-        ])
         self.mamba_blocks = nn.ModuleList([
-            SameScaleFrequencyMambaBlock(
+            SpatialMambaBlock(
                 dim,
                 mlp_ratio=mlp_ratio,
                 init_scale=mamba_init_scale,
                 d_state=mamba_d_state,
                 d_conv=mamba_d_conv,
                 bidirectional=mamba_bidirectional,
+                scan_mode=mamba_scan_mode,
+                learnable_direction_weights=mamba_learnable_direction_weights,
+                conditional_enabled=True,
             )
             for _ in range(mamba_depth)
         ])
@@ -1371,11 +1890,83 @@ class SameScaleFrequencyMambaFusion(nn.Module):
             if msef_enabled
             else nn.Identity()
         )
-
         self.osnet_map_proj.apply(weights_init_kaiming)
         self.fuse_proj.apply(weights_init_kaiming)
 
-    def forward(self, mamba_map, osnet_map):
+        rng_state = torch.random.get_rng_state()
+        self.odsmf = (
+            OrthogonalDualStateFusion(
+                input_dim=dim,
+                state_dim=odsmf_state_dim,
+                depth=odsmf_depth,
+                d_state=mamba_d_state,
+                d_conv=mamba_d_conv,
+                init_scale=mamba_init_scale,
+                bidirectional=mamba_bidirectional,
+                scan_mode=mamba_scan_mode,
+                learnable_direction_weights=mamba_learnable_direction_weights,
+                mlp_ratio=mlp_ratio,
+                use_consensus=odsmf_use_consensus,
+                use_discrepancy=odsmf_use_discrepancy,
+                share_mamba=odsmf_share_mamba,
+                share_norm=odsmf_share_norm,
+                packed_scan=odsmf_packed_scan,
+                basis=odsmf_basis,
+                gate=odsmf_gate,
+                shuffle_discrepancy=odsmf_shuffle_discrepancy,
+                detach_discrepancy=odsmf_detach_discrepancy,
+                carrier_enabled=odsmf_carrier_enabled,
+                residual_scale_init=odsmf_res_scale_init,
+                residual_scale_max=odsmf_res_scale_max,
+                semantic_perp=odsmf_semantic_perp,
+                modulation=odsmf_modulation,
+                modulation_scale=odsmf_modulation_scale,
+            )
+            if self.odsmf_enabled
+            else None
+        )
+        torch.random.set_rng_state(rng_state)
+
+        if self.odsmf is not None:
+            self._freeze_module(self.fuse_proj)
+            self._freeze_module(self.mamba_blocks)
+
+        if not self.mamba_forward_enabled:
+            self._freeze_module(self.mamba_blocks)
+        elif not self.mamba_mlp_enabled:
+            for block in self.mamba_blocks:
+                self._freeze_module(block.norm2)
+                self._freeze_module(block.mlp)
+                block.gamma2.requires_grad_(False)
+        if not self.msef_forward_enabled:
+            self._freeze_module(self.msef)
+
+    @staticmethod
+    def _freeze_module(module):
+        if module is None:
+            return
+        for parameter in module.parameters():
+            parameter.requires_grad_(False)
+
+    def _run_blocks(self, feature_map):
+        refined = feature_map
+        if self.mamba_forward_enabled:
+            for block in self.mamba_blocks:
+                refined = block(
+                    refined,
+                    include_mlp=self.mamba_mlp_enabled,
+                )
+        return refined
+
+    def forward(
+        self,
+        mamba_map,
+        osnet_map,
+        region_masks=None,
+        foreground_map=None,
+        return_diagnostics=False,
+    ):
+        del region_masks, foreground_map
         if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
             osnet_map = F.interpolate(
                 osnet_map,
@@ -1384,14 +1975,21 @@ class SameScaleFrequencyMambaFusion(nn.Module):
                 align_corners=False,
             )
         osnet_map = self.osnet_map_proj(osnet_map)
-
-        fused_map = self.fuse_proj(torch.cat([mamba_map, osnet_map], dim=1))
-        for block in self.stripe_blocks:
-            fused_map = block(fused_map)
-        for block in self.mamba_blocks:
-            fused_map = block(fused_map)
-        fused_map = self.msef(fused_map)
-        return fused_map
+        if self.odsmf is None:
+            fused_map = self.fuse_proj(torch.cat([mamba_map, osnet_map], dim=1))
+            fused_map = self._run_blocks(fused_map)
+            diagnostics = None
+        else:
+            fused_map, diagnostics = self.odsmf(
+                mamba_map,
+                osnet_map,
+                return_diagnostics=return_diagnostics,
+            )
+        if self.msef_forward_enabled:
+            fused_map = self.msef(fused_map)
+        if not diagnostics:
+            return fused_map
+        return dict(fused_map=fused_map, **diagnostics)
 
 
 class StageFCU(nn.Module):
@@ -1414,23 +2012,31 @@ class StageFCU(nn.Module):
         self.gate_type = str(gate_type).lower()
         if self.gate_type not in ('none', 'channel'):
             raise ValueError("FCU gate_type must be 'none' or 'channel'")
-        self.mamba_from_osnet = nn.Sequential(
-            nn.Conv2d(osnet_dim, mamba_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(mamba_dim),
-            nn.GELU(),
-        )
-        self.osnet_from_mamba = nn.Sequential(
-            nn.Conv2d(mamba_dim, osnet_dim, kernel_size=1, bias=False),
-            nn.BatchNorm2d(osnet_dim),
-            nn.GELU(),
-        )
-        self.fusion_scale_mamba = nn.Parameter(torch.ones(1) * float(init_scale))
-        self.fusion_scale_osnet = nn.Parameter(torch.ones(1) * float(init_scale))
-        if self.gate_type == 'channel':
+        self.mamba_from_osnet = None
+        self.osnet_from_mamba = None
+        self.fusion_scale_mamba = None
+        self.fusion_scale_osnet = None
+        if self.direction in ('bidirectional', 'osnet_to_mamba'):
+            self.mamba_from_osnet = nn.Sequential(
+                nn.Conv2d(osnet_dim, mamba_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(mamba_dim),
+                nn.GELU(),
+            )
+            self.fusion_scale_mamba = nn.Parameter(torch.ones(1) * float(init_scale))
+        if self.direction in ('bidirectional', 'mamba_to_osnet'):
+            self.osnet_from_mamba = nn.Sequential(
+                nn.Conv2d(mamba_dim, osnet_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(osnet_dim),
+                nn.GELU(),
+            )
+            self.fusion_scale_osnet = nn.Parameter(torch.ones(1) * float(init_scale))
+        if self.gate_type == 'channel' and self.mamba_from_osnet is not None:
             self.mamba_gate = self._make_channel_gate(mamba_dim, gate_reduction, gate_init_bias)
-            self.osnet_gate = self._make_channel_gate(osnet_dim, gate_reduction, gate_init_bias)
         else:
             self.mamba_gate = None
+        if self.gate_type == 'channel' and self.osnet_from_mamba is not None:
+            self.osnet_gate = self._make_channel_gate(osnet_dim, gate_reduction, gate_init_bias)
+        else:
             self.osnet_gate = None
 
     @staticmethod
@@ -1453,12 +2059,19 @@ class StageFCU(nn.Module):
         gate_input = torch.cat([target_map, delta_map], dim=1).float()
         return delta_map * gate(gate_input).to(delta_map.dtype)
 
-    def forward(self, mamba_map, osnet_map):
+    def forward(
+        self,
+        mamba_map,
+        osnet_map,
+        detach_mamba_source=False,
+        detach_osnet_source=False,
+    ):
         new_mamba_map = mamba_map
         new_osnet_map = osnet_map
 
         if self.direction in ('bidirectional', 'osnet_to_mamba'):
-            osnet_to_mamba = self.mamba_from_osnet(osnet_map)
+            osnet_source = osnet_map.detach() if detach_osnet_source else osnet_map
+            osnet_to_mamba = self.mamba_from_osnet(osnet_source)
             if osnet_to_mamba.shape[-2:] != mamba_map.shape[-2:]:
                 osnet_to_mamba = F.interpolate(
                     osnet_to_mamba,
@@ -1470,7 +2083,8 @@ class StageFCU(nn.Module):
             new_mamba_map = mamba_map + self.fusion_scale_mamba.to(mamba_map.dtype) * osnet_to_mamba
 
         if self.direction in ('bidirectional', 'mamba_to_osnet'):
-            mamba_to_osnet = self.osnet_from_mamba(mamba_map)
+            mamba_source = mamba_map.detach() if detach_mamba_source else mamba_map
+            mamba_to_osnet = self.osnet_from_mamba(mamba_source)
             if mamba_to_osnet.shape[-2:] != osnet_map.shape[-2:]:
                 mamba_to_osnet = F.interpolate(
                     mamba_to_osnet,
@@ -1484,258 +2098,209 @@ class StageFCU(nn.Module):
         return new_mamba_map, new_osnet_map
 
 
-class Stage3PartStripeFusion(nn.Module):
-    """Part-wise two-branch stripe fusion head on aligned feature maps."""
+
+
+class Stage3SemanticDetailFusion(nn.Module):
+    """Use Stage3 semantics to pool the true high-resolution OSNet detail map."""
 
     def __init__(
         self,
-        mamba_dim,
-        osnet_dim,
-        num_stripes=4,
-        share_params=True,
-        mamba_depth=1,
-        mamba_d_state=8,
-        mamba_d_conv=3,
-        mamba_init_scale=0.1,
-        mamba_bidirectional=True,
-        mlp_ratio=2.0,
+        mask_dim,
+        detail_dim,
+        fdmf_dim,
+        foreground_dim=None,
+        num_parts=2,
         part_dim=0,
-        pooling_type='gem',
-        overlap_ratio=0.0,
-        context_mixer_type='none',
-        context_mixer_kernel=3,
-        context_mixer_init_scale=1e-3,
-        reliability_gate=False,
-        reliability_hidden_ratio=0.25,
-        reliability_init_bias=2.0,
+        temperature=1.5,
+        prior_scale=1.0,
+        order_margin=0.15,
+        foreground_gate=False,
+        foreground_gate_mode='emphasis',
+        confidence_mode='none',
+        residual_injection=False,
+        residual_init_scale=0.1,
     ):
         super().__init__()
-        self.num_stripes = max(int(num_stripes), 1)
-        self.share_params = bool(share_params)
-        self.mamba_dim = int(mamba_dim)
-        self.osnet_dim = int(osnet_dim)
-        self.fuse_dim = self.mamba_dim
-        self.part_dim = int(part_dim) if int(part_dim) > 0 else self.fuse_dim
-        self.overlap_ratio = max(float(overlap_ratio), 0.0)
-        self.pool = create_pooling(pooling_type)
-
-        self.osnet_proj = (
-            nn.Identity()
-            if self.osnet_dim == self.fuse_dim
-            else nn.Sequential(
-                nn.Conv2d(self.osnet_dim, self.fuse_dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(self.fuse_dim),
-            )
+        self.num_parts = max(int(num_parts), 1)
+        self.mask_dim = int(mask_dim)
+        self.detail_dim = int(detail_dim)
+        self.fdmf_dim = int(fdmf_dim)
+        self.foreground_dim = (
+            int(foreground_dim) if foreground_dim is not None else self.mask_dim
         )
+        self.part_dim = int(part_dim) if int(part_dim) > 0 else self.fdmf_dim
+        self.temperature = max(float(temperature), 1e-4)
+        self.prior_scale = max(float(prior_scale), 0.0)
+        self.order_margin = max(float(order_margin), 0.0)
+        self.foreground_gate_enabled = bool(foreground_gate)
+        self.foreground_gate_mode = str(foreground_gate_mode).lower()
+        if self.foreground_gate_mode not in ('emphasis', 'sigmoid2', 'floor01'):
+            raise ValueError(
+                'STAGE3_DETAIL_FOREGROUND_GATE_MODE must be emphasis, sigmoid2, or floor01'
+            )
+        self.confidence_mode = str(confidence_mode).lower()
+        if self.confidence_mode not in ('none', 'triplet', 'descriptor'):
+            raise ValueError(
+                'STAGE3_LOCAL_CONFIDENCE_MODE must be none, triplet, or descriptor'
+            )
+        self.residual_injection_enabled = bool(residual_injection)
 
-        def make_fuse():
-            return nn.Sequential(
-                nn.Conv2d(self.fuse_dim * 2, self.fuse_dim, kernel_size=1, bias=False),
-                nn.BatchNorm2d(self.fuse_dim),
+        self.semantic_proj = nn.Sequential(
+            nn.Conv2d(self.mask_dim, self.mask_dim, 1, bias=False),
+            nn.BatchNorm2d(self.mask_dim),
+            nn.SiLU(inplace=True),
+        )
+        self.mask_predictor = nn.Conv2d(self.mask_dim, self.num_parts, 1, bias=True)
+        self.detail_proj = nn.Sequential(
+            nn.Conv2d(self.detail_dim, self.part_dim, 1, bias=False),
+            nn.BatchNorm2d(self.part_dim),
+            nn.SiLU(inplace=True),
+        )
+        if self.foreground_gate_enabled:
+            self.foreground_predictor = nn.Conv2d(self.foreground_dim, 1, 1, bias=True)
+        else:
+            self.foreground_predictor = None
+
+        if self.residual_injection_enabled:
+            self.residual_projector = nn.Sequential(
+                nn.Conv2d(self.num_parts * self.part_dim, self.fdmf_dim, 1, bias=False),
+                nn.BatchNorm2d(self.fdmf_dim),
                 nn.SiLU(inplace=True),
             )
-
-        def make_mamba_stack():
-            return nn.Sequential(*[
-                SameScaleFrequencyMambaBlock(
-                    self.fuse_dim,
-                    mlp_ratio=mlp_ratio,
-                    init_scale=mamba_init_scale,
-                    d_state=mamba_d_state,
-                    d_conv=mamba_d_conv,
-                    bidirectional=mamba_bidirectional,
-                )
-                for _ in range(max(int(mamba_depth), 0))
-            ])
-
-        self.shared_fuse = make_fuse() if self.share_params else None
-        self.shared_mamba = make_mamba_stack() if self.share_params else None
-        self.stripe_fuse = None if self.share_params else nn.ModuleList([
-            make_fuse() for _ in range(self.num_stripes)
-        ])
-        self.stripe_mamba = None if self.share_params else nn.ModuleList([
-            make_mamba_stack() for _ in range(self.num_stripes)
-        ])
-        self.part_reduce = (
-            nn.Identity()
-            if self.part_dim == self.fuse_dim
-            else nn.Sequential(
-                nn.LayerNorm(self.fuse_dim),
-                nn.Linear(self.fuse_dim, self.part_dim),
-                nn.ReLU(inplace=True),
+            self.fdmf_residual_scale = nn.Parameter(
+                torch.ones(1) * float(residual_init_scale)
             )
+            self.fdmf_residual_scale._no_weight_decay = True
+        else:
+            self.residual_projector = None
+            self.register_parameter('fdmf_residual_scale', None)
+
+        self.out_dim = self.num_parts * self.part_dim
+        self.last_aux = {}
+        self.last_residual = None
+        self.last_parts = None
+        self.last_confidence = None
+        self.last_masks = None
+        self.last_foreground = None
+
+        self.semantic_proj.apply(weights_init_kaiming)
+        self.detail_proj.apply(weights_init_kaiming)
+        if self.residual_projector is not None:
+            self.residual_projector.apply(weights_init_kaiming)
+        nn.init.zeros_(self.mask_predictor.weight)
+        nn.init.zeros_(self.mask_predictor.bias)
+        if self.foreground_predictor is not None:
+            nn.init.zeros_(self.foreground_predictor.weight)
+            nn.init.zeros_(self.foreground_predictor.bias)
+
+    def _vertical_prior(self, height, width, device, dtype):
+        y = torch.linspace(0.0, 1.0, height, device=device, dtype=dtype).view(1, 1, height, 1)
+        centers = torch.linspace(
+            0.5 / self.num_parts,
+            1.0 - 0.5 / self.num_parts,
+            self.num_parts,
+            device=device,
+            dtype=dtype,
+        ).view(1, self.num_parts, 1, 1)
+        sigma = 0.5 / self.num_parts
+        return -((y - centers) / max(sigma, 1e-4)).square().expand(1, -1, height, width)
+
+    def forward(self, mask_map, detail_map, foreground_map=None):
+        semantic_map = self.semantic_proj(mask_map)
+        logits = self.mask_predictor(semantic_map).float()
+        logits = F.interpolate(
+            logits,
+            size=detail_map.shape[-2:],
+            mode='bilinear',
+            align_corners=False,
         )
-        self.context_mixer = StripeContextMixer(
-            self.part_dim,
-            self.num_stripes,
-            mixer_type=context_mixer_type,
-            kernel_size=context_mixer_kernel,
-            init_scale=context_mixer_init_scale,
-        )
-        self.reliability_gate = (
-            StripeReliabilityGate(
-                self.part_dim,
-                hidden_ratio=reliability_hidden_ratio,
-                init_bias=reliability_init_bias,
+        if self.prior_scale > 0:
+            logits = logits + self.prior_scale * self._vertical_prior(
+                logits.shape[-2],
+                logits.shape[-1],
+                logits.device,
+                logits.dtype,
             )
-            if reliability_gate
-            else None
-        )
-        self.out_dim = self.num_stripes * self.part_dim
+        masks = torch.softmax(logits / self.temperature, dim=1)
+        self.last_masks = masks
 
-        self.osnet_proj.apply(weights_init_kaiming)
-        if self.shared_fuse is not None:
-            self.shared_fuse.apply(weights_init_kaiming)
-        if self.stripe_fuse is not None:
-            self.stripe_fuse.apply(weights_init_kaiming)
-        self.part_reduce.apply(weights_init_kaiming)
-
-    def _stripe_range(self, height, idx):
-        y0 = idx * height // self.num_stripes
-        y1 = (idx + 1) * height // self.num_stripes
-        if y1 <= y0:
-            y1 = min(y0 + 1, height)
-        if self.overlap_ratio > 0 and self.num_stripes > 1:
-            stripe_h = max(y1 - y0, 1)
-            overlap = max(int(round(stripe_h * self.overlap_ratio)), 1)
-            y0 = max(y0 - overlap, 0)
-            y1 = min(y1 + overlap, height)
-        return y0, y1
-
-    def forward(self, mamba_map, osnet_map, return_parts=False):
-        if osnet_map.shape[-2:] != mamba_map.shape[-2:]:
-            osnet_map = F.interpolate(
-                osnet_map,
-                size=mamba_map.shape[-2:],
+        detail_map = self.detail_proj(detail_map)
+        foreground = None
+        if self.foreground_predictor is not None:
+            if foreground_map is None:
+                foreground_map = mask_map
+            foreground = torch.sigmoid(self.foreground_predictor(foreground_map).float())
+            foreground = F.interpolate(
+                foreground,
+                size=detail_map.shape[-2:],
                 mode='bilinear',
                 align_corners=False,
             )
-        osnet_map = self.osnet_proj(osnet_map)
+            foreground_gate = foreground.to(detail_map.dtype)
+            if self.foreground_gate_mode == 'emphasis':
+                foreground_gate = 0.5 + foreground_gate
+            elif self.foreground_gate_mode == 'sigmoid2':
+                foreground_gate = 2.0 * foreground_gate
+            else:
+                foreground_gate = 0.1 + 1.8 * foreground_gate
+            detail_map = detail_map * foreground_gate
+        self.last_foreground = foreground
 
-        _, _, height, _ = mamba_map.shape
-        parts = []
-        for idx in range(self.num_stripes):
-            y0, y1 = self._stripe_range(height, idx)
-            mamba_stripe = mamba_map[:, :, y0:y1, :]
-            osnet_stripe = osnet_map[:, :, y0:y1, :]
-            fuse = self.shared_fuse if self.share_params else self.stripe_fuse[idx]
-            mamba_stack = self.shared_mamba if self.share_params else self.stripe_mamba[idx]
-            stripe = fuse(torch.cat([mamba_stripe, osnet_stripe], dim=1))
-            stripe = mamba_stack(stripe)
-            part = self.pool(stripe).flatten(1)
-            part = self.part_reduce(part)
-            parts.append(part)
-        part_tokens = torch.stack(parts, dim=1)
-        part_tokens = self.context_mixer(part_tokens)
-        if self.reliability_gate is not None:
-            part_tokens = self.reliability_gate(part_tokens)
-        local_feat = part_tokens.flatten(1)
-        if return_parts:
-            return local_feat, part_tokens
-        return local_feat
-
-
-class StripeContextMixer(nn.Module):
-    """Lightweight context exchange over pooled horizontal stripe tokens."""
-
-    def __init__(self, dim, num_stripes, mixer_type='none', kernel_size=3, init_scale=1e-3):
-        super().__init__()
-        self.mixer_type = str(mixer_type).lower()
-        if self.mixer_type not in ('none', 'dwconv', 'mlp'):
-            raise ValueError("stripe context mixer type must be one of: none, dwconv, mlp")
-        self.gamma = None
-        if self.mixer_type == 'none':
-            self.norm = None
-            self.mixer = None
-            return
-        self.norm = nn.LayerNorm(dim)
-        self.gamma = nn.Parameter(torch.ones(1) * float(init_scale))
-        self.gamma._no_weight_decay = True
-        if self.mixer_type == 'dwconv':
-            kernel_size = max(int(kernel_size), 1)
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-            self.mixer = nn.Sequential(
-                nn.Conv1d(dim, dim, kernel_size=kernel_size, padding=kernel_size // 2, groups=dim, bias=False),
-                nn.GELU(),
-                nn.Conv1d(dim, dim, kernel_size=1, bias=False),
-            )
+        mass = masks.sum(dim=(-1, -2)).clamp_min(1e-6)
+        if foreground is None:
+            part_confidence = torch.ones_like(mass)
         else:
-            self.mixer = nn.Sequential(
-                nn.Linear(num_stripes, num_stripes),
-                nn.GELU(),
-                nn.Linear(num_stripes, num_stripes),
+            part_confidence = torch.einsum(
+                'bkhw,bchw->bk',
+                masks,
+                foreground,
+            ) / mass
+            part_confidence = part_confidence.clamp(0.0, 1.0)
+        parts = torch.einsum(
+            'bkhw,bchw->bkc',
+            masks,
+            detail_map.float(),
+        ) / mass.unsqueeze(-1)
+        if self.confidence_mode == 'descriptor':
+            confidence_scale = part_confidence / part_confidence.mean(
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-6)
+            parts = parts * confidence_scale.unsqueeze(-1)
+        self.last_parts = parts.to(mask_map.dtype)
+        self.last_confidence = part_confidence
+
+        if self.residual_projector is not None:
+            masked_details = torch.cat(
+                [detail_map * masks[:, idx:idx + 1].to(detail_map.dtype)
+                 for idx in range(self.num_parts)],
+                dim=1,
             )
-        self.mixer.apply(weights_init_kaiming)
-
-    def forward(self, tokens):
-        if self.mixer_type == 'none':
-            return tokens
-        y = self.norm(tokens)
-        if self.mixer_type == 'dwconv':
-            y = self.mixer(y.transpose(1, 2)).transpose(1, 2).contiguous()
+            self.last_residual = self.residual_projector(masked_details)
         else:
-            y = self.mixer(y.transpose(1, 2)).transpose(1, 2).contiguous()
-        return tokens + self.gamma.to(tokens.dtype) * y
+            self.last_residual = None
+
+        part_fraction = masks.mean(dim=(-1, -2))
+        balance_loss = (part_fraction - 1.0 / self.num_parts).square().mean()
+        y = torch.linspace(0.0, 1.0, masks.shape[-2], device=masks.device, dtype=masks.dtype)
+        y = y.view(1, 1, -1, 1)
+        centers = (masks * y).sum(dim=(-1, -2)) / mass
+        if self.num_parts > 1:
+            order_loss = F.relu(
+                self.order_margin - (centers[:, 1:] - centers[:, :-1])
+            ).square().mean()
+        else:
+            order_loss = balance_loss.new_zeros(())
+        self.last_aux = {
+            'balance_loss': balance_loss,
+            'order_loss': order_loss,
+            'part_fraction': part_fraction.detach().mean(dim=0),
+            'part_centers': centers.detach().mean(dim=0),
+            'part_confidence': part_confidence.detach().mean(dim=0),
+        }
+        return self.last_parts.flatten(1)
 
 
-class StripeReliabilityGate(nn.Module):
-    """Predict a soft reliability score for each pooled stripe token."""
-
-    def __init__(self, dim, hidden_ratio=0.25, init_bias=2.0):
-        super().__init__()
-        hidden_dim = max(int(dim * float(hidden_ratio)), 16)
-        self.gate = nn.Sequential(
-            nn.LayerNorm(dim),
-            nn.Linear(dim, hidden_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, 1),
-            nn.Sigmoid(),
-        )
-        nn.init.zeros_(self.gate[3].weight)
-        nn.init.constant_(self.gate[3].bias, float(init_bias))
-
-    def forward(self, tokens):
-        return tokens * self.gate(tokens).to(tokens.dtype)
-
-
-class Stage3StripeLocalGlobalEnhancer(nn.Module):
-    """Low-scale DES-like interaction between FDMF global and stripe-local parts."""
-
-    def __init__(self, global_dim, part_dim, init_scale=0.05, direction='global_to_local'):
-        super().__init__()
-        self.global_dim = int(global_dim)
-        self.part_dim = int(part_dim)
-        self.direction = str(direction).lower()
-        if self.direction not in ('global_to_local', 'local_to_global', 'bidirectional'):
-            raise ValueError("STAGE3_STRIPE_LOCAL_LG_ENHANCE_DIRECTION must be 'global_to_local', 'local_to_global', or 'bidirectional'")
-        self.global_from_local = nn.Sequential(
-            nn.LayerNorm(self.part_dim),
-            nn.Linear(self.part_dim, self.global_dim),
-        )
-        self.local_from_global = nn.Sequential(
-            nn.LayerNorm(self.global_dim),
-            nn.Linear(self.global_dim, self.part_dim),
-        )
-        self.global_scale = nn.Parameter(torch.ones(1) * float(init_scale))
-        self.local_scale = nn.Parameter(torch.ones(1) * float(init_scale))
-        self.global_scale._no_weight_decay = True
-        self.local_scale._no_weight_decay = True
-        self.global_from_local.apply(weights_init_kaiming)
-        self.local_from_global.apply(weights_init_kaiming)
-
-    def forward(self, global_feat, part_feats):
-        local_context = part_feats.mean(dim=1)
-        enhanced_global = global_feat
-        enhanced_parts = part_feats
-        if self.direction in ('local_to_global', 'bidirectional'):
-            global_delta = self.global_from_local(local_context)
-            enhanced_global = global_feat + self.global_scale.to(global_feat.dtype) * global_delta
-        if self.direction in ('global_to_local', 'bidirectional'):
-            local_delta = self.local_from_global(global_feat).unsqueeze(1)
-            enhanced_parts = part_feats + self.local_scale.to(part_feats.dtype) * local_delta
-        enhanced_local = enhanced_parts.flatten(1)
-        return enhanced_global, enhanced_local, enhanced_parts
 
 
 class MambaOSNetFusion(nn.Module):
@@ -1757,6 +2322,9 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_type = str(getattr(fusion_cfg, 'FUSION_TYPE', 'descriptor')).lower()
         self.fusion_norm = str(getattr(fusion_cfg, 'FUSION_NORM', 'none')).lower()
         self.fusion_beta = float(getattr(fusion_cfg, 'FUSION_BETA', 1.0))
+        self.dual_view_enabled = bool(
+            getattr(getattr(cfg.INPUT, 'DUAL_VIEW', None), 'ENABLED', False)
+        )
         if self.fusion_type not in ('descriptor', 'stage_fcu', 'fdmf'):
             raise ValueError("MODEL.OSNET_FUSION.FUSION_TYPE must be 'descriptor', 'stage_fcu', or 'fdmf'")
         if self.fusion_norm not in ('none', 'branch', 'weighted_branch'):
@@ -1766,8 +2334,14 @@ class MambaOSNetFusion(nn.Module):
         if self.fusion_beta < 0:
             raise ValueError('MODEL.OSNET_FUSION.FUSION_BETA must be non-negative')
         self.fdmf_fused_form = str(getattr(fusion_cfg, 'FDMF_FUSED_FORM', 'raw_fdmf')).lower()
+        self.fdmf_bypass = bool(getattr(fusion_cfg, 'FDMF_BYPASS', False))
+        self.fdmf_odsmf_enabled = bool(
+            getattr(fusion_cfg, 'FDMF_ODSMF_ENABLED', False)
+        )
         if self.fdmf_fused_form not in ('mamba_fdmf', 'raw_fdmf', 'fdmf_only'):
             raise ValueError("MODEL.OSNET_FUSION.FDMF_FUSED_FORM must be 'mamba_fdmf', 'raw_fdmf', or 'fdmf_only'")
+        if self.fdmf_bypass and self.fusion_type != 'fdmf':
+            raise ValueError('MODEL.OSNET_FUSION.FDMF_BYPASS requires FUSION_TYPE=fdmf')
 
         self.mamba = build_transformer(num_classes, camera_num, view_num, cfg, factory)
         self.mamba_dim = self.mamba.in_planes
@@ -1782,6 +2356,7 @@ class MambaOSNetFusion(nn.Module):
         )
         self.osnet_dim = self.osnet.feature_dim
         self.osnet_map_dim = self.osnet.conv5.conv.out_channels
+        self.osnet_detail_dim = self.osnet.conv2[0].conv3.conv.out_channels
         self.osnet_stage2_dim = self.osnet.conv3[0].conv3.conv.out_channels
         self.osnet_stage3_dim = self.osnet.conv4[0].conv3.conv.out_channels
 
@@ -1804,35 +2379,66 @@ class MambaOSNetFusion(nn.Module):
         self.osnet_classifier = self._make_classifier(self.osnet_dim)
 
         self.fdmf_refiner = None
+        self.fdmf_diagnostic_pool = None
         if self.fusion_type == 'fdmf':
-            self.fdmf_refiner = SameScaleFrequencyMambaFusion(
+            self.fdmf_refiner = SameScaleMambaFusion(
                 dim=self.mamba_dim,
                 osnet_dim=self.osnet_map_dim,
-                compressed_channels=int(getattr(fusion_cfg, 'FDMF_COMPRESSED_CHANNELS', 64)),
-                lowpass_kernel=int(getattr(fusion_cfg, 'FDMF_LOWPASS_KERNEL', 5)),
-                highpass_kernel=int(getattr(fusion_cfg, 'FDMF_HIGHPASS_KERNEL', 3)),
-                use_hamming=bool(getattr(fusion_cfg, 'FDMF_HAMMING_WINDOW', True)),
-                filter_type=str(getattr(fusion_cfg, 'FDMF_FILTER_TYPE', 'dynamic')),
                 mamba_depth=int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
                 mamba_d_state=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_STATE', 8)),
                 mamba_d_conv=int(getattr(fusion_cfg, 'FDMF_MAMBA_D_CONV', 3)),
                 mamba_init_scale=float(getattr(fusion_cfg, 'FDMF_MAMBA_INIT_SCALE', 0.1)),
                 mamba_bidirectional=bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                mamba_scan_mode=str(getattr(fusion_cfg, 'FDMF_MAMBA_SCAN_MODE', 'raster')),
+                mamba_learnable_direction_weights=bool(
+                    getattr(fusion_cfg, 'FDMF_MAMBA_LEARNABLE_DIRECTION_WEIGHTS', False)
+                ),
                 mlp_ratio=float(getattr(fusion_cfg, 'FDMF_MLP_RATIO', 2.0)),
-                stripe_depth=int(getattr(fusion_cfg, 'FDMF_STRIPE_DEPTH', 0)),
-                stripe_num=int(getattr(fusion_cfg, 'FDMF_STRIPE_NUM', 4)),
-                stripe_share_params=bool(getattr(fusion_cfg, 'FDMF_STRIPE_SHARE_PARAMS', True)),
+                mamba_forward_enabled=bool(
+                    getattr(fusion_cfg, 'FDMF_MAMBA_FORWARD_ENABLED', True)
+                ),
+                mamba_mlp_enabled=bool(
+                    getattr(fusion_cfg, 'FDMF_MAMBA_MLP_ENABLED', True)
+                ),
                 msef_enabled=bool(getattr(fusion_cfg, 'FDMF_MSEF_ENABLED', True)),
+                msef_forward_enabled=bool(
+                    getattr(fusion_cfg, 'FDMF_MSEF_FORWARD_ENABLED', True)
+                ),
                 msef_reduction_ratio=int(getattr(fusion_cfg, 'FDMF_MSEF_REDUCTION_RATIO', 16)),
                 msef_res_scale_enabled=bool(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_ENABLED', False)),
                 msef_res_scale_init=float(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_INIT', 0.1)),
+                odsmf_enabled=self.fdmf_odsmf_enabled,
+                odsmf_state_dim=int(getattr(fusion_cfg, 'FDMF_ODSMF_STATE_DIM', 256)),
+                odsmf_depth=int(getattr(fusion_cfg, 'FDMF_ODSMF_DEPTH', 1)),
+                odsmf_use_consensus=bool(getattr(fusion_cfg, 'FDMF_ODSMF_USE_CONSENSUS', True)),
+                odsmf_use_discrepancy=bool(getattr(fusion_cfg, 'FDMF_ODSMF_USE_DISCREPANCY', True)),
+                odsmf_share_mamba=bool(getattr(fusion_cfg, 'FDMF_ODSMF_SHARE_MAMBA', True)),
+                odsmf_share_norm=bool(getattr(fusion_cfg, 'FDMF_ODSMF_SHARE_NORM', False)),
+                odsmf_packed_scan=bool(getattr(fusion_cfg, 'FDMF_ODSMF_PACKED_SCAN', False)),
+                odsmf_basis=str(getattr(fusion_cfg, 'FDMF_ODSMF_BASIS', 'fixed')),
+                odsmf_gate=str(getattr(fusion_cfg, 'FDMF_ODSMF_GATE', 'separable')),
+                odsmf_shuffle_discrepancy=bool(getattr(fusion_cfg, 'FDMF_ODSMF_SHUFFLE_DISCREPANCY', False)),
+                odsmf_detach_discrepancy=bool(getattr(fusion_cfg, 'FDMF_ODSMF_DETACH_DISCREPANCY', False)),
+                odsmf_carrier_enabled=bool(getattr(fusion_cfg, 'FDMF_ODSMF_CARRIER_ENABLED', True)),
+                odsmf_res_scale_init=float(getattr(fusion_cfg, 'FDMF_ODSMF_RES_SCALE_INIT', 0.1)),
+                odsmf_res_scale_max=float(getattr(fusion_cfg, 'FDMF_ODSMF_RES_SCALE_MAX', 0.5)),
+                odsmf_semantic_perp=bool(getattr(fusion_cfg, 'FDMF_ODSMF_SEMANTIC_PERP', False)),
+                odsmf_modulation=str(getattr(fusion_cfg, 'FDMF_ODSMF_MODULATION', 'none')),
+                odsmf_modulation_scale=float(getattr(fusion_cfg, 'FDMF_ODSMF_MODULATION_SCALE', 0.5)),
             )
+            if self.fdmf_bypass:
+                for param in self.fdmf_refiner.parameters():
+                    param.requires_grad_(False)
+            # Fixed GeM is diagnostic-only: it adds no learned inference head
+            # and makes restored M/O descriptors directly comparable.
+            self.fdmf_diagnostic_pool = GeM(p=3.0, learnable=False)
+            fdmf_dim = self.fdmf_refiner.output_dim
             if self.fdmf_fused_form == 'raw_fdmf':
-                self.fusion_dim = self.mamba_dim + self.osnet_dim + self.mamba_dim
+                self.fusion_dim = self.mamba_dim + self.osnet_dim + fdmf_dim
             elif self.fdmf_fused_form == 'mamba_fdmf':
-                self.fusion_dim = self.mamba_dim * 2
+                self.fusion_dim = self.mamba_dim + fdmf_dim
             else:
-                self.fusion_dim = self.mamba_dim
+                self.fusion_dim = fdmf_dim
         else:
             self.fusion_dim = self.mamba_dim + self.osnet_dim
         self.fusion_bottleneck = nn.BatchNorm1d(self.fusion_dim)
@@ -1840,60 +2446,138 @@ class MambaOSNetFusion(nn.Module):
         self.fusion_bottleneck.apply(weights_init_kaiming)
         self.fusion_classifier = self._make_classifier(self.fusion_dim)
 
+        self.descriptor_mamba_weight = float(
+            getattr(fusion_cfg, 'FDMF_DESCRIPTOR_MAMBA_WEIGHT', 1.0)
+        )
+        self.descriptor_fdmf_weight = float(
+            getattr(fusion_cfg, 'FDMF_DESCRIPTOR_FDMF_WEIGHT', 0.75)
+        )
+        self.descriptor_osnet_weight = float(
+            getattr(fusion_cfg, 'FDMF_DESCRIPTOR_OSNET_WEIGHT', 0.4)
+        )
+        self.fdmf_descriptor_sweep_enabled = bool(
+            getattr(cfg.TEST, 'FDMF_DESCRIPTOR_SWEEP_ENABLED', False)
+        )
+        self.fdmf_descriptor_sweep_fdmf_weights = [
+            float(value)
+            for value in getattr(
+                cfg.TEST,
+                'FDMF_DESCRIPTOR_SWEEP_FDMF_WEIGHTS',
+                [0.5, 0.75, 1.0],
+            )
+        ]
+        self.fdmf_descriptor_sweep_osnet_weights = [
+            float(value)
+            for value in getattr(
+                cfg.TEST,
+                'FDMF_DESCRIPTOR_SWEEP_OSNET_WEIGHTS',
+                [0.2, 0.4],
+            )
+        ]
+        if min(
+            self.descriptor_mamba_weight,
+            self.descriptor_fdmf_weight,
+            self.descriptor_osnet_weight,
+        ) < 0.0:
+            raise ValueError('FDMF descriptor weights must be non-negative')
+        if any(
+            value < 0.0
+            for value in (
+                self.fdmf_descriptor_sweep_fdmf_weights
+                + self.fdmf_descriptor_sweep_osnet_weights
+            )
+        ):
+            raise ValueError('FDMF descriptor sweep weights must be non-negative')
+
         self.use_stage_fcu_exchange = self.fusion_type == 'stage_fcu' or bool(getattr(fusion_cfg, 'FCU_ENABLED', False))
+        self.fcu_exchange_enabled = bool(
+            getattr(fusion_cfg, 'FCU_EXCHANGE_ENABLED', True)
+        )
         self.stage3_stripe_local_enabled = bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_ENABLED', False))
+        self.stage3_local_type = str(
+            getattr(fusion_cfg, 'STAGE3_LOCAL_TYPE', 'semantic_detail')
+        ).lower()
+        if self.stage3_local_type != 'semantic_detail':
+            raise ValueError('Only STAGE3_LOCAL_TYPE=semantic_detail is supported')
         self.stage3_stripe_local = None
         self.stage3_stripe_local_bottleneck = None
         self.stage3_stripe_local_classifier = None
-        self.stage3_stripe_part_bottlenecks = None
-        self.stage3_stripe_part_classifiers = None
-        self.stage3_stripe_lg_enhancer = None
+        self.stage3_stripe_local_part_bottlenecks = None
+        self.stage3_stripe_local_part_classifiers = None
+        self.stage3_local_part_id_mode = str(
+            getattr(fusion_cfg, 'STAGE3_LOCAL_PART_ID_MODE', 'none')
+        ).lower()
+        if self.stage3_local_part_id_mode not in ('none', 'replace', 'joint'):
+            raise ValueError('STAGE3_LOCAL_PART_ID_MODE must be none, replace, or joint')
+        self.stage3_local_triplet_mode = str(
+            getattr(fusion_cfg, 'STAGE3_LOCAL_TRIPLET_MODE', 'flat')
+        ).lower()
+        if self.stage3_local_triplet_mode not in ('flat', 'part_avg'):
+            raise ValueError('STAGE3_LOCAL_TRIPLET_MODE must be flat or part_avg')
+        self.stage3_local_confidence_mode = str(
+            getattr(fusion_cfg, 'STAGE3_LOCAL_CONFIDENCE_MODE', 'none')
+        ).lower()
+        if self.stage3_local_confidence_mode not in ('none', 'triplet', 'descriptor'):
+            raise ValueError(
+                'STAGE3_LOCAL_CONFIDENCE_MODE must be none, triplet, or descriptor'
+            )
         self.stage3_stripe_local_infer_weight = float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_INFER_WEIGHT', 0.3))
-        self.stage4_stripe_local_enabled = bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_ENABLED', False))
-        self.stage4_stripe_local = None
-        self.stage4_stripe_local_bottleneck = None
-        self.stage4_stripe_local_classifier = None
-        self.stage4_stripe_local_infer_weight = float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_INFER_WEIGHT', 0.3))
-        self.stage3_stripe_part_supervision_enabled = bool(
-            getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_SUPERVISION_ENABLED', False)
+        self.stage3_detail_mask_stage = str(getattr(fusion_cfg, 'STAGE3_DETAIL_MASK_STAGE', 'stage3')).lower()
+        self.stage3_detail_foreground_stage = str(
+            getattr(fusion_cfg, 'STAGE3_DETAIL_FOREGROUND_STAGE', 'stage3')
+        ).lower()
+        self.stage3_detail_source = str(getattr(fusion_cfg, 'STAGE3_DETAIL_SOURCE', 'conv2')).lower()
+        self.stage3_local_detach_prompt = bool(
+            getattr(fusion_cfg, 'STAGE3_LOCAL_DETACH_PROMPT', False)
         )
-        self.stage3_stripe_lg_enhance_enabled = bool(
-            getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_ENABLED', False)
+        self.stage3_local_detach_detail = bool(
+            getattr(fusion_cfg, 'STAGE3_LOCAL_DETACH_DETAIL', False)
         )
-        if self.stage3_stripe_part_supervision_enabled and not self.stage3_stripe_local_enabled:
-            raise ValueError('STAGE3_STRIPE_LOCAL_PART_SUPERVISION_ENABLED requires STAGE3_STRIPE_LOCAL_ENABLED=True')
-        if self.stage3_stripe_lg_enhance_enabled and not self.stage3_stripe_local_enabled:
-            raise ValueError('STAGE3_STRIPE_LOCAL_LG_ENHANCE_ENABLED requires STAGE3_STRIPE_LOCAL_ENABLED=True')
-        if self.stage3_stripe_lg_enhance_enabled and self.fusion_type != 'fdmf':
-            raise ValueError('STAGE3_STRIPE_LOCAL_LG_ENHANCE_ENABLED requires FUSION_TYPE=fdmf')
-        if self.stage4_stripe_local_enabled and self.fusion_type != 'fdmf':
-            raise ValueError('STAGE4_STRIPE_LOCAL_ENABLED requires FUSION_TYPE=fdmf')
+        if self.stage3_detail_mask_stage not in ('stage3', 'stage4'):
+            raise ValueError('STAGE3_DETAIL_MASK_STAGE must be stage3 or stage4')
+        if self.stage3_detail_foreground_stage not in ('stage3', 'stage4'):
+            raise ValueError('STAGE3_DETAIL_FOREGROUND_STAGE must be stage3 or stage4')
+        if self.stage3_detail_source not in ('conv2', 'conv4'):
+            raise ValueError('STAGE3_DETAIL_SOURCE must be conv2 or conv4')
         if self.stage3_stripe_local_enabled and not self.use_stage_fcu_exchange:
             raise ValueError('STAGE3_STRIPE_LOCAL_ENABLED requires Stage-FCU/manual branch forwarding (set FCU_ENABLED=True)')
-        if self.stage4_stripe_local_enabled and not self.use_stage_fcu_exchange:
-            raise ValueError('STAGE4_STRIPE_LOCAL_ENABLED requires Stage-FCU/manual branch forwarding (set FCU_ENABLED=True)')
         if self.use_stage_fcu_exchange:
             if not hasattr(self.mamba.base, 'levels') or len(self.mamba.base.levels) < 4:
                 raise ValueError('stage_fcu requires a MambaVision backbone with four stages')
             self.fcu_stages = [int(stage) for stage in getattr(fusion_cfg, 'FCU_STAGES', [2, 3])]
-            invalid_fcu_stages = sorted(set(self.fcu_stages) - {2, 3})
+            invalid_fcu_stages = sorted(set(self.fcu_stages) - {1, 2, 3})
             if invalid_fcu_stages:
-                raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES only supports stages 2 and 3')
+                raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES only supports stages 1, 2, and 3')
             if not self.fcu_stages:
                 raise ValueError('MODEL.OSNET_FUSION.FCU_STAGES must contain at least one stage for stage_fcu')
+            mamba_stage1_dim = self._mamba_stage_out_dim(self.mamba.base.levels[0])
             mamba_stage2_dim = self._mamba_stage_out_dim(self.mamba.base.levels[1])
             mamba_stage3_dim = self._mamba_stage_out_dim(self.mamba.base.levels[2])
+            mamba_stage3_semantic_dim = self._mamba_level_block_dim(self.mamba.base.levels[2])
             fcu_init_scale = float(getattr(fusion_cfg, 'FCU_INIT_SCALE', 0.1))
             fcu_gate_type = str(getattr(fusion_cfg, 'FCU_GATE_TYPE', 'none')).lower()
             fcu_gate_reduction = int(getattr(fusion_cfg, 'FCU_GATE_REDUCTION', 16))
             fcu_gate_init_bias = float(getattr(fusion_cfg, 'FCU_GATE_INIT_BIAS', 0.0))
             self.fcu_direction = str(getattr(fusion_cfg, 'FCU_DIRECTION', 'bidirectional')).lower()
+            self.fcu_stage1_direction = str(getattr(fusion_cfg, 'FCU_STAGE1_DIRECTION', '')).lower()
             self.fcu_stage2_direction = str(getattr(fusion_cfg, 'FCU_STAGE2_DIRECTION', '')).lower()
             self.fcu_stage3_direction = str(getattr(fusion_cfg, 'FCU_STAGE3_DIRECTION', '')).lower()
+            if not self.fcu_stage1_direction:
+                self.fcu_stage1_direction = self.fcu_direction
             if not self.fcu_stage2_direction:
                 self.fcu_stage2_direction = self.fcu_direction
             if not self.fcu_stage3_direction:
                 self.fcu_stage3_direction = self.fcu_direction
+            if 1 in self.fcu_stages:
+                self.stage1_fcu = StageFCU(
+                    mamba_stage1_dim,
+                    self.osnet_detail_dim,
+                    init_scale=fcu_init_scale,
+                    direction=self.fcu_stage1_direction,
+                    gate_type=fcu_gate_type,
+                    gate_reduction=fcu_gate_reduction,
+                    gate_init_bias=fcu_gate_init_bias,
+                )
             if 2 in self.fcu_stages:
                 self.stage2_fcu = StageFCU(
                     mamba_stage2_dim,
@@ -1914,79 +2598,61 @@ class MambaOSNetFusion(nn.Module):
                     gate_reduction=fcu_gate_reduction,
                     gate_init_bias=fcu_gate_init_bias,
                 )
+            if not self.fcu_exchange_enabled:
+                for stage_name in ('stage1_fcu', 'stage2_fcu', 'stage3_fcu'):
+                    stage_module = getattr(self, stage_name, None)
+                    if stage_module is not None:
+                        for param in stage_module.parameters():
+                            param.requires_grad_(False)
             if self.stage3_stripe_local_enabled:
-                if 2 not in self.fcu_stages:
-                    raise ValueError('STAGE3_STRIPE_LOCAL_ENABLED requires stage 2 FCU before OSNet conv3/Mamba level2 local fusion')
-                self.stage3_stripe_local = Stage3PartStripeFusion(
-                    mamba_stage3_dim,
-                    self.osnet_stage2_dim,
-                    num_stripes=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 4)),
-                    share_params=bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_SHARE_PARAMS', True)),
-                    mamba_depth=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
-                    mamba_d_state=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_D_STATE', 8)),
-                    mamba_d_conv=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_D_CONV', 3)),
-                    mamba_init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_INIT_SCALE', 0.1)),
-                    mamba_bidirectional=bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_BIDIRECTIONAL', True)),
-                    mlp_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MLP_RATIO', 2.0)),
+                mask_dim = (
+                    mamba_stage3_semantic_dim
+                    if self.stage3_detail_mask_stage == 'stage3'
+                    else self.mamba_dim
+                )
+                foreground_dim = (
+                    mamba_stage3_semantic_dim
+                    if self.stage3_detail_foreground_stage == 'stage3'
+                    else self.mamba_dim
+                )
+                detail_dim = (
+                    self.osnet_detail_dim
+                    if self.stage3_detail_source == 'conv2'
+                    else self.osnet_stage3_dim
+                )
+                self.stage3_stripe_local = Stage3SemanticDetailFusion(
+                    mask_dim,
+                    detail_dim,
+                    self.mamba_dim,
+                    foreground_dim=foreground_dim,
+                    num_parts=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 2)),
                     part_dim=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_PART_DIM', 0)),
-                    pooling_type=getattr(cfg.MODEL, 'POOLING_TYPE', 'gem'),
-                    overlap_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
-                    context_mixer_type=str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
-                    context_mixer_kernel=int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_KERNEL', 3)),
-                    context_mixer_init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_INIT_SCALE', 1e-3)),
-                    reliability_gate=bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
-                    reliability_hidden_ratio=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_HIDDEN_RATIO', 0.25)),
-                    reliability_init_bias=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_INIT_BIAS', 2.0)),
+                    temperature=float(getattr(fusion_cfg, 'STAGE3_SOFT_TEMPERATURE', 1.5)),
+                    prior_scale=float(getattr(fusion_cfg, 'STAGE3_SOFT_PRIOR_SCALE', 1.0)),
+                    order_margin=float(getattr(fusion_cfg, 'STAGE3_SOFT_ORDER_MARGIN', 0.15)),
+                    foreground_gate=bool(getattr(fusion_cfg, 'STAGE3_DETAIL_FOREGROUND_GATE', False)),
+                    foreground_gate_mode=str(
+                        getattr(fusion_cfg, 'STAGE3_DETAIL_FOREGROUND_GATE_MODE', 'emphasis')
+                    ),
+                    confidence_mode=self.stage3_local_confidence_mode,
+                    residual_injection=bool(getattr(fusion_cfg, 'STAGE3_DETAIL_RESIDUAL_INJECTION', False)),
+                    residual_init_scale=float(getattr(fusion_cfg, 'STAGE3_DETAIL_RESIDUAL_INIT_SCALE', 0.1)),
                 )
                 self.stage3_stripe_local_bottleneck = nn.BatchNorm1d(self.stage3_stripe_local.out_dim)
                 self.stage3_stripe_local_bottleneck.bias.requires_grad_(False)
                 self.stage3_stripe_local_bottleneck.apply(weights_init_kaiming)
                 self.stage3_stripe_local_classifier = self._make_classifier(self.stage3_stripe_local.out_dim)
-                if self.stage3_stripe_part_supervision_enabled:
-                    self.stage3_stripe_part_bottlenecks = nn.ModuleList([
-                        nn.BatchNorm1d(self.stage3_stripe_local.part_dim)
-                        for _ in range(self.stage3_stripe_local.num_stripes)
-                    ])
-                    for bottleneck in self.stage3_stripe_part_bottlenecks:
-                        bottleneck.bias.requires_grad_(False)
-                        bottleneck.apply(weights_init_kaiming)
-                    self.stage3_stripe_part_classifiers = nn.ModuleList([
-                        self._make_classifier(self.stage3_stripe_local.part_dim)
-                        for _ in range(self.stage3_stripe_local.num_stripes)
-                    ])
-                if self.stage3_stripe_lg_enhance_enabled:
-                    self.stage3_stripe_lg_enhancer = Stage3StripeLocalGlobalEnhancer(
-                        self.mamba_dim,
-                        self.stage3_stripe_local.part_dim,
-                        init_scale=float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_INIT_SCALE', 0.05)),
-                        direction=str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_DIRECTION', 'global_to_local')),
-                    )
-            if self.stage4_stripe_local_enabled:
-                self.stage4_stripe_local = Stage3PartStripeFusion(
-                    self.mamba_dim,
-                    self.osnet_map_dim,
-                    num_stripes=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_NUM_STRIPES', 4)),
-                    share_params=bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_SHARE_PARAMS', True)),
-                    mamba_depth=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
-                    mamba_d_state=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_D_STATE', 8)),
-                    mamba_d_conv=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_D_CONV', 3)),
-                    mamba_init_scale=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_INIT_SCALE', 0.1)),
-                    mamba_bidirectional=bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_BIDIRECTIONAL', True)),
-                    mlp_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MLP_RATIO', 2.0)),
-                    part_dim=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_PART_DIM', 0)),
-                    pooling_type=getattr(cfg.MODEL, 'POOLING_TYPE', 'gem'),
-                    overlap_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
-                    context_mixer_type=str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
-                    context_mixer_kernel=int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_KERNEL', 3)),
-                    context_mixer_init_scale=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_INIT_SCALE', 1e-3)),
-                    reliability_gate=bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
-                    reliability_hidden_ratio=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_HIDDEN_RATIO', 0.25)),
-                    reliability_init_bias=float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_INIT_BIAS', 2.0)),
-                )
-                self.stage4_stripe_local_bottleneck = nn.BatchNorm1d(self.stage4_stripe_local.out_dim)
-                self.stage4_stripe_local_bottleneck.bias.requires_grad_(False)
-                self.stage4_stripe_local_bottleneck.apply(weights_init_kaiming)
-                self.stage4_stripe_local_classifier = self._make_classifier(self.stage4_stripe_local.out_dim)
+                if self.stage3_local_part_id_mode != 'none':
+                    self.stage3_stripe_local_part_bottlenecks = nn.ModuleList()
+                    self.stage3_stripe_local_part_classifiers = nn.ModuleList()
+                    for _ in range(self.stage3_stripe_local.num_parts):
+                        part_bn = nn.BatchNorm1d(self.stage3_stripe_local.part_dim)
+                        part_bn.bias.requires_grad_(False)
+                        part_bn.apply(weights_init_kaiming)
+                        self.stage3_stripe_local_part_bottlenecks.append(part_bn)
+                        self.stage3_stripe_local_part_classifiers.append(
+                            self._make_classifier(self.stage3_stripe_local.part_dim)
+                        )
 
         print(
             '[Model] Mamba-OSNet fusion enabled: type={}, mamba_dim={}, osnet_type={}, osnet_dim={}, fusion_dim={}, fusion_norm={}, beta={:.2f}'.format(
@@ -2001,67 +2667,102 @@ class MambaOSNetFusion(nn.Module):
         )
         if self.fusion_type == 'fdmf':
             print(
-                '[Model] FDMF enabled: osnet_map_dim={}, form={}, filter={}, global_depth={}, stripe_depth={}, stripe_num={}, stripe_share={}, bidirectional={}, msef={}, msef_res_scale={}'.format(
+                '[Model] FDMF enabled: osnet_map_dim={}, form={}, bypass={}, depth={}, mamba_forward={}, mamba_mlp={}, bidirectional={}, scan={}, learnable_scan_weights={}, msef={}/forward={}, msef_res_scale={}'.format(
                     self.osnet_map_dim,
                     self.fdmf_fused_form,
-                    self.fdmf_refiner.filter_type,
+                    self.fdmf_bypass,
                     int(getattr(fusion_cfg, 'FDMF_MAMBA_DEPTH', 1)),
-                    int(getattr(fusion_cfg, 'FDMF_STRIPE_DEPTH', 0)),
-                    int(getattr(fusion_cfg, 'FDMF_STRIPE_NUM', 4)),
-                    bool(getattr(fusion_cfg, 'FDMF_STRIPE_SHARE_PARAMS', True)),
+                    bool(getattr(fusion_cfg, 'FDMF_MAMBA_FORWARD_ENABLED', True)),
+                    bool(getattr(fusion_cfg, 'FDMF_MAMBA_MLP_ENABLED', True)),
                     bool(getattr(fusion_cfg, 'FDMF_MAMBA_BIDIRECTIONAL', True)),
+                    str(getattr(fusion_cfg, 'FDMF_MAMBA_SCAN_MODE', 'raster')),
+                    bool(getattr(fusion_cfg, 'FDMF_MAMBA_LEARNABLE_DIRECTION_WEIGHTS', False)),
                     bool(getattr(fusion_cfg, 'FDMF_MSEF_ENABLED', True)),
+                    bool(getattr(fusion_cfg, 'FDMF_MSEF_FORWARD_ENABLED', True)),
                     bool(getattr(fusion_cfg, 'FDMF_MSEF_RES_SCALE_ENABLED', False)),
                 )
             )
+            if self.fdmf_odsmf_enabled:
+                print(
+                    '[Model] ODSMF: dim={}, depth={}, states={}/{}, share_mamba={}, '
+                    'share_norm={}, packed={}, basis={}, gate={}, carrier={}, '
+                    'shuffle_D={}, detach_D={}, semantic_perp={}, modulation={}@{:.2f}, '
+                    'alpha={:.3f}, max={:.3f}'.format(
+                        int(getattr(fusion_cfg, 'FDMF_ODSMF_STATE_DIM', 256)),
+                        int(getattr(fusion_cfg, 'FDMF_ODSMF_DEPTH', 1)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_USE_CONSENSUS', True)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_USE_DISCREPANCY', True)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_SHARE_MAMBA', True)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_SHARE_NORM', False)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_PACKED_SCAN', False)),
+                        str(getattr(fusion_cfg, 'FDMF_ODSMF_BASIS', 'fixed')),
+                        str(getattr(fusion_cfg, 'FDMF_ODSMF_GATE', 'separable')),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_CARRIER_ENABLED', True)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_SHUFFLE_DISCREPANCY', False)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_DETACH_DISCREPANCY', False)),
+                        bool(getattr(fusion_cfg, 'FDMF_ODSMF_SEMANTIC_PERP', False)),
+                        str(getattr(fusion_cfg, 'FDMF_ODSMF_MODULATION', 'none')),
+                        float(getattr(fusion_cfg, 'FDMF_ODSMF_MODULATION_SCALE', 0.5)),
+                        float(getattr(fusion_cfg, 'FDMF_ODSMF_RES_SCALE_INIT', 0.1)),
+                        float(getattr(fusion_cfg, 'FDMF_ODSMF_RES_SCALE_MAX', 0.5)),
+                    )
+                )
         if self.stage3_stripe_local_enabled:
+            local_source = '{}_mask_{}_foreground_to_osnet_{}'.format(
+                self.stage3_detail_mask_stage,
+                self.stage3_detail_foreground_stage,
+                self.stage3_detail_source,
+            )
+            local_mamba_dim = self.stage3_stripe_local.mask_dim
+            local_osnet_dim = self.stage3_stripe_local.detail_dim
+            legacy_local_weight = float(
+                getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)
+            )
+            local_id_weight = float(
+                getattr(fusion_cfg, 'STAGE3_LOCAL_ID_LOSS_WEIGHT', -1.0)
+            )
+            local_tri_weight = float(
+                getattr(fusion_cfg, 'STAGE3_LOCAL_TRIPLET_LOSS_WEIGHT', -1.0)
+            )
+            if local_id_weight < 0:
+                local_id_weight = legacy_local_weight
+            if local_tri_weight < 0:
+                local_tri_weight = legacy_local_weight
             print(
-                '[Model] Stage3 stripe-local head enabled at conv3 point: stripes={}, share={}, depth={}, overlap={:.2f}, mixer={}, gate={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, part_sup={}, lg_enhance={}, lg_direction={}, dims={}/{}'.format(
+                '[Model] Stage3 semantic-detail local head: parts={}, source={}, part_dim={}, out_dim={}, id/tri_weight={:.2f}/{:.2f}, denominator={:.2f}, part_id={}, triplet_mode={}, confidence={}, gate={}, detach_prompt/detail={}/{}, infer_weight={:.2f}, dims={}/{}'.format(
                     int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_NUM_STRIPES', 4)),
-                    bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_SHARE_PARAMS', True)),
-                    int(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
-                    float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
-                    str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
-                    bool(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
+                    local_source,
                     self.stage3_stripe_local.part_dim,
                     self.stage3_stripe_local.out_dim,
-                    float(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)),
+                    local_id_weight,
+                    local_tri_weight,
+                    float(getattr(fusion_cfg, 'STAGE3_LOCAL_LOSS_DENOMINATOR', 0.0)),
+                    self.stage3_local_part_id_mode,
+                    self.stage3_local_triplet_mode,
+                    self.stage3_local_confidence_mode,
+                    str(getattr(fusion_cfg, 'STAGE3_DETAIL_FOREGROUND_GATE_MODE', 'emphasis')),
+                    self.stage3_local_detach_prompt,
+                    self.stage3_local_detach_detail,
                     self.stage3_stripe_local_infer_weight,
-                    self.stage3_stripe_part_supervision_enabled,
-                    self.stage3_stripe_lg_enhance_enabled,
-                    str(getattr(fusion_cfg, 'STAGE3_STRIPE_LOCAL_LG_ENHANCE_DIRECTION', 'global_to_local')),
-                    mamba_stage3_dim,
-                    self.osnet_stage2_dim,
-                )
-            )
-        if self.stage4_stripe_local_enabled:
-            print(
-                '[Model] Stage4 stripe-local head enabled before FDMF: stripes={}, share={}, depth={}, overlap={:.2f}, mixer={}, gate={}, part_dim={}, out_dim={}, loss_weight={:.2f}, infer_weight={:.2f}, dims={}/{}'.format(
-                    int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_NUM_STRIPES', 4)),
-                    bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_SHARE_PARAMS', True)),
-                    int(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_MAMBA_DEPTH', 1)),
-                    float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_OVERLAP_RATIO', 0.0)),
-                    str(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_CONTEXT_MIXER_TYPE', 'none')),
-                    bool(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_RELIABILITY_GATE_ENABLED', False)),
-                    self.stage4_stripe_local.part_dim,
-                    self.stage4_stripe_local.out_dim,
-                    float(getattr(fusion_cfg, 'STAGE4_STRIPE_LOCAL_LOSS_WEIGHT', 0.2)),
-                    self.stage4_stripe_local_infer_weight,
-                    self.mamba_dim,
-                    self.osnet_map_dim,
+                    local_mamba_dim,
+                    local_osnet_dim,
                 )
             )
         if self.use_stage_fcu_exchange:
             print(
-                '[Model] Stage-FCU exchange enabled at stages={}, direction={}, stage2_direction={}, stage3_direction={}, init_scale={:.3f}, gate_type={}, gate_reduction={}, gate_init_bias={:.2f}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
+                '[Model] Stage-FCU manual forwarding: exchange_enabled={}, stages={}, direction={}, stage1_direction={}, stage2_direction={}, stage3_direction={}, init_scale={:.3f}, gate_type={}, gate_reduction={}, gate_init_bias={:.2f}, stage1_dim={}/{}, stage2_dim={}/{}, stage3_dim={}/{}'.format(
+                    self.fcu_exchange_enabled,
                     self.fcu_stages,
                     self.fcu_direction,
+                    self.fcu_stage1_direction,
                     self.fcu_stage2_direction,
                     self.fcu_stage3_direction,
                     fcu_init_scale,
                     fcu_gate_type,
                     fcu_gate_reduction,
                     fcu_gate_init_bias,
+                    mamba_stage1_dim,
+                    self.osnet_detail_dim,
                     mamba_stage2_dim,
                     self.osnet_stage2_dim,
                     mamba_stage3_dim,
@@ -2092,6 +2793,12 @@ class MambaOSNetFusion(nn.Module):
             return block.conv1.out_channels
         raise ValueError('Unable to infer MambaVision stage output channels')
 
+    @staticmethod
+    def _mamba_level_block_dim(level):
+        if getattr(level, 'downsample', None) is not None:
+            return level.downsample.reduction[0].in_channels
+        return MambaOSNetFusion._mamba_stage_out_dim(level)
+
     def _classify(self, classifier, feat, label):
         if self.ID_LOSS_TYPE in ('arcface', 'cosface', 'amsoftmax', 'circle'):
             return classifier(feat, label)
@@ -2099,6 +2806,9 @@ class MambaOSNetFusion(nn.Module):
 
     def _normalize_feature(self, x):
         return F.normalize(x.float(), p=2, dim=1).to(x.dtype)
+
+    def _concat_normalized_features(self, *features):
+        return torch.cat([self._normalize_feature(x) for x in features], dim=1)
 
     def _make_descriptor_fused_feat(self, mamba_feat, osnet_feat):
         if self.fusion_norm == 'none':
@@ -2119,23 +2829,78 @@ class MambaOSNetFusion(nn.Module):
             fused_feat = fdmf_feat
         return fused_feat
 
-    def _make_fdmf_fused_feat(self, mamba_feat, osnet_feat, mamba_map, osnet_map, return_fdmf_feat=False):
-        fdmf_map = self.fdmf_refiner(mamba_map, osnet_map)
-        fdmf_feat = self.mamba._pool_feature_map(fdmf_map)
+    def _make_fdmf_fused_feat(
+        self,
+        mamba_feat,
+        osnet_feat,
+        mamba_map,
+        osnet_map,
+        return_fdmf_feat=False,
+        return_diagnostics=False,
+    ):
+        if self.fdmf_bypass:
+            fused_feat = self._concat_normalized_features(mamba_feat, osnet_feat)
+            if return_fdmf_feat and return_diagnostics:
+                return fused_feat, fused_feat, {}
+            if return_fdmf_feat:
+                return fused_feat, fused_feat
+            return fused_feat
+        region_masks = None
+        foreground_map = None
+        if self.stage3_stripe_local is not None:
+            region_masks = self.stage3_stripe_local.last_masks
+            foreground_map = self.stage3_stripe_local.last_foreground
+        fdmf_output = self.fdmf_refiner(
+            mamba_map,
+            osnet_map,
+            region_masks=region_masks,
+            foreground_map=foreground_map,
+            return_diagnostics=return_diagnostics,
+        )
+        diagnostics = {}
+        if isinstance(fdmf_output, dict):
+            fdmf_map = fdmf_output['fused_map']
+            diagnostics = {
+                key: value
+                for key, value in fdmf_output.items()
+                if key != 'fused_map' and key.endswith('_map')
+            }
+        else:
+            fdmf_map = fdmf_output
+        if (
+            self.stage3_stripe_local is not None
+            and self.stage3_stripe_local.last_residual is not None
+            and not isinstance(fdmf_map, tuple)
+        ):
+            residual = self.stage3_stripe_local.last_residual
+            if residual.shape[-2:] != fdmf_map.shape[-2:]:
+                residual = F.interpolate(
+                    residual,
+                    size=fdmf_map.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False,
+                )
+            scale = self.stage3_stripe_local.fdmf_residual_scale.to(fdmf_map.dtype)
+            fdmf_map = fdmf_map + scale * residual.to(fdmf_map.dtype)
+        if isinstance(fdmf_map, tuple):
+            fdmf_feat = torch.cat(
+                [self.mamba._pool_feature_map(part) for part in fdmf_map],
+                dim=1,
+            )
+        else:
+            fdmf_feat = self.mamba._pool_feature_map(fdmf_map)
         fused_feat = self._compose_fdmf_fused_feat(mamba_feat, osnet_feat, fdmf_feat)
+        if return_diagnostics and diagnostics:
+            pooled_diagnostics = {}
+            for key, value in diagnostics.items():
+                pooled = self.fdmf_diagnostic_pool(value).flatten(1)
+                pooled_diagnostics[key.replace('_map', '_feat')] = pooled
+            diagnostics = pooled_diagnostics
+        if return_fdmf_feat and return_diagnostics:
+            return fused_feat, fdmf_feat, diagnostics
         if return_fdmf_feat:
             return fused_feat, fdmf_feat
         return fused_feat
-
-    def _enhance_stage3_local_with_fdmf(self, fdmf_feat, stage3_part_feats):
-        if not self.stage3_stripe_lg_enhance_enabled:
-            return fdmf_feat, stage3_part_feats.flatten(1), stage3_part_feats
-        return self.stage3_stripe_lg_enhancer(fdmf_feat, stage3_part_feats)
-
-    def _make_stage4_stripe_local_feat(self, mamba_map, osnet_map):
-        if not self.stage4_stripe_local_enabled:
-            return None
-        return self.stage4_stripe_local(mamba_map, osnet_map, return_parts=False)
 
     def _forward_mamba_branch(self, x, label=None, cam_label=None, view_label=None, return_map=False):
         output = self.mamba.base(x, cam_label=cam_label, view_label=view_label)
@@ -2190,52 +2955,106 @@ class MambaOSNetFusion(nn.Module):
             sie = 0
         return x + sie
 
-    def _forward_stage_fcu_maps(self, x, cam_label=None, view_label=None):
+
+    def _forward_stage_fcu_maps(
+        self,
+        x_mamba,
+        x_osnet=None,
+        cam_label=None,
+        view_label=None,
+    ):
         base = self.mamba.base
         stage3_local_feat = None
-        stage3_part_feats = None
+        if x_osnet is None:
+            x_osnet = x_mamba
 
-        mamba_map = self._mamba_patch_embed_with_sie(x, cam_label=cam_label, view_label=view_label)
-        osnet_map = self.osnet.conv1(x)
+        mamba_map = self._mamba_patch_embed_with_sie(
+            x_mamba,
+            cam_label=cam_label,
+            view_label=view_label,
+        )
+        osnet_map = self.osnet.conv1(x_osnet)
         osnet_map = self.osnet.maxpool(osnet_map)
         osnet_map = self.osnet.conv2(osnet_map)
 
         mamba_map = base.levels[0](mamba_map)
+        if 1 in self.fcu_stages and self.fcu_exchange_enabled:
+            mamba_map, osnet_map = self.stage1_fcu(mamba_map, osnet_map)
+        osnet_detail_map = osnet_map
+
         mamba_map = base.levels[1](mamba_map)
         osnet_map = self.osnet.conv3(osnet_map)
-        if 2 in self.fcu_stages:
+        if 2 in self.fcu_stages and self.fcu_exchange_enabled:
             mamba_map, osnet_map = self.stage2_fcu(mamba_map, osnet_map)
 
-        mamba_map = base.levels[2](mamba_map)
         if self.stage3_stripe_local_enabled:
-            stage3_local_feat, stage3_part_feats = self.stage3_stripe_local(
+            mamba_map, mamba_stage3_map = base.levels[2](
                 mamba_map,
-                osnet_map,
-                return_parts=True,
+                return_pre_downsample=True,
             )
+        else:
+            mamba_map = base.levels[2](mamba_map)
+            mamba_stage3_map = None
+
         osnet_map = self.osnet.conv4(osnet_map)
-        if 3 in self.fcu_stages:
+        osnet_conv4_map = osnet_map
+        if 3 in self.fcu_stages and self.fcu_exchange_enabled:
             mamba_map, osnet_map = self.stage3_fcu(mamba_map, osnet_map)
 
         mamba_map = base.main_proj(mamba_map)
         mamba_map = base.levels[3](mamba_map)
+        if self.stage3_stripe_local_enabled:
+            mask_map = (
+                mamba_stage3_map
+                if self.stage3_detail_mask_stage == 'stage3'
+                else mamba_map
+            )
+            foreground_map = (
+                mamba_stage3_map
+                if self.stage3_detail_foreground_stage == 'stage3'
+                else mamba_map
+            )
+            detail_map = (
+                osnet_detail_map
+                if self.stage3_detail_source == 'conv2'
+                else osnet_conv4_map
+            )
+            if self.stage3_local_detach_prompt:
+                mask_map = mask_map.detach()
+                foreground_map = foreground_map.detach()
+            if self.stage3_local_detach_detail:
+                detail_map = detail_map.detach()
+            stage3_local_feat = self.stage3_stripe_local(
+                mask_map,
+                detail_map,
+                foreground_map=foreground_map,
+            )
+
         osnet_map = self.osnet.conv5(osnet_map)
         if self.stage3_stripe_local_enabled:
-            return mamba_map, osnet_map, stage3_local_feat, stage3_part_feats
+            return mamba_map, osnet_map, stage3_local_feat
         return mamba_map, osnet_map
 
-    def _forward_stage_fcu_branches(self, x, label=None, cam_label=None, view_label=None, return_map=False):
+    def _forward_stage_fcu_branches(
+        self,
+        x_mamba,
+        x_osnet=None,
+        label=None,
+        cam_label=None,
+        view_label=None,
+        return_map=False,
+    ):
         stage_maps = self._forward_stage_fcu_maps(
-            x,
+            x_mamba,
+            x_osnet=x_osnet,
             cam_label=cam_label,
             view_label=view_label,
         )
         if self.stage3_stripe_local_enabled:
-            mamba_map, osnet_map, stage3_local_feat, stage3_part_feats = stage_maps
+            mamba_map, osnet_map, stage3_local_feat = stage_maps
         else:
             mamba_map, osnet_map = stage_maps
             stage3_local_feat = None
-            stage3_part_feats = None
 
         mamba_feat = self.mamba._pool_feature_map(mamba_map)
         mamba_bn = self.mamba.bottleneck(mamba_feat)
@@ -2254,34 +3073,42 @@ class MambaOSNetFusion(nn.Module):
                     return (
                         mamba_score, mamba_feat, mamba_bn,
                         osnet_score, osnet_feat, osnet_bn,
-                        stage3_local_feat, stage3_part_feats,
-                        mamba_map, osnet_map,
+                        stage3_local_feat, mamba_map, osnet_map,
                     )
                 return (
                     mamba_score, mamba_feat, mamba_bn,
                     osnet_score, osnet_feat, osnet_bn,
-                    stage3_local_feat, stage3_part_feats,
+                    stage3_local_feat,
                 )
             if return_map:
                 return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn, mamba_map, osnet_map
             return mamba_score, mamba_feat, mamba_bn, osnet_score, osnet_feat, osnet_bn
         if return_map:
             if self.stage3_stripe_local_enabled:
-                return mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats, mamba_map, osnet_map
+                return mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, mamba_map, osnet_map
             return mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map
         if self.stage3_stripe_local_enabled:
-            return mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats
+            return mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat
         return mamba_feat, mamba_bn, osnet_feat, osnet_bn
 
     def forward(self, x, label=None, cam_label=None, view_label=None):
+        if isinstance(x, (tuple, list)):
+            if len(x) != 2:
+                raise ValueError(
+                    'DUAL_VIEW model input must contain (mamba_view, osnet_view)'
+                )
+            x_mamba, x_osnet = x
+        else:
+            x_mamba = x
+            x_osnet = x
         use_fdmf = self.fusion_type == 'fdmf'
         if self.training:
             stage3_local_feat = None
-            stage3_part_feats = None
-            stage4_local_feat = None
+            fdmf_feat = None
             if self.use_stage_fcu_exchange:
                 stage_out = self._forward_stage_fcu_branches(
-                    x,
+                    x_mamba,
+                    x_osnet=x_osnet,
                     label=label,
                     cam_label=cam_label,
                     view_label=view_label,
@@ -2296,23 +3123,9 @@ class MambaOSNetFusion(nn.Module):
                         osnet_feat,
                         osnet_bn,
                         stage3_local_feat,
-                        stage3_part_feats,
                         mamba_map,
                         osnet_map,
                     ) = stage_out
-                    stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
-                    fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
-                        mamba_feat,
-                        osnet_feat,
-                        mamba_map,
-                        osnet_map,
-                        return_fdmf_feat=True,
-                    )
-                    fdmf_feat, stage3_local_feat, stage3_part_feats = self._enhance_stage3_local_with_fdmf(
-                        fdmf_feat,
-                        stage3_part_feats,
-                    )
-                    fused_feat = self._compose_fdmf_fused_feat(mamba_feat, osnet_feat, fdmf_feat)
                 elif use_fdmf:
                     (
                         mamba_score,
@@ -2324,8 +3137,6 @@ class MambaOSNetFusion(nn.Module):
                         mamba_map,
                         osnet_map,
                     ) = stage_out
-                    stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
-                    fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
                 elif self.stage3_stripe_local_enabled:
                     (
                         mamba_score,
@@ -2335,7 +3146,6 @@ class MambaOSNetFusion(nn.Module):
                         osnet_feat,
                         osnet_bn,
                         stage3_local_feat,
-                        stage3_part_feats,
                     ) = stage_out
                 else:
                     (
@@ -2348,28 +3158,38 @@ class MambaOSNetFusion(nn.Module):
                     ) = stage_out
             else:
                 mamba_out = self._forward_mamba_branch(
-                    x,
+                    x_mamba,
                     label=label,
                     cam_label=cam_label,
                     view_label=view_label,
                     return_map=use_fdmf,
                 )
-                osnet_out = self._forward_osnet_branch(x, label=label, return_map=use_fdmf)
+                osnet_out = self._forward_osnet_branch(
+                    x_osnet,
+                    label=label,
+                    return_map=use_fdmf,
+                )
                 if use_fdmf:
                     mamba_score, mamba_feat, mamba_bn, mamba_map = mamba_out
                     osnet_score, osnet_feat, osnet_bn, osnet_map = osnet_out
-                    stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
-                    fused_feat = self._make_fdmf_fused_feat(mamba_feat, osnet_feat, mamba_map, osnet_map)
                 else:
                     mamba_score, mamba_feat, mamba_bn = mamba_out
                     osnet_score, osnet_feat, osnet_bn = osnet_out
-                    fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
-            if self.use_stage_fcu_exchange and not use_fdmf:
+            if use_fdmf:
+                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
+                    mamba_feat,
+                    osnet_feat,
+                    mamba_map,
+                    osnet_map,
+                    return_fdmf_feat=True,
+                )
+            else:
                 fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
             fused_bn = self.fusion_bottleneck(fused_feat)
             fused_score = self._classify(self.fusion_classifier, fused_bn, label)
             scores = [mamba_score, osnet_score, fused_score]
             feats = [mamba_feat, osnet_feat, fused_feat]
+            auxiliary = {}
             if self.stage3_stripe_local_enabled:
                 stage3_local_bn = self.stage3_stripe_local_bottleneck(stage3_local_feat)
                 stage3_local_score = self._classify(
@@ -2379,96 +3199,81 @@ class MambaOSNetFusion(nn.Module):
                 )
                 scores.append(stage3_local_score)
                 feats.append(stage3_local_feat)
-                if self.stage3_stripe_part_supervision_enabled:
-                    for idx in range(self.stage3_stripe_local.num_stripes):
-                        part_feat = stage3_part_feats[:, idx]
-                        part_bn = self.stage3_stripe_part_bottlenecks[idx](part_feat)
-                        part_score = self._classify(
-                            self.stage3_stripe_part_classifiers[idx],
-                            part_bn,
-                            label,
-                        )
-                        scores.append(part_score)
-                        feats.append(part_feat)
-            if self.stage4_stripe_local_enabled:
-                stage4_local_bn = self.stage4_stripe_local_bottleneck(stage4_local_feat)
-                stage4_local_score = self._classify(
-                    self.stage4_stripe_local_classifier,
-                    stage4_local_bn,
-                    label,
-                )
-                scores.append(stage4_local_score)
-                feats.append(stage4_local_feat)
+                if self.stage3_stripe_local.last_parts is not None:
+                    local_parts = self.stage3_stripe_local.last_parts
+                    part_scores = []
+                    if self.stage3_stripe_local_part_bottlenecks is not None:
+                        for idx in range(local_parts.shape[1]):
+                            part_bn = self.stage3_stripe_local_part_bottlenecks[idx](
+                                local_parts[:, idx]
+                            )
+                            part_scores.append(
+                                self._classify(
+                                    self.stage3_stripe_local_part_classifiers[idx],
+                                    part_bn,
+                                    label,
+                                )
+                            )
+                    auxiliary['stage3_local_parts'] = {
+                        'features': local_parts,
+                        'scores': part_scores,
+                        'confidence': self.stage3_stripe_local.last_confidence,
+                    }
+            if self.stage3_stripe_local_enabled and self.stage3_stripe_local.last_aux:
+                auxiliary['stage3_local_regularization'] = self.stage3_stripe_local.last_aux
+            if auxiliary:
+                feats.append(auxiliary)
             return scores, feats
 
-        stage4_local_feat = None
+        stage3_local_feat = None
+        fdmf_feat = None
+        fdmf_diagnostics = {}
         if self.use_stage_fcu_exchange:
             stage_out = self._forward_stage_fcu_branches(
-                x,
+                x_mamba,
+                x_osnet=x_osnet,
                 cam_label=cam_label,
                 view_label=view_label,
                 return_map=use_fdmf,
             )
             if self.stage3_stripe_local_enabled and use_fdmf:
-                mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats, mamba_map, osnet_map = stage_out
-                stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
-                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
-                    mamba_feat,
-                    osnet_feat,
-                    mamba_map,
-                    osnet_map,
-                    return_fdmf_feat=True,
-                )
-                fdmf_feat, stage3_local_feat, stage3_part_feats = self._enhance_stage3_local_with_fdmf(
-                    fdmf_feat,
-                    stage3_part_feats,
-                )
-                fused_feat = self._compose_fdmf_fused_feat(mamba_feat, osnet_feat, fdmf_feat)
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, mamba_map, osnet_map = stage_out
             elif use_fdmf:
                 mamba_feat, mamba_bn, osnet_feat, osnet_bn, mamba_map, osnet_map = stage_out
-                stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
-                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
-                    mamba_feat,
-                    osnet_feat,
-                    mamba_map,
-                    osnet_map,
-                    return_fdmf_feat=True,
-                )
             elif self.stage3_stripe_local_enabled:
-                mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat, stage3_part_feats = stage_out
-                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
+                mamba_feat, mamba_bn, osnet_feat, osnet_bn, stage3_local_feat = stage_out
             else:
                 mamba_feat, mamba_bn, osnet_feat, osnet_bn = stage_out
-                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         else:
             mamba_out = self._forward_mamba_branch(
-                x,
+                x_mamba,
                 cam_label=cam_label,
                 view_label=view_label,
                 return_map=use_fdmf,
             )
-            osnet_out = self._forward_osnet_branch(x, return_map=use_fdmf)
+            osnet_out = self._forward_osnet_branch(
+                x_osnet,
+                return_map=use_fdmf,
+            )
             if use_fdmf:
                 mamba_feat, mamba_bn, mamba_map = mamba_out
                 osnet_feat, osnet_bn, osnet_map = osnet_out
-                stage4_local_feat = self._make_stage4_stripe_local_feat(mamba_map, osnet_map)
-                fused_feat, fdmf_feat = self._make_fdmf_fused_feat(
-                    mamba_feat,
-                    osnet_feat,
-                    mamba_map,
-                    osnet_map,
-                    return_fdmf_feat=True,
-                )
             else:
                 mamba_feat, mamba_bn = mamba_out
                 osnet_feat, osnet_bn = osnet_out
-                fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
-        if self.use_stage_fcu_exchange and not use_fdmf:
+        if use_fdmf:
+            fused_feat, fdmf_feat, fdmf_diagnostics = self._make_fdmf_fused_feat(
+                mamba_feat,
+                osnet_feat,
+                mamba_map,
+                osnet_map,
+                return_fdmf_feat=True,
+                return_diagnostics=True,
+            )
+        else:
             fused_feat = self._make_descriptor_fused_feat(mamba_feat, osnet_feat)
         if self.stage3_stripe_local_enabled:
             stage3_local_bn = self.stage3_stripe_local_bottleneck(stage3_local_feat)
-        if self.stage4_stripe_local_enabled:
-            stage4_local_bn = self.stage4_stripe_local_bottleneck(stage4_local_feat)
         fused_bn = self.fusion_bottleneck(fused_feat)
 
         if self.neck_feat == 'after':
@@ -2477,16 +3282,12 @@ class MambaOSNetFusion(nn.Module):
             fused_out = fused_bn
             if self.stage3_stripe_local_enabled:
                 stage3_local_out = stage3_local_bn
-            if self.stage4_stripe_local_enabled:
-                stage4_local_out = stage4_local_bn
         else:
             mamba_out = mamba_feat
             osnet_out = osnet_feat
             fused_out = fused_feat
             if self.stage3_stripe_local_enabled:
                 stage3_local_out = stage3_local_feat
-            if self.stage4_stripe_local_enabled:
-                stage4_local_out = stage4_local_feat
 
         output = {
             'backbone': mamba_out,
@@ -2494,32 +3295,112 @@ class MambaOSNetFusion(nn.Module):
         }
         if self.stage3_stripe_local_enabled:
             output['stage3_stripe_local'] = stage3_local_out
-        if self.stage4_stripe_local_enabled:
-            output['stage4_stripe_local'] = stage4_local_out
         if use_fdmf:
             output['raw_concat'] = torch.cat([mamba_out, osnet_out], dim=1)
             output['fdmf'] = fused_out
-            output['mamba_fdmf_osnet'] = torch.cat([mamba_out, fdmf_feat, osnet_out], dim=1)
+            if self.fdmf_bypass:
+                direct_descriptor = torch.cat([mamba_out, osnet_out], dim=1)
+                output['fdmf_only'] = direct_descriptor
+                output['mamba_fdmf'] = direct_descriptor
+                output['fdmf_osnet'] = direct_descriptor
+                output['complementary_pair'] = direct_descriptor
+                output['mamba_fdmf_osnet'] = direct_descriptor
+                output['weighted_mamba_fdmf_osnet'] = torch.cat(
+                    [
+                        self.descriptor_mamba_weight
+                        * F.normalize(mamba_out.float(), p=2, dim=1),
+                        self.descriptor_osnet_weight
+                        * F.normalize(osnet_out.float(), p=2, dim=1),
+                    ],
+                    dim=1,
+                )
+            else:
+                output['fdmf_only'] = fdmf_feat
+                output['mamba_fdmf'] = torch.cat([mamba_out, fdmf_feat], dim=1)
+                output['fdmf_osnet'] = torch.cat([fdmf_feat, osnet_out], dim=1)
+                output['mamba_fdmf_osnet'] = torch.cat([mamba_out, fdmf_feat, osnet_out], dim=1)
+                output['complementary_pair'] = torch.cat(
+                    [mamba_out, fdmf_feat], dim=1
+                )
+                output['weighted_mamba_fdmf_osnet'] = torch.cat(
+                    [
+                        self.descriptor_mamba_weight * F.normalize(mamba_out.float(), p=2, dim=1),
+                        self.descriptor_fdmf_weight * F.normalize(fdmf_feat.float(), p=2, dim=1),
+                        self.descriptor_osnet_weight * F.normalize(osnet_out.float(), p=2, dim=1),
+                    ],
+                    dim=1,
+                )
+                if self.fdmf_descriptor_sweep_enabled:
+                    mamba_normalized = F.normalize(mamba_out.float(), p=2, dim=1)
+                    fdmf_normalized = F.normalize(fdmf_feat.float(), p=2, dim=1)
+                    osnet_normalized = F.normalize(osnet_out.float(), p=2, dim=1)
+                    for fdmf_weight in self.fdmf_descriptor_sweep_fdmf_weights:
+                        for osnet_weight in self.fdmf_descriptor_sweep_osnet_weights:
+                            sweep_key = 'weighted_mfo_f{:03d}_o{:03d}'.format(
+                                int(round(100.0 * fdmf_weight)),
+                                int(round(100.0 * osnet_weight)),
+                            )
+                            output[sweep_key] = torch.cat(
+                                [
+                                    self.descriptor_mamba_weight * mamba_normalized,
+                                    fdmf_weight * fdmf_normalized,
+                                    osnet_weight * osnet_normalized,
+                                ],
+                                dim=1,
+                            )
+            if 'odsmf_consensus_feat' in fdmf_diagnostics:
+                consensus_feat = fdmf_diagnostics['odsmf_consensus_feat']
+                discrepancy_feat = fdmf_diagnostics['odsmf_discrepancy_feat']
+                output['odsmf_consensus'] = consensus_feat
+                output['odsmf_discrepancy'] = discrepancy_feat
+                output['odsmf_dual_state'] = self._concat_normalized_features(
+                    consensus_feat, discrepancy_feat
+                )
+                output['odsmf_dual_state_fdmf'] = self._concat_normalized_features(
+                    consensus_feat, discrepancy_feat, fdmf_feat
+                )
             if self.stage3_stripe_local_enabled:
-                output['mamba_fdmf_osnet_stage3local'] = torch.cat(
-                    [
-                        mamba_out,
-                        fdmf_feat,
-                        osnet_out,
-                        self.stage3_stripe_local_infer_weight * stage3_local_out,
-                    ],
-                    dim=1,
-                )
-            if self.stage4_stripe_local_enabled:
-                output['mamba_fdmf_osnet_stage4local'] = torch.cat(
-                    [
-                        mamba_out,
-                        fdmf_feat,
-                        osnet_out,
-                        self.stage4_stripe_local_infer_weight * stage4_local_out,
-                    ],
-                    dim=1,
-                )
+                if self.fdmf_bypass:
+                    output['mamba_fdmf_osnet_stage3local'] = torch.cat(
+                        [
+                            mamba_out,
+                            osnet_out,
+                            self.stage3_stripe_local_infer_weight * stage3_local_out,
+                        ],
+                        dim=1,
+                    )
+                    output['weighted_mamba_fdmf_osnet_stage3local'] = torch.cat(
+                        [
+                            self.descriptor_mamba_weight
+                            * F.normalize(mamba_out.float(), p=2, dim=1),
+                            self.descriptor_osnet_weight
+                            * F.normalize(osnet_out.float(), p=2, dim=1),
+                            self.stage3_stripe_local_infer_weight
+                            * F.normalize(stage3_local_out.float(), p=2, dim=1),
+                        ],
+                        dim=1,
+                    )
+                else:
+                    output['mamba_fdmf_osnet_stage3local'] = torch.cat(
+                        [
+                            mamba_out,
+                            fdmf_feat,
+                            osnet_out,
+                            self.stage3_stripe_local_infer_weight * stage3_local_out,
+                        ],
+                        dim=1,
+                    )
+                    output['weighted_mamba_fdmf_osnet_stage3local'] = torch.cat(
+                        [
+                            self.descriptor_mamba_weight * F.normalize(mamba_out.float(), p=2, dim=1),
+                            self.descriptor_fdmf_weight * F.normalize(fdmf_feat.float(), p=2, dim=1),
+                            self.descriptor_osnet_weight * F.normalize(osnet_out.float(), p=2, dim=1),
+                            self.stage3_stripe_local_infer_weight * F.normalize(
+                                stage3_local_out.float(), p=2, dim=1
+                            ),
+                        ],
+                        dim=1,
+                    )
         else:
             output['concat'] = fused_out
             if self.stage3_stripe_local_enabled:
@@ -2569,6 +3450,13 @@ __factory_T_type = {
 def make_model(cfg, num_class, camera_num, view_num):
     model = None
     osnet_fusion_enabled = bool(getattr(getattr(cfg.MODEL, 'OSNET_FUSION', None), 'ENABLED', False))
+    dual_view_enabled = bool(
+        getattr(getattr(cfg.INPUT, 'DUAL_VIEW', None), 'ENABLED', False)
+    )
+    if dual_view_enabled and not osnet_fusion_enabled:
+        raise ValueError(
+            'INPUT.DUAL_VIEW requires MODEL.OSNET_FUSION.ENABLED=True'
+        )
     if osnet_fusion_enabled:
         model = MambaOSNetFusion(num_class, camera_num, view_num, cfg, __factory_T_type)
         print('===========building Mamba-OSNet fusion===========')

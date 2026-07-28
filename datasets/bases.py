@@ -107,3 +107,34 @@ class ParallelAugmentationImageDataset(Dataset):
         img_erase = self.eraser_transform(img)
 
         return img_base, img_crop, img_erase, pid, camid, trackid, img_path.split('/')[-1]
+
+
+class DualViewImageDataset(Dataset):
+    """Return shared-geometry clean and crop candidates for two-backbone routing.
+
+    Unlike ParallelAugmentationImageDataset/PAM, this dataset does not create
+    three supervised branches. The collator selects exactly one tensor for
+    MambaVision and one tensor for OSNet.
+    """
+
+    def __init__(self, dataset, clean_transform, crop_transform):
+        self.dataset = dataset
+        self.clean_transform = clean_transform
+        self.crop_transform = crop_transform
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        img_path, pid, camid, trackid = self.dataset[index]
+        img = read_image(img_path)
+        img_clean = self.clean_transform(img)
+        img_crop = self.crop_transform(img)
+        return (
+            img_clean,
+            img_crop,
+            pid,
+            camid,
+            trackid,
+            img_path.split('/')[-1],
+        )

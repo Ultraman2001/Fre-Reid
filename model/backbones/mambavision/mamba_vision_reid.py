@@ -522,6 +522,8 @@ class MambaVisionMixer(nn.Module):
         device=None,
         dtype=None,
         use_sasf=False,
+        condition_dim=None,
+        condition_init_scale=0.1,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -530,11 +532,13 @@ class MambaVisionMixer(nn.Module):
         self.d_conv = d_conv
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
+        self.output_dim = self.d_inner
         
         self.use_sasf = use_sasf
         if use_sasf:
-            # SASF operates AFTER concat, so input is full d_inner (SSM + Conv1d branches)
-            self.state_fusion = StateFusion(self.d_inner)
+            # SASF calibrates the concatenated selective-state and local
+            # convolution streams.
+            self.state_fusion = StateFusion(self.output_dim)
             # Initialize with 0 scale to ensure "identity" behavior at start
             self.sasf_scale = nn.Parameter(torch.zeros(1))
             
@@ -571,7 +575,7 @@ class MambaVisionMixer(nn.Module):
         self.A_log._no_weight_decay = True
         self.D = nn.Parameter(torch.ones(self.d_inner//2, device=device))
         self.D._no_weight_decay = True
-        self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        self.out_proj = nn.Linear(self.output_dim, self.d_model, bias=bias, **factory_kwargs)
         self.conv1d_x = nn.Conv1d(
             in_channels=self.d_inner//2,
             out_channels=self.d_inner//2,
@@ -591,7 +595,61 @@ class MambaVisionMixer(nn.Module):
             **factory_kwargs,
         )
 
-    def forward(self, hidden_states, H=None, W=None):
+        # Optional cross-branch controller.  It predicts residual offsets for
+        # the content stream's selective-scan parameters; the ordinary Mamba
+        # path is unchanged when condition_states is None/condition_parts is
+        # "none".  The three scales correspond to delta, B and C.
+        self.condition_dim = condition_dim
+        if condition_dim is not None:
+            scan_dim = self.d_inner // 2
+            self.condition_in_proj = nn.Linear(
+                int(condition_dim), scan_dim, bias=bias, **factory_kwargs
+            )
+            self.condition_x_proj = nn.Linear(
+                scan_dim,
+                self.dt_rank + self.d_state * 2,
+                bias=False,
+                **factory_kwargs,
+            )
+            self.condition_scales = nn.Parameter(
+                torch.full((3,), float(condition_init_scale), **factory_kwargs)
+            )
+            self.condition_scales._no_weight_decay = True
+        else:
+            self.condition_in_proj = None
+            self.condition_x_proj = None
+            self.register_parameter('condition_scales', None)
+
+    @staticmethod
+    def _parse_condition_parts(condition_parts):
+        mode = str(condition_parts).strip().lower().replace('+', '_')
+        aliases = {
+            '': frozenset(),
+            'none': frozenset(),
+            'delta': frozenset(('delta',)),
+            'b': frozenset(('b',)),
+            'c': frozenset(('c',)),
+            'b_delta': frozenset(('b', 'delta')),
+            'b_c': frozenset(('b', 'c')),
+            'c_delta': frozenset(('c', 'delta')),
+            'b_c_delta': frozenset(('b', 'c', 'delta')),
+        }
+        if mode not in aliases:
+            raise ValueError(
+                'condition_parts must be one of: none, delta, b, c, '
+                'b_delta, b_c, c_delta, b_c_delta'
+            )
+        return aliases[mode]
+
+    def forward(
+        self,
+        hidden_states,
+        H=None,
+        W=None,
+        condition_states=None,
+        condition_parts='none',
+        condition_merge='residual',
+    ):
         """
         hidden_states: (B, L, D)
         H, W: spatial dimensions for non-square feature maps
@@ -612,6 +670,69 @@ class MambaVisionMixer(nn.Module):
         
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
+        active_parts = self._parse_condition_parts(condition_parts)
+        condition_merge = str(condition_merge).strip().lower()
+        if condition_merge not in ('residual', 'replace'):
+            raise ValueError("condition_merge must be 'residual' or 'replace'")
+        if active_parts:
+            if self.condition_in_proj is None or self.condition_x_proj is None:
+                raise ValueError('condition_dim must be set before using conditional scan')
+            if condition_states is None:
+                raise ValueError('condition_states is required for conditional scan')
+
+            # A tensor preserves the historical conditional-Mamba behavior.
+            # A dict lets heterogeneous branches control delta/B/C separately
+            # while sharing the controller weights, so gains cannot be
+            # explained by three independent parameter generators.
+            if isinstance(condition_states, dict):
+                part_states = {
+                    part: condition_states.get(part, condition_states.get('default'))
+                    for part in ('delta', 'b', 'c')
+                }
+            else:
+                part_states = {
+                    'delta': condition_states,
+                    'b': condition_states,
+                    'c': condition_states,
+                }
+
+            projected_parts = {}
+            for part in active_parts:
+                part_state = part_states[part]
+                if part_state is None:
+                    raise ValueError('missing {} controller state'.format(part))
+                if part_state.shape[:2] != hidden_states.shape[:2]:
+                    raise ValueError(
+                        '{} controller and hidden_states must share '
+                        'batch/sequence dimensions'.format(part)
+                    )
+                condition = F.silu(self.condition_in_proj(part_state))
+                condition_dbl = self.condition_x_proj(
+                    rearrange(condition, 'b l d -> (b l) d')
+                )
+                projected_parts[part] = torch.split(
+                    condition_dbl,
+                    [self.dt_rank, self.d_state, self.d_state],
+                    dim=-1,
+                )
+            if 'delta' in active_parts:
+                condition_dt = projected_parts['delta'][0]
+                if condition_merge == 'replace':
+                    dt = condition_dt
+                else:
+                    dt = dt + self.condition_scales[0].to(dt.dtype) * condition_dt
+            if 'b' in active_parts:
+                condition_B = projected_parts['b'][1]
+                if condition_merge == 'replace':
+                    B = condition_B
+                else:
+                    B = B + self.condition_scales[1].to(B.dtype) * condition_B
+            if 'c' in active_parts:
+                condition_C = projected_parts['c'][2]
+                if condition_merge == 'replace':
+                    C = condition_C
+                else:
+                    C = C + self.condition_scales[2].to(C.dtype) * condition_C
         dt = rearrange(self.dt_proj(dt), "(b l) d -> b d l", l=seqlen).contiguous()
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
@@ -622,12 +743,10 @@ class MambaVisionMixer(nn.Module):
                               delta_bias=self.dt_proj.bias.float(),
                               delta_softplus=True, return_last_state=None).to(x.dtype)
         
-        # Concatenation FIRST: merge SSM branch (y) and Conv1d branch (z)
-        # y: has global sequential context, but lacks 2D vertical structure
-        # z: has local horizontal texture, but lacks 2D vertical structure
-        y = torch.cat([y, z], dim=1)  # (B, D_inner, L)
+        # Preserve both the selective state and local convolution streams.
+        y = torch.cat([y, z], dim=1)
         
-        # Apply SASF AFTER concat - unified 2D spatial calibration for both branches
+        # Apply SASF after the selected mixer-output fusion.
         B_batch, D_inner, L_seq = y.shape
         if self.use_sasf:
             # Determine H, W for reshape
@@ -651,6 +770,8 @@ class MambaVisionMixer(nn.Module):
         y = rearrange(y, "b d l -> b l d")
         out = self.out_proj(y)
         return out
+
+
 
 
 class Attention(nn.Module):
@@ -770,7 +891,7 @@ class MambaVisionLayer(nn.Module):
         self.downsample = None if not downsample else Downsample(dim=dim)
         self.window_size = window_size
 
-    def forward(self, x):
+    def forward(self, x, return_pre_downsample=False):
         B, C, H, W = x.shape
 
         if self.transformer_block:
@@ -803,9 +924,11 @@ class MambaVisionLayer(nn.Module):
             for blk in self.blocks:
                 x = blk(x)
 
-        if self.downsample is None:
-            return x
-        return self.downsample(x)
+        pre_downsample = x
+        output = x if self.downsample is None else self.downsample(x)
+        if return_pre_downsample:
+            return output, pre_downsample
+        return output
 
 
 class MambaVisionBackbone(nn.Module):
