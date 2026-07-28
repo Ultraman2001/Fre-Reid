@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 def normalize(x, axis=-1):
@@ -9,7 +10,8 @@ def normalize(x, axis=-1):
     Returns:
       x: pytorch Variable, same shape as input
     """
-    x = 1. * x / (torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
+    x = x.float()
+    x = x / (torch.norm(x, 2, axis, keepdim=True).expand_as(x) + 1e-12)
     return x
 
 
@@ -21,6 +23,10 @@ def euclidean_dist(x, y):
     Returns:
       dist: pytorch Variable, with shape [m, n]
     """
+    # Feature tensors produced under AMP remain FP16 outside autocast. Pairwise
+    # squared distances can overflow before the final sqrt, so accumulate in FP32.
+    x = x.float()
+    y = y.float()
     m, n = x.size(0), y.size(0)
     xx = torch.pow(x, 2).sum(1, keepdim=True).expand(m, n)
     yy = torch.pow(y, 2).sum(1, keepdim=True).expand(n, m).t()
@@ -39,6 +45,8 @@ def cosine_dist(x, y):
     Returns:
       dist: pytorch Variable, with shape [m, n]
     """
+    x = x.float()
+    y = y.float()
     m, n = x.size(0), y.size(0)
     x_norm = torch.pow(x, 2).sum(1, keepdim=True).sqrt().expand(m, n)
     y_norm = torch.pow(y, 2).sum(1, keepdim=True).sqrt().expand(n, m).t()
@@ -116,7 +124,7 @@ class TripletLoss(object):
         if margin is not None:
             self.ranking_loss = nn.MarginRankingLoss(margin=margin)
         else:
-            self.ranking_loss = nn.SoftMarginLoss()
+            self.ranking_loss = None
 
     def __call__(self, global_feat, labels, normalize_feature=False):
         if normalize_feature:
@@ -127,11 +135,12 @@ class TripletLoss(object):
         dist_ap *= (1.0 + self.hard_factor)
         dist_an *= (1.0 - self.hard_factor)
 
-        y = dist_an.new().resize_as_(dist_an).fill_(1)
         if self.margin is not None:
+            y = torch.ones_like(dist_an)
             loss = self.ranking_loss(dist_an, dist_ap, y)
         else:
-            loss = self.ranking_loss(dist_an - dist_ap, y)
+            # SoftMarginLoss is softplus(dist_ap - dist_an), but its backend can
+            # overflow for large hard-mined distances. F.softplus uses a stable
+            # thresholded formulation while preserving the same objective.
+            loss = F.softplus(dist_ap - dist_an).mean()
         return loss, dist_ap, dist_an
-
-

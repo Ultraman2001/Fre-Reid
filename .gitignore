@@ -235,3 +235,12 @@ checkpoints/
 *.ckpt
 *.npy
 *.npz
+
+# Local datasets, scratch space, and archived experimental backups
+/data/
+/datasets/Occluded_Duke/
+/.codex_tmp/
+/tmp/
+/etffm_backup/
+/s4fcu_backup/
+/use_backup/

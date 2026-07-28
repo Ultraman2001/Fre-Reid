@@ -195,12 +195,38 @@ class RATRLoss(nn.Module):
         samples_per_class: PK 采样中的 K 值，默认 4
         tau: Kendall-tau 温度参数，默认 0.1
     """
-    def __init__(self, num_branches=2, num_classes=16, samples_per_class=4, tau=0.1):
+    def __init__(
+        self,
+        num_branches=2,
+        num_classes=16,
+        samples_per_class=4,
+        tau=0.1,
+        mode='raw',
+        intra_target=0.5,
+        inter_target=0.3,
+    ):
         super().__init__()
         self.intra_loss = RATRIntraLoss(num_branches, num_classes, samples_per_class, tau)
         self.inter_loss = RATRInterLoss(num_branches, num_classes, samples_per_class, tau)
-        
-        print(f"[RATR] Initialized: N={num_branches}, P={num_classes}, K={samples_per_class}, tau={tau}")
+        self.mode = str(mode).lower()
+        if self.mode not in ('raw', 'hinge', 'square'):
+            raise ValueError('RATR_MODE must be one of: raw, hinge, square')
+        self.intra_target = float(intra_target)
+        self.inter_target = float(inter_target)
+        self.last_intra = 0.0
+        self.last_inter = 0.0
+
+        print(
+            '[RATR] Initialized: N={}, P={}, K={}, tau={}, mode={}, targets={}/{}'.format(
+                num_branches,
+                num_classes,
+                samples_per_class,
+                tau,
+                self.mode,
+                self.intra_target,
+                self.inter_target,
+            )
+        )
         
     def forward(self, feat_list, targets):
         """
@@ -213,4 +239,10 @@ class RATRLoss(nn.Module):
         """
         intra = self.intra_loss(feat_list, targets)
         inter = self.inter_loss(feat_list, targets)
+        self.last_intra = intra.detach().item()
+        self.last_inter = inter.detach().item()
+        if self.mode == 'hinge':
+            return F.relu(intra - self.intra_target) + F.relu(inter - self.inter_target)
+        if self.mode == 'square':
+            return intra.square() + inter.square()
         return intra + inter

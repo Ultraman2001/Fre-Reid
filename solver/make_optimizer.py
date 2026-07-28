@@ -3,7 +3,6 @@ import torch
 
 def make_optimizer(cfg, model, center_criterion):
     params = []
-    # Track printed keys to avoid excessive logging
     printed_high_lr_keys = set()
     
     for key, value in model.named_parameters():
@@ -13,17 +12,10 @@ def make_optimizer(cfg, model, center_criterion):
         lr = cfg.SOLVER.BASE_LR
         weight_decay = cfg.SOLVER.WEIGHT_DECAY
         
-        # Respect _no_weight_decay attribute set by Mamba SSM components (A_log, D)
-        # This aligns with the official MambaVision design intent
         if getattr(value, "_no_weight_decay", False):
             weight_decay = 0.0
             print(f"[No Weight Decay] {key}")
-        
-        # High Learning Rate Strategy for Randomly Initialized Modules
-        # Priority: SASF modules first (independent LR), then Stage 4 backbone
-        # 1. state_fusion / sasf_scale: StateFusion modules (uses SASF_LR_FACTOR)
-        # 2. levels.3 (Stage 4 backbone): Random init due to structure change
-        
+
         if "fslora" in key:
             fslora_lr_factor = getattr(cfg.SOLVER, 'FSLORA_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fslora_lr_factor
@@ -34,22 +26,46 @@ def make_optimizer(cfg, model, center_criterion):
         elif key.startswith("osnet."):
             osnet_lr_factor = getattr(cfg.SOLVER, 'OSNET_LR_FACTOR', 1.0)
             lr = cfg.SOLVER.BASE_LR * osnet_lr_factor
+            osnet_weight_decay = float(getattr(cfg.SOLVER, 'OSNET_WEIGHT_DECAY', -1.0))
+            if osnet_weight_decay >= 0.0:
+                weight_decay = osnet_weight_decay
             if "osnet" not in printed_high_lr_keys:
-                print(f"Using {osnet_lr_factor}x learning rate for OSNet branch: {key}")
+                print(
+                    f"Using {osnet_lr_factor}x learning rate and weight_decay={weight_decay} "
+                    f"for OSNet branch: {key}"
+                )
                 printed_high_lr_keys.add("osnet")
+
+        elif (
+            key.startswith("stage1_fcu")
+            or key.startswith("stage2_fcu")
+            or key.startswith("stage3_fcu")
+        ):
+            legacy_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
+            fcu_lr_factor = float(getattr(cfg.SOLVER, 'FCU_LR_FACTOR', -1.0))
+            if fcu_lr_factor < 0.0:
+                fcu_lr_factor = legacy_factor
+            lr = cfg.SOLVER.BASE_LR * fcu_lr_factor
+            if "fcu" not in printed_high_lr_keys:
+                print(f"Using {fcu_lr_factor}x learning rate for FCU modules: {key}")
+                printed_high_lr_keys.add("fcu")
+
+        elif key.startswith("fdmf_refiner"):
+            legacy_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
+            fdmf_lr_factor = float(getattr(cfg.SOLVER, 'FDMF_LR_FACTOR', -1.0))
+            if fdmf_lr_factor < 0.0:
+                fdmf_lr_factor = legacy_factor
+            lr = cfg.SOLVER.BASE_LR * fdmf_lr_factor
+            if "fdmf_refiner" not in printed_high_lr_keys:
+                print(f"Using {fdmf_lr_factor}x learning rate for FDMF refiner: {key}")
+                printed_high_lr_keys.add("fdmf_refiner")
 
         elif (
             key.startswith("osnet_bottleneck")
             or key.startswith("osnet_classifier")
             or key.startswith("fusion_bottleneck")
             or key.startswith("fusion_classifier")
-            or key.startswith("stage2_fcu")
-            or key.startswith("stage3_fcu")
-            or key.startswith("fdmf_refiner")
             or key.startswith("stage3_stripe_local")
-            or key.startswith("stage3_stripe_part")
-            or key.startswith("stage3_stripe_lg_enhancer")
-            or key.startswith("stage4_stripe_local")
         ):
             fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
             lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
@@ -70,25 +86,32 @@ def make_optimizer(cfg, model, center_criterion):
                 printed_high_lr_keys.add("levels.3")
 
         if "bias" in key:
-            # Scale the *current* LR (whether base or high) by the bias factor
             lr = lr * cfg.SOLVER.BIAS_LR_FACTOR
             weight_decay = cfg.SOLVER.WEIGHT_DECAY_BIAS
-        
-        # fusion_scale is a gate scalar, should not have weight decay
-        # and follows the fusion-head LR so it learns without becoming too aggressive
+            if key.startswith("osnet."):
+                osnet_bias_weight_decay = float(
+                    getattr(cfg.SOLVER, 'OSNET_WEIGHT_DECAY_BIAS', -1.0)
+                )
+                if osnet_bias_weight_decay >= 0.0:
+                    weight_decay = osnet_bias_weight_decay
+
         if "fusion_scale" in key:
             weight_decay = 0.0
-            fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
-            lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
-            print(f"Using {fusion_lr_factor}x LR and no weight decay for fusion_scale: {key}")
-            
-        if cfg.SOLVER.LARGE_FC_LR:
-            if "classifier" in key or "arcface" in key:
-                lr = cfg.SOLVER.BASE_LR * 2
-                print('Using two times learning rate for fc ')
+            if key.startswith(("stage1_fcu", "stage2_fcu", "stage3_fcu")):
+                if "fcu_scale" not in printed_high_lr_keys:
+                    print(f"Using FCU learning rate and no weight decay for FCU fusion scale: {key}")
+                    printed_high_lr_keys.add("fcu_scale")
+            else:
+                fusion_lr_factor = getattr(cfg.SOLVER, 'OSNET_FUSION_LR_FACTOR', 2.0)
+                lr = cfg.SOLVER.BASE_LR * fusion_lr_factor
+                if "fusion_scale" not in printed_high_lr_keys:
+                    print(f"Using {fusion_lr_factor}x LR and no weight decay for fusion_scale: {key}")
+                    printed_high_lr_keys.add("fusion_scale")
 
-        # SFM 3.0 Hierarchical Fusion Learning Rate
-        # 1. SFM Blocks inside backbone (Typical: 0.5x LR)
+        if cfg.SOLVER.LARGE_FC_LR and ("classifier" in key or "arcface" in key):
+            lr = cfg.SOLVER.BASE_LR * 2
+            print('Using two times learning rate for fc ')
+
         if "sfm_s" in key:
             sfm_lr_factor = getattr(cfg.SOLVER, 'SFM_LR_FACTOR', 0.5)
             lr = cfg.SOLVER.BASE_LR * sfm_lr_factor
@@ -96,8 +119,6 @@ def make_optimizer(cfg, model, center_criterion):
                 print(f"Using {sfm_lr_factor}x learning rate for SFM Blocks: {key}")
                 printed_high_lr_keys.add("sfm_blocks")
         
-        # 2. SFM Deep Supervision Heads (2.0x LR for randomly initialized new layers)
-        # Only match the exact head names to avoid false positives
         elif "pooling_fused" in key or "bottleneck_fused" in key or "classifier_fused" in key:
             lr = cfg.SOLVER.BASE_LR * 2.0
             if "sfm_heads" not in printed_high_lr_keys:
